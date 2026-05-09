@@ -18,7 +18,7 @@ function TopBar({ connection, onRefresh, isRefreshing }) {
   return (
     <header className="topbar">
       <div className="topbar-left">
-        <h1>信投建设智能申标平台</h1>
+        <h1>信投建设智能审标平台</h1>
         <nav className="nav-tabs">
           {NAV_TABS.map((tab) => (
             <a
