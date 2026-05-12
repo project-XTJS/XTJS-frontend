@@ -3,13 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import {
   getProjectResults,
   listProjects,
-  runBidDocumentReview,
-  runBusinessBidDuplicateCheck,
-  runBusinessBidFormatReview,
-  runDuplicateCheck,
-  runPersonnelReuseCheck,
-  runTechnicalBidDuplicateCheck,
-  runTypoCheck,
+  runAnalysis,
 } from '../lib/xtjsApi'
 import { formatDateTime } from '../utils/formatters'
 import EmptyBlock from '../components/EmptyBlock'
@@ -21,58 +15,140 @@ const ANALYSIS_TYPES = [
     label: '全文比对查重',
     icon: '📋',
     description: '比对商务标与技术标文档，发现高度相似的文本块',
-    execute: (id) => runDuplicateCheck({ identifierId: id, documentScope: 'all' }),
-    scopeEnabled: true,
+    services: ['business_bid_duplicate_check', 'technical_bid_duplicate_check'],
   },
   {
     key: 'businessBidDuplicateCheck',
     label: '商务标查重',
     icon: '📄',
     description: '仅对商务标文档之间进行内容查重',
-    execute: (id) => runBusinessBidDuplicateCheck({ identifierId: id }),
-    scopeEnabled: false,
+    services: ['business_bid_duplicate_check'],
   },
   {
     key: 'technicalBidDuplicateCheck',
     label: '技术标查重',
     icon: '📐',
     description: '仅对技术标文档之间进行内容查重',
-    execute: (id) => runTechnicalBidDuplicateCheck({ identifierId: id }),
-    scopeEnabled: false,
+    services: ['technical_bid_duplicate_check'],
   },
   {
     key: 'businessBidFormatReview',
     label: '形式审查',
     icon: '🔍',
     description: '检查商务标格式规范性与完整性',
-    execute: (id) => runBusinessBidFormatReview(id),
-    scopeEnabled: false,
+    services: ['business_bid_format_review'],
   },
   {
     key: 'personnelReuseCheck',
     label: '人员复用',
     icon: '👥',
     description: '检测关键人员是否在不同标书中重复出现',
-    execute: (id) => runPersonnelReuseCheck(id),
-    scopeEnabled: false,
+    services: ['personnel_reuse_check'],
   },
   {
     key: 'typoCheck',
     label: '错字检查',
     icon: '✏️',
     description: '检查标书中的错别字与用词不当',
-    execute: (id) => runTypoCheck(id),
-    scopeEnabled: false,
+    services: ['typo_check'],
   },
   {
     key: 'bidDocumentReview',
     label: '综合审查',
     icon: '📝',
     description: '一键执行全部审查项并汇总结果',
-    execute: (id) => runBidDocumentReview({ identifierId: id, documentScope: 'all' }),
-    scopeEnabled: true,
+    services: [
+      'business_bid_format_review',
+      'business_bid_duplicate_check',
+      'technical_bid_duplicate_check',
+      'personnel_reuse_check',
+      'typo_check',
+    ],
   },
 ]
+
+/**
+ * 将 /api/analysis.run 统一返回结果标准化为各卡片需要的格式。
+ * 卡片依赖 result.summary.document_count (或 total) 和 result.summary.suspicious_* 字段。
+ */
+function normalizeAnalysisResult(analysisType, apiResult) {
+  const results = apiResult?.results ?? {}
+  const serviceKeys = analysisType.services
+
+  // 单服务类型：直接提取该服务的 summary
+  if (serviceKeys.length === 1) {
+    const svcKey = serviceKeys[0]
+    const svcResult = results[svcKey]
+
+    if (!svcResult) {
+      return { summary: { total: 0, suspicious: 0 } }
+    }
+
+    // 从各服务结果中提取 summary
+    let documentCount = 0
+    let suspiciousCount = 0
+
+    if (svcKey === 'business_bid_format_review') {
+      documentCount = svcResult.review?.summary?.bidder_count ?? svcResult.overview?.bidder_count ?? 0
+      suspiciousCount = svcResult.review?.summary?.review_status_counts?.fail ?? 0
+    } else if (svcKey === 'business_bid_duplicate_check' || svcKey === 'technical_bid_duplicate_check') {
+      documentCount = svcResult.summary?.document_count ?? svcResult.groups?.[svcKey === 'business_bid_duplicate_check' ? 'business_bid' : 'technical_bid']?.summary?.document_count ?? 0
+      suspiciousCount = svcResult.summary?.suspicious_pair_count ?? 0
+    } else if (svcKey === 'personnel_reuse_check') {
+      documentCount = svcResult.summary?.total ?? 0
+      suspiciousCount = svcResult.summary?.suspicious ?? 0
+    } else if (svcKey === 'typo_check') {
+      documentCount = svcResult.summary?.document_count ?? 0
+      suspiciousCount = svcResult.summary?.suspicious_typo_document_count ?? (svcResult.summary?.suspicious ? 1 : 0)
+    }
+
+    return {
+      ...svcResult,
+      summary: {
+        ...svcResult.summary,
+        document_count: documentCount,
+        total: documentCount,
+        suspicious: suspiciousCount,
+        suspicious_pair_count: suspiciousCount,
+        suspicious_document_count: suspiciousCount,
+      },
+    }
+  }
+
+  // 多服务类型（全文比对查重、综合审查）：合并各服务的 summary
+  let totalDocuments = 0
+  let totalSuspicious = 0
+
+  for (const svcKey of serviceKeys) {
+    const svcResult = results[svcKey]
+    if (!svcResult) continue
+
+    if (svcKey === 'business_bid_format_review') {
+      totalDocuments += svcResult.review?.summary?.bidder_count ?? 0
+      totalSuspicious += svcResult.review?.summary?.review_status_counts?.fail ?? 0
+    } else if (svcKey === 'business_bid_duplicate_check' || svcKey === 'technical_bid_duplicate_check') {
+      totalDocuments += svcResult.summary?.document_count ?? 0
+      totalSuspicious += svcResult.summary?.suspicious_pair_count ?? 0
+    } else if (svcKey === 'personnel_reuse_check') {
+      totalDocuments += svcResult.summary?.total ?? 0
+      totalSuspicious += svcResult.summary?.suspicious ?? 0
+    } else if (svcKey === 'typo_check') {
+      totalDocuments += svcResult.summary?.document_count ?? 0
+      totalSuspicious += svcResult.summary?.suspicious_typo_document_count ?? 0
+    }
+  }
+
+  return {
+    ...apiResult,
+    summary: {
+      document_count: totalDocuments,
+      total: totalDocuments,
+      suspicious: totalSuspicious,
+      suspicious_pair_count: totalSuspicious,
+      suspicious_document_count: totalSuspicious,
+    },
+  }
+}
 
 function getAnalysisStatusIcon(status) {
   switch (status) {
@@ -175,23 +251,34 @@ export default function AnalysisPage() {
     const keys = [...checkedServices]
     const typesToRun = ANALYSIS_TYPES.filter((t) => keys.includes(t.key))
 
+    // 收集所有需要执行的服务（去重）
+    const allServices = [...new Set(typesToRun.flatMap((t) => t.services))]
+
+    // 标记所有选中类型为执行中
     for (const analysisType of typesToRun) {
-      const key = analysisType.key
-      setAnalysisStatus((prev) => ({ ...prev, [key]: 'running' }))
-
-      const startTime = new Date()
+      setAnalysisStatus((prev) => ({ ...prev, [analysisType.key]: 'running' }))
       addLog(analysisType.label, 'running')
+    }
 
-      try {
-        const result = await analysisType.execute(selectedProjectId)
-        setAnalysisStatus((prev) => ({ ...prev, [key]: 'success' }))
-        setResults((prev) => ({ ...prev, [key]: result }))
+    try {
+      const result = await runAnalysis({
+        projectIdentifier: selectedProjectId,
+        services: allServices,
+      })
+
+      // 一次调用返回所有结果，根据各类型需要的服务提取对应结果
+      for (const analysisType of typesToRun) {
+        const normalizedResult = normalizeAnalysisResult(analysisType, result)
+        setAnalysisStatus((prev) => ({ ...prev, [analysisType.key]: 'success' }))
+        setResults((prev) => ({ ...prev, [analysisType.key]: normalizedResult }))
         updateLog(analysisType.label, 'success')
-      } catch (error) {
-        setAnalysisStatus((prev) => ({ ...prev, [key]: 'error' }))
-        setNotice({ type: 'error', message: `${analysisType.label}失败: ${error.message}` })
+      }
+    } catch (error) {
+      for (const analysisType of typesToRun) {
+        setAnalysisStatus((prev) => ({ ...prev, [analysisType.key]: 'error' }))
         updateLog(analysisType.label, 'error')
       }
+      setNotice({ type: 'error', message: `分析执行失败: ${error.message}` })
     }
   }
 

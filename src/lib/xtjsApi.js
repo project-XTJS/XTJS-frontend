@@ -149,26 +149,26 @@ export async function batchDeleteProjects(identifierIds) {
   })
 }
 
-export async function batchRecognizeProjectDocuments({
-  projectIdentifier,
-  bidGroupParallelism = 4,
+export async function ingestProjectDocuments({
+  projectName,
+  bidGroupParallelism = 1,
   tenderFile,
-  bidGroups,
+  businessBidFiles,
+  technicalBidFiles,
 }) {
   const formData = new FormData()
+  formData.append('project_name', projectName)
   formData.append('tender_file', tenderFile)
   formData.append('bid_group_parallelism', `${bidGroupParallelism}`)
 
-  if (projectIdentifier?.trim()) {
-    formData.append('project_identifier', projectIdentifier.trim())
-  }
-
-  bidGroups.forEach((group) => {
-    formData.append('business_bid_files', group.businessFile)
-    formData.append('technical_bid_files', group.technicalFile)
+  businessBidFiles.forEach((file) => {
+    formData.append('business_bid_files', file)
+  })
+  technicalBidFiles.forEach((file) => {
+    formData.append('technical_bid_files', file)
   })
 
-  return request('/api/postgresql/projects/batch/recognize', {
+  return request('/api/postgresql/projects/batch/ingest-recognize', {
     method: 'POST',
     body: formData,
   })
@@ -188,86 +188,58 @@ export async function getProjectVisualizationData(identifierId) {
   return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/visualization-data`)
 }
 
+// ─── OCR Execution ───────────────────────────────────
+
+export async function runTenderOcr(identifierId, { parallelism = 1 } = {}) {
+  const formBody = new URLSearchParams()
+  formBody.append('parallelism', `${parallelism}`)
+
+  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/run-tender-ocr`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: formBody,
+  })
+}
+
+export async function runBusinessOcr(identifierId, { parallelism = 1 } = {}) {
+  const formBody = new URLSearchParams()
+  formBody.append('parallelism', `${parallelism}`)
+
+  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/run-business-ocr`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: formBody,
+  })
+}
+
+export async function continueTechnicalOcr(identifierId, { parallelism = 1 } = {}) {
+  const formBody = new URLSearchParams()
+  formBody.append('parallelism', `${parallelism}`)
+
+  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/continue-technical-ocr`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: formBody,
+  })
+}
+
 // ─── Analysis Execution ──────────────────────────────
 
-export async function runDuplicateCheck({
-  identifierId,
-  documentScope = 'all',
+export async function runAnalysis({
+  projectIdentifier,
+  services,
   maxEvidenceSections = 5,
   maxPairsPerType = 0,
 }) {
-  return request('/api/postgresql/projects/duplicate-check', {
+  return request('/api/analysis/run', {
     method: 'POST',
-    query: {
-      identifier_id: identifierId,
-      document_scope: documentScope,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      project_identifier: projectIdentifier,
+      services,
       max_evidence_sections: maxEvidenceSections,
       max_pairs_per_type: maxPairsPerType,
-    },
-  })
-}
-
-export async function runBusinessBidDuplicateCheck({
-  identifierId,
-  maxEvidenceSections = 5,
-  maxPairsPerType = 0,
-}) {
-  return request('/api/postgresql/projects/business-bid-duplicate-check', {
-    method: 'POST',
-    query: {
-      identifier_id: identifierId,
-      max_evidence_sections: maxEvidenceSections,
-      max_pairs_per_type: maxPairsPerType,
-    },
-  })
-}
-
-export async function runTechnicalBidDuplicateCheck({
-  identifierId,
-  maxEvidenceSections = 5,
-  maxPairsPerType = 0,
-}) {
-  return request('/api/postgresql/projects/technical-bid-duplicate-check', {
-    method: 'POST',
-    query: {
-      identifier_id: identifierId,
-      max_evidence_sections: maxEvidenceSections,
-      max_pairs_per_type: maxPairsPerType,
-    },
-  })
-}
-
-export async function runBusinessBidFormatReview(identifierId) {
-  return request('/api/postgresql/projects/business-bid-format-review', {
-    method: 'POST',
-    query: { identifier_id: identifierId },
-  })
-}
-
-export async function runPersonnelReuseCheck(identifierId) {
-  return request('/api/postgresql/projects/personnel-reuse-check', {
-    method: 'POST',
-    query: { identifier_id: identifierId },
-  })
-}
-
-export async function runTypoCheck(identifierId) {
-  return request('/api/postgresql/projects/typo-check', {
-    method: 'POST',
-    query: { identifier_id: identifierId },
-  })
-}
-
-export async function runBidDocumentReview({
-  identifierId,
-  documentScope = 'all',
-}) {
-  return request('/api/postgresql/projects/bid-document-review', {
-    method: 'POST',
-    query: {
-      identifier_id: identifierId,
-      document_scope: documentScope,
-    },
+    }),
   })
 }
 

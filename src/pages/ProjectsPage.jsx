@@ -1,9 +1,12 @@
 import { startTransition, useCallback, useEffect, useState } from 'react'
 import {
-  batchRecognizeProjectDocuments,
+  continueTechnicalOcr,
   deleteProject,
   getProjectDetail,
+  ingestProjectDocuments,
   listProjects,
+  runBusinessOcr,
+  runTenderOcr,
 } from '../lib/xtjsApi'
 import {
   deriveBidderName,
@@ -28,9 +31,9 @@ function createBidGroupDraft() {
 
 function createInitialComposer() {
   return {
-    projectIdentifier: '',
+    projectName: '',
     tenderFile: null,
-    bidGroupParallelism: 4,
+    bidGroupParallelism: 1,
     bidGroups: [createBidGroupDraft()],
   }
 }
@@ -173,6 +176,7 @@ export default function ProjectsPage() {
     null
 
   const canSubmitComposer =
+    Boolean(composer.projectName.trim()) &&
     Boolean(composer.tenderFile) &&
     composer.bidGroups.length > 0 &&
     composer.bidGroups.every((group) => group.businessFile && group.technicalFile)
@@ -214,28 +218,32 @@ export default function ProjectsPage() {
     setNotice(null)
 
     try {
-      const payload = await batchRecognizeProjectDocuments({
-        projectIdentifier: composer.projectIdentifier,
+      const businessBidFiles = composer.bidGroups.map((g) => g.businessFile)
+      const technicalBidFiles = composer.bidGroups.map((g) => g.technicalFile)
+
+      const payload = await ingestProjectDocuments({
+        projectName: composer.projectName.trim(),
         bidGroupParallelism: composer.bidGroupParallelism,
         tenderFile: composer.tenderFile,
-        bidGroups: composer.bidGroups,
+        businessBidFiles,
+        technicalBidFiles,
       })
+
+      const projectId = payload.project?.identifier_id
 
       let nextProject
       try {
-        nextProject = normalizeProject(await getProjectDetail(payload.project.identifier_id))
+        nextProject = normalizeProject(await getProjectDetail(projectId))
       } catch {
         nextProject = {
-          id: payload.project.identifier_id,
-          identifierId: payload.project.identifier_id,
+          id: projectId,
+          identifierId: projectId,
           title: composer.tenderFile?.name
             ? stripExtension(composer.tenderFile.name)
-            : payload.project.identifier_id,
-          createdAt: payload.project.create_time,
-          updatedAt: payload.project.update_time,
-          relations: (payload.bid_groups?.items ?? [])
-            .filter((item) => item.status === 'success' && item.relation)
-            .map((item) => normalizeRelation(item.relation, 0)),
+            : projectId,
+          createdAt: payload.project?.create_time ?? new Date().toISOString(),
+          updatedAt: payload.project?.update_time ?? new Date().toISOString(),
+          relations: [],
           results: {},
         }
       }
@@ -251,8 +259,34 @@ export default function ProjectsPage() {
       })
 
       setNotice({
-        type: 'success',
-        message: `项目 ${payload.project.identifier_id} 创建成功。`,
+        type: 'info',
+        message: `项目 ${projectId} 创建成功，正在启动 OCR 解析...`,
+      })
+
+      // 异步触发 OCR（招标文件 → 商务标 → 技术标）
+      const ocrResults = []
+      try {
+        ocrResults.push(await runTenderOcr(projectId, { parallelism: composer.bidGroupParallelism }))
+      } catch (e) {
+        ocrResults.push({ error: e.message })
+      }
+      try {
+        ocrResults.push(await runBusinessOcr(projectId, { parallelism: composer.bidGroupParallelism }))
+      } catch (e) {
+        ocrResults.push({ error: e.message })
+      }
+      try {
+        ocrResults.push(await continueTechnicalOcr(projectId, { parallelism: composer.bidGroupParallelism }))
+      } catch (e) {
+        ocrResults.push({ error: e.message })
+      }
+
+      const ocrFailed = ocrResults.some((r) => r?.error)
+      setNotice({
+        type: ocrFailed ? 'warning' : 'success',
+        message: ocrFailed
+          ? `项目 ${projectId} 创建成功，部分 OCR 触发失败，请手动重试。`
+          : `项目 ${projectId} 创建成功，OCR 解析已全部启动。`,
       })
     } catch (error) {
       setNotice({
@@ -317,11 +351,11 @@ export default function ProjectsPage() {
 
           <div className="create-grid">
             <label className="field">
-              <span>项目标识</span>
+              <span>项目名称</span>
               <input
-                value={composer.projectIdentifier}
-                onChange={(event) => updateComposerField('projectIdentifier', event.target.value)}
-                placeholder="可选，不填则由后端生成"
+                value={composer.projectName}
+                onChange={(event) => updateComposerField('projectName', event.target.value)}
+                placeholder="输入项目名称"
               />
             </label>
 
