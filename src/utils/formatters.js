@@ -49,13 +49,32 @@ export const DOCUMENT_SCOPE_OPTIONS = [
   { value: 'technical_bid', label: '仅技术标' },
 ]
 
+export function getParsingProgress(parsingStatus) {
+  switch (parsingStatus) {
+    case 1:
+      return { percent: 33, label: '招标文件已解析' }
+    case 2:
+      return { percent: 66, label: '商务标已解析' }
+    case 3:
+      return { percent: 100, label: '解析完成' }
+    default:
+      return { percent: 0, label: '未开始' }
+  }
+}
+
 export function getProjectStatus(project) {
   const hasRelations = project.relations.length > 0
   const results = project.results ?? {}
   const resultKeys = Object.keys(results).filter((k) => results[k])
+  const parsingStatus = project.parsingStatus ?? 0
 
   if (!hasRelations) {
     return { label: '待绑定', className: 'status-pending' }
+  }
+
+  // 解析中（未完成）：显示"解析中"
+  if (parsingStatus === 1 || parsingStatus === 2) {
+    return { label: '解析中', className: 'status-running' }
   }
 
   const hasSuspicious = resultKeys.some((key) => {

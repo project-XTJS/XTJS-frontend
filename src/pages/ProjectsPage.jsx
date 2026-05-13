@@ -12,6 +12,7 @@ import {
   deriveBidderName,
   deriveProjectTitle,
   formatDateTime,
+  getParsingProgress,
   getProjectStatus,
   getProjectSummary,
   stripExtension,
@@ -74,6 +75,7 @@ function normalizeProject(detail) {
     title: deriveProjectTitle(detail.project.identifier_id, relations),
     createdAt: detail.project.create_time,
     updatedAt: detail.project.update_time,
+    parsingStatus: detail.project.parsing_status ?? 0,
     relations,
     results: {},
   }
@@ -86,6 +88,7 @@ function normalizeProjectFromListItem(item) {
     title: item.identifier_id,
     createdAt: item.create_time,
     updatedAt: item.update_time,
+    parsingStatus: item.parsing_status ?? 0,
     relations: [],
     results: {},
   }
@@ -522,6 +525,16 @@ export default function ProjectsPage() {
                     label="分析状态"
                     value={getProjectStatus(activeProject).label}
                   />
+                </div>
+
+                <div className="parsing-progress">
+                  <div className="parsing-progress-bar">
+                    <div
+                      className="parsing-progress-fill"
+                      style={{ width: `${getParsingProgress(activeProject.parsingStatus).percent}%` }}
+                    />
+                  </div>
+                  <span>{getParsingProgress(activeProject.parsingStatus).label}</span>
                 </div>
 
                 <div className="action-row">

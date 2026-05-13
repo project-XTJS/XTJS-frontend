@@ -20,7 +20,6 @@ var RESULT_TYPE_LABELS = {
   bid_document_review: '综合审查',
 }
 
-// Group result types into categories for sidebar
 var RESULT_TYPE_CATEGORIES = [
   {
     label: '查重类',
@@ -36,7 +35,6 @@ var RESULT_TYPE_CATEGORIES = [
   },
 ]
 
-// Color scheme for result type cards
 var RESULT_TYPE_COLORS = {
   duplicate_check: '#dc2626',
   business_bid_duplicate_check: '#ea580c',
@@ -52,7 +50,6 @@ function collectAllAlerts(results) {
 
   var allAlerts = []
 
-  // Duplicate check alerts
   var duplicateTypes = ['duplicate_check', 'business_bid_duplicate_check', 'technical_bid_duplicate_check']
   for (var di = 0; di < duplicateTypes.length; di++) {
     var key = duplicateTypes[di]
@@ -153,7 +150,7 @@ function collectAllAlerts(results) {
     }
   }
 
-  // Bid document review alerts (nested within bidDocumentReview)
+  // Bid document review alerts
   var reviewResult = results.bid_document_review
   if (reviewResult && reviewResult.groups) {
     var rGroupEntries = Object.entries(reviewResult.groups)
@@ -194,12 +191,12 @@ function collectAllAlerts(results) {
           title: rpItem.name,
           description: '在 ' + rpItem.document_count + ' 份文档中重复出现',
           metrics: { documentCount: rpItem.document_count },
+          evidence: { documents: rpItem.documents || [] },
         })
       }
     }
   }
 
-  // Sort by risk level
   var order = { high: 3, medium: 2, low: 1, none: 0 }
   return allAlerts.sort(function (a, b) {
     return (order[b.riskLevel] || 0) - (order[a.riskLevel] || 0)
@@ -220,28 +217,51 @@ var RISK_LABELS = {
   none: 'NONE',
 }
 
-// Extract page number from alert evidence for PDF navigation
-function extractPageFromEvidence(alert) {
-  if (!alert.evidence) return 1
+// Extract document list from an alert for PDF preview rendering
+function getAlertDocIds(alert) {
+  var docs = []
 
-  // For duplicate check: use first duplicate block's page
-  var dupBlocks = alert.evidence.duplicateBlocks
-  if (dupBlocks && dupBlocks.length > 0) {
-    return dupBlocks[0].left_page || dupBlocks[0].page || 1
+  // Duplicate check: left + right documents
+  if (alert.leftDocumentId && alert.rightDocumentId) {
+    var dupBlocks = alert.evidence && alert.evidence.duplicateBlocks
+    var firstBlock = dupBlocks && dupBlocks[0]
+    docs.push({
+      docId: alert.leftDocumentId,
+      label: alert.leftFileName || '文档 A',
+      startPage: (firstBlock && (firstBlock.left_page || firstBlock.page)) || 1,
+    })
+    docs.push({
+      docId: alert.rightDocumentId,
+      label: alert.rightFileName || '文档 B',
+      startPage: (firstBlock && firstBlock.right_page) || 1,
+    })
+    return docs
   }
 
-  // For similar blocks
-  var simBlocks = alert.evidence.similarBlocks
-  if (simBlocks && simBlocks.length > 0) {
-    return simBlocks[0].left_page || 1
+  // Single document (typo, review-typo)
+  if (alert.documentId) {
+    docs.push({
+      docId: alert.documentId,
+      label: alert.title || '文档',
+      startPage: (alert.evidence && alert.evidence.page) || 1,
+    })
+    return docs
   }
 
-  // For typo check: direct page
-  if (alert.evidence.page) {
-    return alert.evidence.page
+  // Personnel reuse: multiple documents
+  var personnelDocs = (alert.evidence && alert.evidence.documents) || []
+  for (var i = 0; i < personnelDocs.length; i++) {
+    var d = personnelDocs[i]
+    if (d.identifier_id) {
+      docs.push({
+        docId: d.identifier_id,
+        label: d.file_name || ('文档 ' + (i + 1)),
+        startPage: 1,
+      })
+    }
   }
 
-  return 1
+  return docs
 }
 
 export default function ReviewPage() {
@@ -250,22 +270,18 @@ export default function ReviewPage() {
   var [selectedProjectId, setSelectedProjectId] = useState(searchParams.get('projectId') || '')
   var [results, setResults] = useState(null)
   var [allAlerts, setAllAlerts] = useState([])
-  var [filteredAlerts, setFilteredAlerts] = useState([])
-  var [activeResultTypes, setActiveResultTypes] = useState(new Set())
+  var [currentServiceType, setCurrentServiceType] = useState(null)
+  var [currentAlertIndex, setCurrentAlertIndex] = useState(0)
   var [reviewStatus, setReviewStatus] = useState({})
   var [reviewNotes, setReviewNotes] = useState({})
-  var [expandedAlert, setExpandedAlert] = useState(null)
-  var [diffData, setDiffData] = useState(null)
-  var [diffLoading, setDiffLoading] = useState(false)
   var [showExport, setShowExport] = useState(false)
   var [notice, setNotice] = useState(null)
   var [isLoading, setIsLoading] = useState(true)
   var [selectedAlerts, setSelectedAlerts] = useState(new Set())
-  // PDF page navigation
-  var [currentLeftPage, setCurrentLeftPage] = useState(1)
-  var [currentRightPage, setCurrentRightPage] = useState(1)
-  var [leftPageCount, setLeftPageCount] = useState(null)
-  var [rightPageCount, setRightPageCount] = useState(null)
+  // PDF preview state
+  var [previewData, setPreviewData] = useState({})
+  var [previewPages, setPreviewPages] = useState({})
+  var [previewLoading, setPreviewLoading] = useState(false)
   var [exportLoading, setExportLoading] = useState(false)
   var exportModalRef = useRef(null)
 
@@ -289,9 +305,19 @@ export default function ReviewPage() {
       setResults(projectResults)
       var alerts = collectAllAlerts(projectResults)
       setAllAlerts(alerts)
-      setFilteredAlerts(alerts)
-      setActiveResultTypes(new Set(Object.keys(projectResults).filter(function (k) { return projectResults[k] })))
       setSelectedAlerts(new Set())
+
+      // Auto-select first service type that has alerts
+      var availableTypes = Object.keys(projectResults).filter(function (k) { return projectResults[k] })
+      var firstTypeWithAlerts = null
+      for (var ti = 0; ti < availableTypes.length; ti++) {
+        if (alerts.some(function (a) { return a.resultType === availableTypes[ti] })) {
+          firstTypeWithAlerts = availableTypes[ti]
+          break
+        }
+      }
+      setCurrentServiceType(firstTypeWithAlerts)
+      setCurrentAlertIndex(0)
     }).catch(function () {
       setNotice({ type: 'error', message: '加载项目结果失败' })
     }).finally(function () {
@@ -310,32 +336,115 @@ export default function ReviewPage() {
   function handleProjectChange(projectId) {
     setSelectedProjectId(projectId)
     setSearchParams(projectId ? { projectId } : {})
-    setExpandedAlert(null)
-    setDiffData(null)
     setReviewStatus({})
     setReviewNotes({})
     setSelectedAlerts(new Set())
-    setCurrentLeftPage(1)
-    setCurrentRightPage(1)
+    setPreviewData({})
+    setPreviewPages({})
+    setCurrentServiceType(null)
+    setCurrentAlertIndex(0)
   }
 
-  function toggleResultType(key) {
-    setActiveResultTypes(function (prev) {
-      var next = new Set(prev)
-      if (next.has(key)) {
-        next.delete(key)
-      } else {
-        next.add(key)
-      }
+  // Compute alerts for current service type
+  var serviceAlerts = currentServiceType
+    ? allAlerts.filter(function (a) { return a.resultType === currentServiceType })
+    : []
+
+  var currentAlert = serviceAlerts[currentAlertIndex] || null
+
+  // Load previews for current alert
+  useEffect(function () {
+    if (!currentAlert) {
+      setPreviewData({})
+      return
+    }
+
+    var docIds = getAlertDocIds(currentAlert)
+    if (docIds.length === 0) {
+      setPreviewData({})
+      return
+    }
+
+    setPreviewLoading(true)
+    var cancelled = false
+
+    var pages = {}
+    docIds.forEach(function (d) {
+      pages[d.docId] = previewPages[d.docId] || d.startPage
+    })
+
+    Promise.all(docIds.map(function (d) {
+      return getDocumentPreview(d.docId, pages[d.docId])
+        .then(function (preview) {
+          return { docId: d.docId, preview: preview }
+        })
+        .catch(function () {
+          return { docId: d.docId, preview: null }
+        })
+    })).then(function (results) {
+      if (cancelled) return
+      var newData = {}
+      results.forEach(function (r) {
+        newData[r.docId] = r.preview
+      })
+      setPreviewData(newData)
+      setPreviewPages(pages)
+      setPreviewLoading(false)
+    })
+
+    return function () { cancelled = true }
+  }, [currentAlert, selectedProjectId])
+
+  function selectServiceType(key) {
+    setCurrentServiceType(key)
+    setCurrentAlertIndex(0)
+    setPreviewData({})
+    setPreviewPages({})
+  }
+
+  function goToPrev() {
+    if (currentAlertIndex > 0) {
+      setCurrentAlertIndex(function (i) { return i - 1 })
+      setPreviewData({})
+      setPreviewPages({})
+    }
+  }
+
+  function goToNext() {
+    if (currentAlertIndex < serviceAlerts.length - 1) {
+      setCurrentAlertIndex(function (i) { return i + 1 })
+      setPreviewData({})
+      setPreviewPages({})
+    }
+  }
+
+  async function handleDocPageChange(docId, delta) {
+    var currentPage = previewPages[docId] || 1
+    var existing = previewData[docId]
+    var pageCount = existing && existing.page_count
+    var newPage = currentPage + delta
+    if (newPage < 1) return
+    if (pageCount && newPage > pageCount) return
+
+    setPreviewPages(function (prev) {
+      var next = {}
+      for (var k in prev) { next[k] = prev[k] }
+      next[docId] = newPage
       return next
     })
-  }
 
-  useEffect(function () {
-    setFilteredAlerts(
-      allAlerts.filter(function (alert) { return activeResultTypes.has(alert.resultType) }),
-    )
-  }, [allAlerts, activeResultTypes])
+    try {
+      var preview = await getDocumentPreview(docId, newPage)
+      setPreviewData(function (prev) {
+        var next = {}
+        for (var k in prev) { next[k] = prev[k] }
+        next[docId] = preview
+        return next
+      })
+    } catch (e) {
+      // ignore
+    }
+  }
 
   function handleReview(alertId, status) {
     setReviewStatus(function (prev) {
@@ -355,7 +464,6 @@ export default function ReviewPage() {
     })
   }
 
-  // Toggle alert selection
   function toggleAlertSelection(alertId) {
     setSelectedAlerts(function (prev) {
       var next = new Set(prev)
@@ -368,105 +476,18 @@ export default function ReviewPage() {
     })
   }
 
-  // Select all / deselect all visible alerts
-  function toggleSelectAll() {
+  // Select/deselect all alerts in current service type
+  function toggleSelectAllCurrent() {
+    if (!currentServiceType) return
     setSelectedAlerts(function (prev) {
-      if (prev.size >= filteredAlerts.length && filteredAlerts.length > 0) {
-        return new Set()
+      var allSelected = serviceAlerts.every(function (a) { return prev.has(a.id) })
+      if (allSelected) {
+        var next = new Set(prev)
+        serviceAlerts.forEach(function (a) { next.delete(a.id) })
+        return next
       }
-      return new Set(filteredAlerts.map(function (a) { return a.id }))
-    })
-  }
-
-  // Load PDF preview for a specific page
-  async function loadPagePreview(documentId, page, side) {
-    try {
-      var preview = await getDocumentPreview(documentId, page)
-      if (side === 'left') {
-        setLeftPageCount(preview.page_count)
-      } else {
-        setRightPageCount(preview.page_count)
-      }
-      return preview
-    } catch (e) {
-      return null
-    }
-  }
-
-  async function handleExpandAlert(alert) {
-    if (expandedAlert === alert.id) {
-      setExpandedAlert(null)
-      setDiffData(null)
-      return
-    }
-
-    var startPage = extractPageFromEvidence(alert)
-
-    setExpandedAlert(alert.id)
-    setDiffLoading(true)
-    setDiffData(null)
-    setCurrentLeftPage(startPage)
-    setCurrentRightPage(startPage)
-    setLeftPageCount(null)
-    setRightPageCount(null)
-
-    try {
-      var leftPreview = null
-      var rightPreview = null
-
-      if (alert.leftDocumentId) {
-        leftPreview = await loadPagePreview(alert.leftDocumentId, startPage, 'left')
-      }
-      if (alert.rightDocumentId) {
-        rightPreview = await loadPagePreview(alert.rightDocumentId, startPage, 'right')
-      }
-
-      setDiffData({
-        left: leftPreview,
-        right: rightPreview,
-        evidence: alert.evidence,
-        alert: alert,
-      })
-    } catch (e) {
-      setDiffData({ error: true })
-    } finally {
-      setDiffLoading(false)
-    }
-  }
-
-  // Change page for left or right document
-  async function handlePageChange(side, delta) {
-    var currentPage = side === 'left' ? currentLeftPage : currentRightPage
-    var newPage = currentPage + delta
-    if (newPage < 1) return
-
-    var pageCount = side === 'left' ? leftPageCount : rightPageCount
-    if (pageCount && newPage > pageCount) return
-
-    // Update page state
-    if (side === 'left') {
-      setCurrentLeftPage(newPage)
-    } else {
-      setCurrentRightPage(newPage)
-    }
-
-    // Load preview for new page
-    var alert = diffData && diffData.alert
-    if (!alert) return
-
-    var docId = side === 'left' ? alert.leftDocumentId : alert.rightDocumentId
-    if (!docId) return
-
-    var preview = await loadPagePreview(docId, newPage, side)
-    setDiffData(function (prev) {
-      if (!prev) return prev
-      var next = {}
-      for (var k in prev) { next[k] = prev[k] }
-      if (side === 'left') {
-        next.left = preview
-      } else {
-        next.right = preview
-      }
+      var next = new Set(prev)
+      serviceAlerts.forEach(function (a) { next.add(a.id) })
       return next
     })
   }
@@ -474,7 +495,7 @@ export default function ReviewPage() {
   function batchPassAll() {
     var newStatus = {}
     for (var key in reviewStatus) { newStatus[key] = reviewStatus[key] }
-    filteredAlerts.forEach(function (alert) {
+    serviceAlerts.forEach(function (alert) {
       if (!newStatus[alert.id]) {
         newStatus[alert.id] = { status: 'passed', reviewedAt: new Date().toISOString() }
       }
@@ -482,7 +503,6 @@ export default function ReviewPage() {
     setReviewStatus(newStatus)
   }
 
-  // Handle export
   async function handleExport(options) {
     if (!selectedProjectId || selectedAlerts.size === 0) return
 
@@ -493,7 +513,6 @@ export default function ReviewPage() {
         options: options,
       })
 
-      // Trigger download
       var url = window.URL.createObjectURL(blob)
       var a = document.createElement('a')
       a.href = url
@@ -518,9 +537,9 @@ export default function ReviewPage() {
     resultTypeCounts[alert.resultType] = (resultTypeCounts[alert.resultType] || 0) + 1
   })
 
-  var reviewedCount = Object.values(reviewStatus).length
-  var totalCount = filteredAlerts.length
-  var progressPercent = totalCount > 0 ? Math.round((reviewedCount / totalCount) * 100) : 0
+  var reviewedCount = Object.keys(reviewStatus).length
+  var totalCount = serviceAlerts.length
+  var progressPercent = totalCount > 0 ? Math.round((reviewedCount / Math.max(totalCount, allAlerts.length)) * 100) : 0
 
   // Build category groups for sidebar
   var sidebarCategories = RESULT_TYPE_CATEGORIES.map(function (cat) {
@@ -530,7 +549,6 @@ export default function ReviewPage() {
     }
   }).filter(function (cat) { return cat.types.length > 0 })
 
-  // Count selected alerts by result type for export summary
   var selectedByType = {}
   selectedAlerts.forEach(function (id) {
     var alert = allAlerts.find(function (a) { return a.id === id })
@@ -539,6 +557,9 @@ export default function ReviewPage() {
       selectedByType[rt] = (selectedByType[rt] || 0) + 1
     }
   })
+
+  // Build PDF panels for current alert
+  var pdfDocIds = currentAlert ? getAlertDocIds(currentAlert) : []
 
   return (
     <>
@@ -574,7 +595,7 @@ export default function ReviewPage() {
                   style={{ width: progressPercent + '%' }}
                 />
               </div>
-              <span>{reviewedCount}/{totalCount} 项已审核 ({progressPercent}%)</span>
+              <span>{progressPercent}% 已审核</span>
             </div>
           ) : null}
 
@@ -600,16 +621,18 @@ export default function ReviewPage() {
               <h3>结果筛选</h3>
             </div>
 
-            <div className="select-all-row">
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={selectedAlerts.size >= filteredAlerts.length && filteredAlerts.length > 0}
-                  onChange={toggleSelectAll}
-                />
-                <span>{selectedAlerts.size >= filteredAlerts.length && filteredAlerts.length > 0 ? '取消全选' : '全选当前'}</span>
-              </label>
-            </div>
+            {currentServiceType ? (
+              <div className="select-all-row">
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={serviceAlerts.length > 0 && serviceAlerts.every(function (a) { return selectedAlerts.has(a.id) })}
+                    onChange={toggleSelectAllCurrent}
+                  />
+                  <span>全选当前</span>
+                </label>
+              </div>
+            ) : null}
 
             {sidebarCategories.map(function (cat) {
               return (
@@ -617,10 +640,9 @@ export default function ReviewPage() {
                   <div className="filter-category-title">{cat.label}</div>
                   <div className="filter-card-list">
                     {cat.types.map(function (key) {
-                      var isActive = activeResultTypes.has(key)
+                      var isActive = currentServiceType === key
                       var count = resultTypeCounts[key] || 0
                       var color = RESULT_TYPE_COLORS[key] || '#64748b'
-                      var riskLevel = key.indexOf('duplicate') !== -1 ? '查重' : key.indexOf('review') !== -1 ? '审查' : '检查'
 
                       return (
                         <button
@@ -628,7 +650,7 @@ export default function ReviewPage() {
                           type="button"
                           className={'filter-card' + (isActive ? ' filter-card-active' : '')}
                           style={isActive ? { borderColor: color, background: color + '10' } : {}}
-                          onClick={function () { toggleResultType(key) }}
+                          onClick={function () { selectServiceType(key) }}
                         >
                           <span
                             className="filter-card-dot"
@@ -650,7 +672,7 @@ export default function ReviewPage() {
             })}
 
             <div className="review-actions">
-              <button type="button" className="ghost-button" onClick={batchPassAll}>
+              <button type="button" className="ghost-button" onClick={batchPassAll} disabled={!currentServiceType || serviceAlerts.length === 0}>
                 一键通过全部
               </button>
             </div>
@@ -659,239 +681,240 @@ export default function ReviewPage() {
           <section className="review-main">
             {isLoading ? (
               <EmptyBlock title="加载中..." />
-            ) : filteredAlerts.length > 0 ? (
-              <div className="alert-list">
-                {filteredAlerts.map(function (alert) {
-                  var review = reviewStatus[alert.id]
-                  var isReviewed = Boolean(review)
-                  var isPassed = review && review.status === 'passed'
-                  var isFlagged = review && review.status === 'flagged'
-                  var isSelected = selectedAlerts.has(alert.id)
+            ) : !currentServiceType ? (
+              <EmptyBlock title={results ? '请从左侧选择一个服务类型' : '暂无分析结果'} />
+            ) : serviceAlerts.length === 0 ? (
+              <EmptyBlock title="该类型下未发现可疑项" />
+            ) : currentAlert ? (
+              <div className="detail-container">
+                {/* ── Navigation bar ── */}
+                <div className="detail-nav">
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    disabled={currentAlertIndex === 0}
+                    onClick={goToPrev}
+                  >
+                    ◀ 上一条
+                  </button>
+                  <span className="detail-nav-info">
+                    第 {currentAlertIndex + 1}/{serviceAlerts.length} 条
+                  </span>
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    disabled={currentAlertIndex >= serviceAlerts.length - 1}
+                    onClick={goToNext}
+                  >
+                    下一条 ▶
+                  </button>
+                </div>
 
-                  return (
-                    <div
-                      key={alert.id}
-                      className={'alert-card review-alert-card' + (
-                        isPassed ? ' alert-passed' : isFlagged ? ' alert-flagged' : ''
-                      ) + (isSelected ? ' alert-selected' : '')}
-                    >
-                      <div className="alert-card-head">
-                        <div className="alert-card-meta">
-                          <label className="checkbox-label alert-checkbox">
-                            <input
-                              type="checkbox"
-                              checked={isSelected}
-                              onChange={function () { toggleAlertSelection(alert.id) }}
-                              onClick={function (event) { event.stopPropagation() }}
-                            />
-                          </label>
-                          <span className={'risk-tag ' + (RISK_CLASSES[alert.riskLevel] || 'risk-none')}>
-                            {RISK_LABELS[alert.riskLevel] || alert.riskLevel}
+                {/* ── Alert info ── */}
+                <div className="panel detail-info">
+                  <div className="detail-info-head">
+                    <span className={'risk-tag ' + (RISK_CLASSES[currentAlert.riskLevel] || 'risk-none')}>
+                      {RISK_LABELS[currentAlert.riskLevel] || currentAlert.riskLevel}
+                    </span>
+                    <span className="alert-tag">{currentAlert.resultTypeLabel}</span>
+                    <span className="alert-tag">{currentAlert.groupLabel}</span>
+                    {reviewStatus[currentAlert.id] ? (
+                      <span className={'review-badge ' + (reviewStatus[currentAlert.id].status === 'passed' ? 'badge-passed' : 'badge-flagged')}>
+                        {reviewStatus[currentAlert.id].status === 'passed' ? '✅ 已通过' : '⚠ 已标记'}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  <strong className="alert-title">{currentAlert.title}</strong>
+                  <p>{currentAlert.description}</p>
+
+                  {currentAlert.metrics ? (
+                    <div className="alert-metrics">
+                      {Object.entries(currentAlert.metrics).map(function (entry) {
+                        var key = entry[0]
+                        var value = entry[1]
+                        return (
+                          <span key={key}>
+                            {key}: {typeof value === 'number' ? value.toFixed ? value.toFixed(2) : value : value}
                           </span>
-                          <span className="alert-tag">{alert.resultTypeLabel}</span>
-                          <span className="alert-tag">{alert.groupLabel}</span>
-                        </div>
-                        {isReviewed ? (
-                          <span className={'review-badge ' + (isPassed ? 'badge-passed' : 'badge-flagged')}>
-                            {isPassed ? '✅ 已通过' : '⚠ 已标记'}
-                          </span>
-                        ) : null}
-                      </div>
-
-                      <strong className="alert-title">{alert.title}</strong>
-                      <p>{alert.description}</p>
-
-                      {alert.metrics ? (
-                        <div className="alert-metrics">
-                          {Object.entries(alert.metrics).map(function (entry) {
-                            var key = entry[0]
-                            var value = entry[1]
-                            return (
-                              <span key={key}>
-                                {key}: {typeof value === 'number' ? value.toFixed(2) : value}
-                              </span>
-                            )
-                          })}
-                        </div>
-                      ) : null}
-
-                      <div className="alert-actions">
-                        <button
-                          type="button"
-                          className="text-button"
-                          onClick={function () { handleExpandAlert(alert) }}
-                          disabled={!alert.evidence}
-                        >
-                          {expandedAlert === alert.id ? '收起对比' : '查看原文对比'}
-                        </button>
-
-                        <div className="alert-review-actions">
-                          <button
-                            type="button"
-                            className="ghost-button"
-                            onClick={function () { handleReview(alert.id, 'passed') }}
-                            disabled={isPassed}
-                          >
-                            审核通过
-                          </button>
-                          <button
-                            type="button"
-                            className="ghost-button"
-                            onClick={function () { handleReview(alert.id, 'flagged') }}
-                            disabled={isFlagged}
-                          >
-                            标记异常
-                          </button>
-                        </div>
-                      </div>
-
-                      {review && review.note ? (
-                        <p className="review-note">备注: {review.note}</p>
-                      ) : null}
-
-                      <input
-                        className="review-note-input"
-                        placeholder="添加备注..."
-                        value={reviewNotes[alert.id] || ''}
-                        onChange={function (event) { handleNote(alert.id, event.target.value) }}
-                        onBlur={function () {
-                          var note = reviewNotes[alert.id] || ''
-                          if (note.trim()) {
-                            setReviewStatus(function (prev) {
-                              var next = {}
-                              for (var k in prev) { next[k] = prev[k] }
-                              next[alert.id] = Object.assign({}, prev[alert.id], { note: note.trim() })
-                              return next
-                            })
-                          }
-                        }}
-                      />
-
-                      {expandedAlert === alert.id ? (
-                        <div className="diff-viewer">
-                          {diffLoading ? (
-                            <EmptyBlock title="加载对比数据..." />
-                          ) : diffData && diffData.error ? (
-                            <EmptyBlock title="无法加载原文对比" />
-                          ) : diffData ? (
-                            <div className="diff-content">
-                              <div className="diff-panel">
-                                <strong>{alert.leftFileName || '文档 A'}</strong>
-                                {diffData.left ? (
-                                  <div className="diff-page-preview">
-                                    {diffData.left.image_data_url ? (
-                                      <img
-                                        src={diffData.left.image_data_url}
-                                        alt={alert.leftFileName}
-                                        className="diff-image"
-                                      />
-                                    ) : (
-                                      <p>第 {diffData.left.page} 页，共 {diffData.left.page_count} 页</p>
-                                    )}
-                                    {/* Page navigation */}
-                                    <div className="pdf-page-nav">
-                                      <button
-                                        type="button"
-                                        className="pdf-page-btn"
-                                        disabled={currentLeftPage <= 1}
-                                        onClick={function () { handlePageChange('left', -1) }}
-                                      >
-                                        ◀ 上一页
-                                      </button>
-                                      <span className="pdf-page-info">
-                                        {currentLeftPage}{leftPageCount ? ' / ' + leftPageCount : ''}
-                                      </span>
-                                      <button
-                                        type="button"
-                                        className="pdf-page-btn"
-                                        disabled={leftPageCount && currentLeftPage >= leftPageCount}
-                                        onClick={function () { handlePageChange('left', 1) }}
-                                      >
-                                        下一页 ▶
-                                      </button>
-                                    </div>
-                                  </div>
-                                ) : (
-                                  <EmptyBlock title="无预览" />
-                                )}
-                              </div>
-
-                              <div className="diff-panel">
-                                <strong>{alert.rightFileName || '文档 B'}</strong>
-                                {diffData.right ? (
-                                  <div className="diff-page-preview">
-                                    {diffData.right.image_data_url ? (
-                                      <img
-                                        src={diffData.right.image_data_url}
-                                        alt={alert.rightFileName}
-                                        className="diff-image"
-                                      />
-                                    ) : (
-                                      <p>第 {diffData.right.page} 页，共 {diffData.right.page_count} 页</p>
-                                    )}
-                                    {/* Page navigation */}
-                                    <div className="pdf-page-nav">
-                                      <button
-                                        type="button"
-                                        className="pdf-page-btn"
-                                        disabled={currentRightPage <= 1}
-                                        onClick={function () { handlePageChange('right', -1) }}
-                                      >
-                                        ◀ 上一页
-                                      </button>
-                                      <span className="pdf-page-info">
-                                        {currentRightPage}{rightPageCount ? ' / ' + rightPageCount : ''}
-                                      </span>
-                                      <button
-                                        type="button"
-                                        className="pdf-page-btn"
-                                        disabled={rightPageCount && currentRightPage >= rightPageCount}
-                                        onClick={function () { handlePageChange('right', 1) }}
-                                      >
-                                        下一页 ▶
-                                      </button>
-                                    </div>
-                                  </div>
-                                ) : (
-                                  <EmptyBlock title="无预览" />
-                                )}
-                              </div>
-
-                              {diffData.evidence ? (
-                                <div className="diff-evidence">
-                                  <strong>匹配片段</strong>
-                                  {(diffData.evidence.duplicateBlocks || []).slice(0, 5).map(function (block, i) {
-                                    return (
-                                      <div key={i} className="diff-block">
-                                        <span className="diff-block-page">第 {(block.left_page || block.page)} 页</span>
-                                        <p>{block.text || block.left_text}</p>
-                                      </div>
-                                    )
-                                  })}
-                                  {(diffData.evidence.similarBlocks || []).slice(0, 3).map(function (block, i) {
-                                    return (
-                                      <div key={'sim-' + i} className="diff-block diff-block-similar">
-                                        <span className="diff-block-page">
-                                          相似: L{block.left_page} / R{block.right_page}
-                                        </span>
-                                        <p>L: {block.left_text}</p>
-                                        <p>R: {block.right_text}</p>
-                                      </div>
-                                    )
-                                  })}
-                                </div>
-                              ) : null}
-                            </div>
-                          ) : null}
-                        </div>
-                      ) : null}
+                        )
+                      })}
                     </div>
-                  )
-                })}
+                  ) : null}
+                </div>
+
+                {/* ── PDF preview row ── */}
+                {pdfDocIds.length > 0 ? (
+                  <div className="detail-pdf-row">
+                    {previewLoading ? (
+                      <div className="panel detail-pdf-panel detail-pdf-loading">
+                        <EmptyBlock title="加载预览..." />
+                      </div>
+                    ) : (
+                      pdfDocIds.map(function (docInfo) {
+                        var preview = previewData[docInfo.docId]
+                        var currentPage = previewPages[docInfo.docId] || docInfo.startPage
+                        var pageCount = preview && preview.page_count
+
+                        return (
+                          <div className="panel detail-pdf-panel" key={docInfo.docId}>
+                            <strong className="detail-pdf-name">{docInfo.label}</strong>
+                            <div className="diff-page-preview">
+                              {preview ? (
+                                preview.image_data_url ? (
+                                  <img
+                                    src={preview.image_data_url}
+                                    alt={docInfo.label}
+                                    className="diff-image"
+                                  />
+                                ) : (
+                                  <p>第 {preview.page} 页，共 {preview.page_count} 页</p>
+                                )
+                              ) : (
+                                <p>无预览</p>
+                              )}
+                            </div>
+                            <div className="pdf-page-nav">
+                              <button
+                                type="button"
+                                className="pdf-page-btn"
+                                disabled={currentPage <= 1}
+                                onClick={function () { handleDocPageChange(docInfo.docId, -1) }}
+                              >
+                                ◀ 上一页
+                              </button>
+                              <span className="pdf-page-info">
+                                {currentPage}{pageCount ? ' / ' + pageCount : ''}
+                              </span>
+                              <button
+                                type="button"
+                                className="pdf-page-btn"
+                                disabled={pageCount && currentPage >= pageCount}
+                                onClick={function () { handleDocPageChange(docInfo.docId, 1) }}
+                              >
+                                下一页 ▶
+                              </button>
+                            </div>
+                          </div>
+                        )
+                      })
+                    )}
+                  </div>
+                ) : null}
+
+                {/* ── Text evidence ── */}
+                {currentAlert.evidence ? (
+                  <div className="panel detail-text-block">
+                    <strong>检测文字</strong>
+
+                    {/* Duplicate blocks */}
+                    {(currentAlert.evidence.duplicateBlocks || []).map(function (block, i) {
+                      return (
+                        <div key={'dup-' + i} className="diff-block">
+                          <span className="diff-block-page">
+                            第 {(block.left_page || block.page)} 页（左）/ 第 {(block.right_page || '--')} 页（右）
+                          </span>
+                          <p>{block.text || block.left_text}</p>
+                        </div>
+                      )
+                    })}
+
+                    {/* Similar blocks */}
+                    {(currentAlert.evidence.similarBlocks || []).map(function (block, i) {
+                      return (
+                        <div key={'sim-' + i} className="diff-block diff-block-similar">
+                          <span className="diff-block-page">
+                            相似: L{block.left_page} / R{block.right_page}
+                          </span>
+                          <p>L: {block.left_text}</p>
+                          <p>R: {block.right_text}</p>
+                        </div>
+                      )
+                    })}
+
+                    {/* Typo evidence */}
+                    {currentAlert.evidence.matchedText ? (
+                      <div className="diff-block">
+                        <span className="diff-block-page">
+                          第 {currentAlert.evidence.page} 页
+                        </span>
+                        <p>
+                          检测到: <strong>{currentAlert.evidence.matchedText}</strong>
+                          {currentAlert.evidence.suggestion ? ' → ' + currentAlert.evidence.suggestion : ''}
+                        </p>
+                      </div>
+                    ) : null}
+
+                    {/* Personnel documents list */}
+                    {(currentAlert.evidence.documents || []).length > 0 && !currentAlert.evidence.matchedText && !currentAlert.evidence.duplicateBlocks ? (
+                      (currentAlert.evidence.documents || []).map(function (doc, i) {
+                        return (
+                          <div key={'pdoc-' + i} className="diff-block">
+                            <span className="diff-block-page">文档 {i + 1}</span>
+                            <p>{doc.file_name}</p>
+                          </div>
+                        )
+                      })
+                    ) : null}
+                  </div>
+                ) : null}
+
+                {/* ── Actions ── */}
+                <div className="panel detail-actions">
+                  <label className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={selectedAlerts.has(currentAlert.id)}
+                      onChange={function () { toggleAlertSelection(currentAlert.id) }}
+                    />
+                    <span>选择导出</span>
+                  </label>
+
+                  <div className="detail-review-actions">
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={function () { handleReview(currentAlert.id, 'passed') }}
+                      disabled={reviewStatus[currentAlert.id] && reviewStatus[currentAlert.id].status === 'passed'}
+                    >
+                      审核通过
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={function () { handleReview(currentAlert.id, 'flagged') }}
+                      disabled={reviewStatus[currentAlert.id] && reviewStatus[currentAlert.id].status === 'flagged'}
+                    >
+                      标记异常
+                    </button>
+                  </div>
+                </div>
+
+                {/* ── Notes ── */}
+                <div className="panel detail-notes">
+                  {reviewStatus[currentAlert.id] && reviewStatus[currentAlert.id].note ? (
+                    <p className="review-note">备注: {reviewStatus[currentAlert.id].note}</p>
+                  ) : null}
+                  <input
+                    className="review-note-input"
+                    placeholder="添加备注..."
+                    value={reviewNotes[currentAlert.id] || ''}
+                    onChange={function (event) { handleNote(currentAlert.id, event.target.value) }}
+                    onBlur={function () {
+                      var note = reviewNotes[currentAlert.id] || ''
+                      if (note.trim()) {
+                        setReviewStatus(function (prev) {
+                          var next = {}
+                          for (var k in prev) { next[k] = prev[k] }
+                          next[currentAlert.id] = Object.assign({}, prev[currentAlert.id], { note: note.trim() })
+                          return next
+                        })
+                      }
+                    }}
+                  />
+                </div>
               </div>
-            ) : (
-              <EmptyBlock title={results ? '未发现可疑项' : '暂无分析结果'} />
-            )}
+            ) : null}
           </section>
         </main>
       ) : (
@@ -922,7 +945,6 @@ export default function ReviewPage() {
             </div>
 
             <div className="modal-body">
-              {/* Export summary */}
               <div className="export-summary">
                 <div className="export-summary-item">
                   <span className="export-summary-label">选中项</span>

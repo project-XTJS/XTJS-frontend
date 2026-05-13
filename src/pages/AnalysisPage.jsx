@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
+  getProjectDetail,
   getProjectResults,
   listProjects,
   runAnalysis,
@@ -16,6 +17,7 @@ const ANALYSIS_TYPES = [
     icon: '📋',
     description: '比对商务标与技术标文档，发现高度相似的文本块',
     services: ['business_bid_duplicate_check', 'technical_bid_duplicate_check'],
+    requiredParsingStatus: 3,
   },
   {
     key: 'businessBidDuplicateCheck',
@@ -23,6 +25,7 @@ const ANALYSIS_TYPES = [
     icon: '📄',
     description: '仅对商务标文档之间进行内容查重',
     services: ['business_bid_duplicate_check'],
+    requiredParsingStatus: 2,
   },
   {
     key: 'technicalBidDuplicateCheck',
@@ -30,6 +33,7 @@ const ANALYSIS_TYPES = [
     icon: '📐',
     description: '仅对技术标文档之间进行内容查重',
     services: ['technical_bid_duplicate_check'],
+    requiredParsingStatus: 3,
   },
   {
     key: 'businessBidFormatReview',
@@ -37,6 +41,7 @@ const ANALYSIS_TYPES = [
     icon: '🔍',
     description: '检查商务标格式规范性与完整性',
     services: ['business_bid_format_review'],
+    requiredParsingStatus: 2,
   },
   {
     key: 'personnelReuseCheck',
@@ -44,6 +49,7 @@ const ANALYSIS_TYPES = [
     icon: '👥',
     description: '检测关键人员是否在不同标书中重复出现',
     services: ['personnel_reuse_check'],
+    requiredParsingStatus: 3,
   },
   {
     key: 'typoCheck',
@@ -51,6 +57,7 @@ const ANALYSIS_TYPES = [
     icon: '✏️',
     description: '检查标书中的错别字与用词不当',
     services: ['typo_check'],
+    requiredParsingStatus: 3,
   },
   {
     key: 'bidDocumentReview',
@@ -64,6 +71,7 @@ const ANALYSIS_TYPES = [
       'personnel_reuse_check',
       'typo_check',
     ],
+    requiredParsingStatus: 3,
   },
 ]
 
@@ -173,6 +181,7 @@ export default function AnalysisPage() {
   const [notice, setNotice] = useState(null)
   const [isLoading, setIsLoading] = useState(true)
   const [checkedServices, setCheckedServices] = useState(new Set())
+  const [selectedProjectParsingStatus, setSelectedProjectParsingStatus] = useState(0)
 
   const loadProjects = useCallback(async () => {
     try {
@@ -222,9 +231,25 @@ export default function AnalysisPage() {
     setSearchParams(projectId ? { projectId } : {})
     setResults({})
     setAnalysisStatus({})
+    setSelectedProjectParsingStatus(0)
+
+    if (projectId) {
+      getProjectDetail(projectId).then((detail) => {
+        setSelectedProjectParsingStatus(detail.project?.parsing_status ?? 0)
+      }).catch(() => {
+        setSelectedProjectParsingStatus(0)
+      })
+    }
+  }
+
+  function isServiceDisabled(analysisType) {
+    return selectedProjectParsingStatus < (analysisType.requiredParsingStatus ?? 0)
   }
 
   function toggleService(key) {
+    const analysisType = ANALYSIS_TYPES.find((t) => t.key === key)
+    if (!analysisType || isServiceDisabled(analysisType)) return
+
     setCheckedServices((prev) => {
       const next = new Set(prev)
       if (next.has(key)) {
@@ -238,10 +263,12 @@ export default function AnalysisPage() {
 
   function toggleAllServices() {
     setCheckedServices((prev) => {
-      if (prev.size === ANALYSIS_TYPES.length) {
+      const enabledTypes = ANALYSIS_TYPES.filter((t) => !isServiceDisabled(t))
+      const enabledKeys = enabledTypes.map((t) => t.key)
+      if (enabledKeys.every((k) => prev.has(k))) {
         return new Set()
       }
-      return new Set(ANALYSIS_TYPES.map((t) => t.key))
+      return new Set(enabledKeys)
     })
   }
 
@@ -328,7 +355,10 @@ export default function AnalysisPage() {
         <label className="checkbox-label">
           <input
             type="checkbox"
-            checked={checkedServices.size === ANALYSIS_TYPES.length}
+            checked={(() => {
+              const enabledKeys = ANALYSIS_TYPES.filter((t) => !isServiceDisabled(t)).map((t) => t.key)
+              return enabledKeys.length > 0 && enabledKeys.every((k) => checkedServices.has(k))
+            })()}
             onChange={toggleAllServices}
           />
           <span>全选</span>
@@ -344,23 +374,31 @@ export default function AnalysisPage() {
         </button>
       </section>
 
-      <section className="analysis-grid">
-        {ANALYSIS_TYPES.map((analysisType) => {
+      {(() => {
+        const businessGroup = ANALYSIS_TYPES.filter((t) => (t.requiredParsingStatus ?? 0) === 2)
+        const technicalGroup = ANALYSIS_TYPES.filter((t) => (t.requiredParsingStatus ?? 0) === 3)
+
+        function renderCard(analysisType) {
           const status = analysisStatus[analysisType.key] ?? 'idle'
           const result = results[analysisType.key]
           const suspiciousCount = result?.summary?.suspicious_pair_count
             ?? result?.summary?.suspicious_document_count
             ?? result?.summary?.suspicious
             ?? 0
+          const disabled = isServiceDisabled(analysisType)
 
           return (
-            <div className={`panel analysis-card ${checkedServices.has(analysisType.key) ? 'analysis-card-checked' : ''}`} key={analysisType.key}>
+            <div
+              className={`panel analysis-card ${checkedServices.has(analysisType.key) ? 'analysis-card-checked' : ''} ${disabled ? 'analysis-card-disabled' : ''}`}
+              key={analysisType.key}
+            >
               <div className="analysis-card-head">
                 <label className="checkbox-label">
                   <input
                     type="checkbox"
                     checked={checkedServices.has(analysisType.key)}
                     onChange={() => toggleService(analysisType.key)}
+                    disabled={disabled}
                   />
                 </label>
                 <span className="analysis-card-icon">{analysisType.icon}</span>
@@ -375,6 +413,10 @@ export default function AnalysisPage() {
               </div>
 
               <p>{analysisType.description}</p>
+
+              {disabled ? (
+                <span className="analysis-card-hint">解析中，暂不可用</span>
+              ) : null}
 
               {status === 'success' && result ? (
                 <div className="analysis-card-result">
@@ -401,8 +443,29 @@ export default function AnalysisPage() {
               ) : null}
             </div>
           )
-        })}
-      </section>
+        }
+
+        return (
+          <>
+            {businessGroup.length > 0 ? (
+              <div className="analysis-group" key="business">
+                <h3 className="analysis-group-title">商务标查重</h3>
+                <div className="analysis-grid">
+                  {businessGroup.map(renderCard)}
+                </div>
+              </div>
+            ) : null}
+            {technicalGroup.length > 0 ? (
+              <div className="analysis-group" key="technical">
+                <h3 className="analysis-group-title">技术标查重</h3>
+                <div className="analysis-grid">
+                  {technicalGroup.map(renderCard)}
+                </div>
+              </div>
+            ) : null}
+          </>
+        )
+      })()}
 
       {!selectedProjectId ? (
         <section className="panel empty-panel">
