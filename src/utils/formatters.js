@@ -94,7 +94,7 @@ export function getProjectStatus(project) {
     return { label: '处理中', className: 'status-running' }
   }
 
-  return { label: '待处理', className: 'status-ready' }
+  return { label: '解析中', className: 'status-ready' }
 }
 
 export function getProjectSummary(project) {

@@ -1,3 +1,5 @@
+import { mockListProjects, mockGetProjectVisualizationData, mockGetDocumentPreview, mockExportReport } from './mockApi'
+
 const DEFAULT_API_BASE_URL = ''
 
 function resolveApiBaseUrl() {
@@ -110,6 +112,7 @@ export async function probeBackend() {
 // ─── Projects ────────────────────────────────────────
 
 export async function listProjects({ page = 1, pageSize = 24, keyword } = {}) {
+  if (import.meta.env.VITE_USE_MOCK_API === 'true') return mockListProjects({ page, pageSize, keyword })
   return request('/api/postgresql/projects', {
     query: { page, page_size: pageSize, keyword },
   })
@@ -185,6 +188,7 @@ export async function getProjectSingleResult(identifierId, resultKey) {
 }
 
 export async function getProjectVisualizationData(identifierId) {
+  if (import.meta.env.VITE_USE_MOCK_API === 'true') return mockGetProjectVisualizationData(identifierId)
   return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/visualization-data`)
 }
 
@@ -345,6 +349,7 @@ export function getDocumentSourceUrl(identifierId) {
 }
 
 export async function getDocumentPreview(identifierId, page, { highlight, highlightBbox } = {}) {
+  if (import.meta.env.VITE_USE_MOCK_API === 'true') return mockGetDocumentPreview(identifierId, page)
   const url = `${API_BASE_URL}/api/postgresql/documents/${encodeURIComponent(identifierId)}/preview/pages/${page}`
   const params = new URLSearchParams()
   if (highlight) params.set('highlight', highlight)
@@ -395,6 +400,7 @@ export async function deleteResult(projectIdentifierId) {
 // ─── Export Report ──────────────────────────────────
 
 export async function exportReport(identifierId, { alertIds, options = {} }) {
+  if (import.meta.env.VITE_USE_MOCK_API === 'true') return mockExportReport(identifierId, { alertIds, options })
   const url = `${API_BASE_URL}/api/postgresql/projects/${encodeURIComponent(identifierId)}/export-report`
 
   const response = await fetch(url, {

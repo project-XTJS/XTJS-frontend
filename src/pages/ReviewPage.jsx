@@ -393,7 +393,7 @@ export default function ReviewPage() {
     })
 
     return function () { cancelled = true }
-  }, [currentAlert, selectedProjectId])
+  }, [currentAlert])
 
   function selectServiceType(key) {
     setCurrentServiceType(key)
