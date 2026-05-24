@@ -1,5 +1,3 @@
-import { mockListProjects, mockGetProjectVisualizationData, mockGetDocumentPreview, mockExportReport } from './mockApi'
-
 const DEFAULT_API_BASE_URL = ''
 
 function resolveApiBaseUrl() {
@@ -112,7 +110,6 @@ export async function probeBackend() {
 // ─── Projects ────────────────────────────────────────
 
 export async function listProjects({ page = 1, pageSize = 24, keyword } = {}) {
-  if (import.meta.env.VITE_USE_MOCK_API === 'true') return mockListProjects({ page, pageSize, keyword })
   return request('/api/postgresql/projects', {
     query: { page, page_size: pageSize, keyword },
   })
@@ -122,19 +119,19 @@ export async function getProjectDetail(identifierId) {
   return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`)
 }
 
-export async function createProject(identifierId) {
+export async function createProject(projectName) {
   return request('/api/postgresql/projects', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ identifier_id: identifierId }),
+    body: JSON.stringify({ project_name: projectName }),
   })
 }
 
-export async function updateProjectIdentifier(identifierId, newIdentifierId) {
+export async function updateProjectIdentifier(identifierId, newProjectName) {
   return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ new_identifier_id: newIdentifierId }),
+    body: JSON.stringify({ project_name: newProjectName }),
   })
 }
 
@@ -179,48 +176,49 @@ export async function ingestProjectDocuments({
 
 // ─── Project Results ─────────────────────────────────
 
-export async function getProjectResults(identifierId) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/results`)
+export async function getProjectResults(projectName) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/results`, {
+    query: { view: 'display', include_raw_results: 'false', include_result_record: 'false' },
+  })
 }
 
-export async function getProjectSingleResult(identifierId, resultKey) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/results/${encodeURIComponent(resultKey)}`)
+export async function getProjectSingleResult(projectName, resultKey) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/results/${encodeURIComponent(resultKey)}`)
 }
 
-export async function getProjectVisualizationData(identifierId) {
-  if (import.meta.env.VITE_USE_MOCK_API === 'true') return mockGetProjectVisualizationData(identifierId)
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/visualization-data`)
+export async function getProjectVisualizationData(projectName) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/visualization-data`)
 }
 
 // ─── OCR Execution ───────────────────────────────────
 
-export async function runTenderOcr(identifierId, { parallelism = 1 } = {}) {
+export async function runTenderOcr(projectName, { parallelism = 1 } = {}) {
   const formBody = new URLSearchParams()
   formBody.append('parallelism', `${parallelism}`)
 
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/run-tender-ocr`, {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/run-tender-ocr`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: formBody,
   })
 }
 
-export async function runBusinessOcr(identifierId, { parallelism = 1 } = {}) {
+export async function runBusinessOcr(projectName, { parallelism = 1 } = {}) {
   const formBody = new URLSearchParams()
   formBody.append('parallelism', `${parallelism}`)
 
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/run-business-ocr`, {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/run-business-ocr`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: formBody,
   })
 }
 
-export async function continueTechnicalOcr(identifierId, { parallelism = 1 } = {}) {
+export async function continueTechnicalOcr(projectName, { parallelism = 1 } = {}) {
   const formBody = new URLSearchParams()
   formBody.append('parallelism', `${parallelism}`)
 
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/continue-technical-ocr`, {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/continue-technical-ocr`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: formBody,
@@ -259,12 +257,12 @@ export async function getRelationDetail(relationId) {
   return request(`/api/postgresql/relations/${relationId}`)
 }
 
-export async function bindDocuments(identifierId, {
+export async function bindDocuments(projectName, {
   tenderDocumentIdentifier,
   businessBidDocumentIdentifier,
   technicalBidDocumentIdentifier,
 }) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/bind-documents`, {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/bind-documents`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -344,16 +342,26 @@ export async function batchDeleteDocuments(identifierIds) {
   })
 }
 
-export function getDocumentSourceUrl(identifierId) {
-  return `${API_BASE_URL}/api/postgresql/documents/${encodeURIComponent(identifierId)}/source`
+export function getDocumentSourceUrl(fileNameOrId, page) {
+  var url = `${API_BASE_URL}/api/postgresql/documents/${encodeURIComponent(fileNameOrId)}/source`
+  if (page) {
+    url += `?page=${encodeURIComponent(page)}`
+  }
+  return url
 }
 
-export async function getDocumentPreview(identifierId, page, { highlight, highlightBbox } = {}) {
-  if (import.meta.env.VITE_USE_MOCK_API === 'true') return mockGetDocumentPreview(identifierId, page)
-  const url = `${API_BASE_URL}/api/postgresql/documents/${encodeURIComponent(identifierId)}/preview/pages/${page}`
+export async function getDocumentPreview(fileNameOrId, page, { highlight, highlightBbox, highlightRects } = {}) {
+  const url = `${API_BASE_URL}/api/postgresql/documents/${encodeURIComponent(fileNameOrId)}/preview/pages/${page}`
   const params = new URLSearchParams()
-  if (highlight) params.set('highlight', highlight)
+  if (Array.isArray(highlight)) {
+    highlight.forEach((item) => {
+      if (item) params.append('highlight', item)
+    })
+  } else if (highlight) {
+    params.set('highlight', highlight)
+  }
   if (highlightBbox) params.set('highlight_bbox', highlightBbox)
+  if (highlightRects) params.set('highlight_rects', typeof highlightRects === 'string' ? highlightRects : JSON.stringify(highlightRects))
 
   const queryString = params.toString()
   const response = await fetch(queryString ? `${url}?${queryString}` : url)
@@ -400,7 +408,6 @@ export async function deleteResult(projectIdentifierId) {
 // ─── Export Report ──────────────────────────────────
 
 export async function exportReport(identifierId, { alertIds, options = {} }) {
-  if (import.meta.env.VITE_USE_MOCK_API === 'true') return mockExportReport(identifierId, { alertIds, options })
   const url = `${API_BASE_URL}/api/postgresql/projects/${encodeURIComponent(identifierId)}/export-report`
 
   const response = await fetch(url, {

@@ -77,6 +77,11 @@ export function getProjectStatus(project) {
     return { label: '解析中', className: 'status-running' }
   }
 
+  // 解析完成但无分析结果：显示"待分析"
+  if (parsingStatus === 3 && resultKeys.length === 0) {
+    return { label: '待分析', className: 'status-ready' }
+  }
+
   const hasSuspicious = resultKeys.some((key) => {
     const r = results[key]
     return r?.summary?.suspicious || (r?.summary?.suspicious_pair_count ?? 0) > 0

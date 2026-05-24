@@ -1,5 +1,18 @@
 import { useEffect, useRef, useState } from 'react'
 
+function getProjectIdentifier(project) {
+  return project?.identifier_id || project?.id || project?.project_name || project?.projectName || ''
+}
+
+function getProjectLabel(project) {
+  var projectName = project?.project_name || project?.projectName
+  var identifierId = project?.identifier_id || project?.id
+  if (projectName && identifierId && projectName !== identifierId) {
+    return projectName + '（' + identifierId.slice(0, 8) + '）'
+  }
+  return projectName || identifierId || ''
+}
+
 export default function ProjectDropdown({ projects, selectedProjectId, onChange }) {
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
@@ -15,12 +28,13 @@ export default function ProjectDropdown({ projects, selectedProjectId, onChange 
     return function () { document.removeEventListener('mousedown', handleClickOutside) }
   }, [])
 
-  var selected = projects.find(function (p) { return p.identifier_id === selectedProjectId })
+  var selected = projects.find(function (p) { return getProjectIdentifier(p) === selectedProjectId })
 
   var filtered = projects.filter(function (p) {
     if (!search.trim()) return true
     var kw = search.trim().toLowerCase()
-    return (p.identifier_id || '').toLowerCase().includes(kw)
+    return [getProjectIdentifier(p), getProjectLabel(p)]
+      .some(function (value) { return value.toLowerCase().includes(kw) })
   })
 
   function select(projectId) {
@@ -37,7 +51,7 @@ export default function ProjectDropdown({ projects, selectedProjectId, onChange 
         onClick={function () { setOpen(function (o) { return !o }) }}
       >
         <span className={selected ? '' : 'dropdown-placeholder'}>
-          {selected ? selected.identifier_id : '选择项目'}
+          {selected ? getProjectLabel(selected) : '选择项目'}
         </span>
         <span className="dropdown-arrow">{open ? '▲' : '▼'}</span>
       </button>
@@ -56,14 +70,15 @@ export default function ProjectDropdown({ projects, selectedProjectId, onChange 
           <div className="dropdown-list">
             {filtered.length > 0 ? (
               filtered.map(function (project) {
+                var projectValue = getProjectIdentifier(project)
                 return (
                   <button
                     type="button"
-                    key={project.identifier_id}
-                    className={'dropdown-item' + (selectedProjectId === project.identifier_id ? ' is-active' : '')}
-                    onClick={function () { select(project.identifier_id) }}
+                    key={projectValue}
+                    className={'dropdown-item' + (selectedProjectId === projectValue ? ' is-active' : '')}
+                    onClick={function () { select(projectValue) }}
                   >
-                    <span>{project.identifier_id}</span>
+                    <span>{getProjectLabel(project)}</span>
                   </button>
                 )
               })

@@ -66,13 +66,24 @@ function normalizeRelation(rawRelation, index) {
   }
 }
 
+function getProjectName(project) {
+  return project?.project_name || project?.projectName || project?.identifier_id || project?.id || ''
+}
+
+function getProjectIdentifier(project) {
+  return project?.identifier_id || project?.id || project?.project_name || project?.projectName || ''
+}
+
 function normalizeProject(detail) {
   const relations = (detail.relations ?? []).map(normalizeRelation)
+  const projectName = getProjectName(detail.project)
+  const identifierId = getProjectIdentifier(detail.project)
 
   return {
-    id: detail.project.identifier_id,
-    identifierId: detail.project.identifier_id,
-    title: deriveProjectTitle(detail.project.identifier_id, relations),
+    id: identifierId,
+    identifierId,
+    projectName,
+    title: projectName || deriveProjectTitle(identifierId, relations),
     createdAt: detail.project.create_time,
     updatedAt: detail.project.update_time,
     parsingStatus: detail.project.parsing_status ?? 0,
@@ -82,10 +93,14 @@ function normalizeProject(detail) {
 }
 
 function normalizeProjectFromListItem(item) {
+  const projectName = getProjectName(item)
+  const identifierId = getProjectIdentifier(item)
+
   return {
-    id: item.identifier_id,
-    identifierId: item.identifier_id,
-    title: item.identifier_id,
+    id: identifierId,
+    identifierId,
+    projectName,
+    title: projectName || identifierId,
     createdAt: item.create_time,
     updatedAt: item.update_time,
     parsingStatus: item.parsing_status ?? 0,
@@ -112,7 +127,7 @@ export default function ProjectsPage() {
     try {
       const listing = await listProjects({ pageSize: 24 })
       const detailResults = await Promise.allSettled(
-        (listing.items ?? []).map((item) => getProjectDetail(item.identifier_id)),
+        (listing.items ?? []).map((item) => getProjectDetail(getProjectIdentifier(item))),
       )
 
       const nextProjects = detailResults.map((result, index) =>
@@ -232,7 +247,8 @@ export default function ProjectsPage() {
         technicalBidFiles,
       })
 
-      const projectId = payload.project?.identifier_id
+      const projectId = getProjectIdentifier(payload.project)
+      const projectName = getProjectName(payload.project) || composer.projectName.trim()
 
       let nextProject
       try {
@@ -241,9 +257,10 @@ export default function ProjectsPage() {
         nextProject = {
           id: projectId,
           identifierId: projectId,
-          title: composer.tenderFile?.name
+          projectName,
+          title: projectName || (composer.tenderFile?.name
             ? stripExtension(composer.tenderFile.name)
-            : projectId,
+            : projectId),
           createdAt: payload.project?.create_time ?? new Date().toISOString(),
           updatedAt: payload.project?.update_time ?? new Date().toISOString(),
           relations: [],

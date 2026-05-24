@@ -12,19 +12,19 @@ import ProjectDropdown from '../components/ProjectDropdown'
 
 const ANALYSIS_TYPES = [
   {
-    key: 'duplicateCheck',
-    label: '全文比对查重',
-    icon: '📋',
-    description: '比对商务标与技术标文档，发现高度相似的文本块',
-    services: ['business_bid_duplicate_check', 'technical_bid_duplicate_check'],
-    requiredParsingStatus: 3,
-  },
-  {
     key: 'businessBidDuplicateCheck',
     label: '商务标查重',
     icon: '📄',
     description: '仅对商务标文档之间进行内容查重',
     services: ['business_bid_duplicate_check'],
+    requiredParsingStatus: 2,
+  },
+  {
+    key: 'personnelReuseCheck',
+    label: '人员复用',
+    icon: '👥',
+    description: '检测关键人员是否在不同标书中重复出现',
+    services: ['personnel_reuse_check'],
     requiredParsingStatus: 2,
   },
   {
@@ -42,14 +42,6 @@ const ANALYSIS_TYPES = [
     description: '检查商务标格式规范性与完整性',
     services: ['business_bid_format_review'],
     requiredParsingStatus: 2,
-  },
-  {
-    key: 'personnelReuseCheck',
-    label: '人员复用',
-    icon: '👥',
-    description: '检测关键人员是否在不同标书中重复出现',
-    services: ['personnel_reuse_check'],
-    requiredParsingStatus: 3,
   },
   {
     key: 'typoCheck',
@@ -158,6 +150,17 @@ function normalizeAnalysisResult(analysisType, apiResult) {
   }
 }
 
+function normalizeProjectResultsPayload(data) {
+  const candidates = [
+    data?.results,
+    data?.result,
+    data?.result_record?.result,
+    data,
+  ]
+
+  return candidates.find((item) => item && typeof item === 'object' && !Array.isArray(item)) ?? {}
+}
+
 function getAnalysisStatusIcon(status) {
   switch (status) {
     case 'running':
@@ -179,7 +182,6 @@ export default function AnalysisPage() {
   const [analysisStatus, setAnalysisStatus] = useState({})
   const [executionLog, setExecutionLog] = useState([])
   const [notice, setNotice] = useState(null)
-  const [isLoading, setIsLoading] = useState(true)
   const [checkedServices, setCheckedServices] = useState(new Set())
   const [selectedProjectParsingStatus, setSelectedProjectParsingStatus] = useState(0)
 
@@ -197,7 +199,7 @@ export default function AnalysisPage() {
 
     try {
       const data = await getProjectResults(projectId)
-      const allResults = data.results ?? {}
+      const allResults = normalizeProjectResultsPayload(data)
 
       const statusMap = {}
       Object.keys(allResults).forEach((key) => {
@@ -221,8 +223,7 @@ export default function AnalysisPage() {
   }, [loadProjects])
 
   useEffect(() => {
-    setIsLoading(true)
-    loadProjectResults(selectedProjectId).finally(() => setIsLoading(false))
+    loadProjectResults(selectedProjectId)
   }, [selectedProjectId, loadProjectResults])
 
 
@@ -375,8 +376,9 @@ export default function AnalysisPage() {
       </section>
 
       {(() => {
+        const bidDocumentReview = ANALYSIS_TYPES.find((t) => t.key === 'bidDocumentReview')
         const businessGroup = ANALYSIS_TYPES.filter((t) => (t.requiredParsingStatus ?? 0) === 2)
-        const technicalGroup = ANALYSIS_TYPES.filter((t) => (t.requiredParsingStatus ?? 0) === 3)
+        const technicalGroup = ANALYSIS_TYPES.filter((t) => (t.requiredParsingStatus ?? 0) === 3 && t.key !== 'bidDocumentReview')
 
         function renderCard(analysisType) {
           const status = analysisStatus[analysisType.key] ?? 'idle'
@@ -460,6 +462,14 @@ export default function AnalysisPage() {
                 <h3 className="analysis-group-title">技术标查重</h3>
                 <div className="analysis-grid">
                   {technicalGroup.map(renderCard)}
+                </div>
+              </div>
+            ) : null}
+            {bidDocumentReview ? (
+              <div className="analysis-group" key="review">
+                <h3 className="analysis-group-title">综合审查</h3>
+                <div className="analysis-grid">
+                  {renderCard(bidDocumentReview)}
                 </div>
               </div>
             ) : null}
