@@ -399,6 +399,14 @@ export async function updateResult(projectIdentifierId, result) {
   })
 }
 
+export async function updateResultForFrontend(projectIdentifierId, resultFotFrontend) {
+  return request(`/api/postgresql/results/${encodeURIComponent(projectIdentifierId)}/frontend`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ result_fot_frontend: resultFotFrontend }),
+  })
+}
+
 export async function deleteResult(projectIdentifierId) {
   return request(`/api/postgresql/results/${encodeURIComponent(projectIdentifierId)}`, {
     method: 'DELETE',

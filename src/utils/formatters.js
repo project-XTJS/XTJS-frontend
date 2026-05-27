@@ -84,7 +84,7 @@ export function getProjectStatus(project) {
 
   const hasSuspicious = resultKeys.some((key) => {
     const r = results[key]
-    return r?.summary?.suspicious || (r?.summary?.suspicious_pair_count ?? 0) > 0
+    return Number(r?.summary?.suspicious) > 0
   })
 
   if (hasSuspicious) {

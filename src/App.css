@@ -872,6 +872,18 @@
   color: var(--text);
 }
 
+.log-project-cell span {
+  display: block;
+  font-weight: 600;
+}
+
+.log-project-cell small {
+  display: block;
+  margin-top: 2px;
+  color: var(--light-text);
+  font-size: 0.75rem;
+}
+
 /* ─── Review Page ───────────────────────────────── */
 
 .review-header {
@@ -982,6 +994,250 @@
 .review-actions {
   padding-top: 8px;
   border-top: 1px solid var(--line);
+}
+
+/* ─── Review Overview ───────────────────────────── */
+
+.overview-container {
+  display: grid;
+  gap: 14px;
+}
+
+.review-overview-head,
+.overview-files-panel,
+.overview-issue-section {
+  padding: 18px !important;
+}
+
+.overview-title-row,
+.overview-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.overview-title-row h3,
+.overview-section-head h3 {
+  margin: 0;
+  color: var(--title);
+}
+
+.overview-title-row p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.overview-kicker,
+.overview-scope,
+.overview-section-head span {
+  color: var(--light-text);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.review-overview-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.overview-stat-card {
+  min-height: 78px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  text-align: left;
+  cursor: pointer;
+}
+
+.overview-stat-card:disabled {
+  cursor: default;
+}
+
+.overview-stat-card span,
+.overview-file-item span,
+.overview-doc-line span,
+.overview-muted {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.overview-stat-card strong {
+  display: block;
+  margin-top: 8px;
+  font-size: 1.45rem;
+}
+
+.overview-file-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.overview-file-item {
+  display: grid;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.overview-file-item strong {
+  color: var(--title);
+  font-size: 0.86rem;
+  word-break: break-all;
+}
+
+.overview-section-list {
+  display: grid;
+  gap: 14px;
+}
+
+.overview-table-wrap {
+  margin-top: 12px;
+  overflow-x: auto;
+}
+
+.overview-format-groups {
+  display: grid;
+  gap: 18px;
+  margin-top: 12px;
+}
+
+.overview-format-group {
+  display: grid;
+  gap: 8px;
+}
+
+.overview-format-group + .overview-format-group {
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.overview-format-group .overview-table-wrap {
+  margin-top: 0;
+}
+
+.overview-format-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 28px;
+}
+
+.overview-format-group-head strong {
+  color: var(--title);
+  font-size: 0.9rem;
+  word-break: break-all;
+}
+
+.overview-format-group-head span {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
+.overview-table {
+  width: 100%;
+  min-width: 1040px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+
+.overview-table th,
+.overview-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+  font-size: 0.82rem;
+  color: var(--text);
+}
+
+.overview-table th {
+  background: #f8fafc;
+  color: var(--title);
+  font-weight: 700;
+}
+
+.overview-table th:nth-child(1),
+.overview-table td:nth-child(1) {
+  width: 64px;
+}
+
+.overview-table th:nth-child(2),
+.overview-table td:nth-child(2) {
+  width: 29%;
+}
+
+.overview-table th:nth-child(3),
+.overview-table td:nth-child(3) {
+  width: 38%;
+}
+
+.overview-table th:nth-child(4),
+.overview-table td:nth-child(4) {
+  width: 17%;
+}
+
+.overview-table th:nth-child(5),
+.overview-table td:nth-child(5) {
+  width: 72px;
+}
+
+.overview-table th:nth-child(6),
+.overview-table td:nth-child(6) {
+  width: 72px;
+}
+
+.overview-doc-cell,
+.overview-issue-cell {
+  min-width: 220px;
+}
+
+.overview-doc-line {
+  display: grid;
+  gap: 5px;
+}
+
+.overview-doc-line + .overview-doc-line {
+  margin-top: 8px;
+}
+
+.overview-doc-line strong,
+.overview-issue-cell strong {
+  display: block;
+  color: var(--title);
+  font-size: 0.84rem;
+  word-break: break-all;
+}
+
+.overview-issue-cell span {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.overview-empty-cell {
+  color: var(--muted) !important;
+  text-align: center !important;
+}
+
+.overview-open-button {
+  min-height: 30px;
+  padding: 0 12px;
 }
 
 /* ─── Risk Tags ─────────────────────────────────── */
@@ -1670,7 +1926,9 @@
   .alert-actions,
   .alert-card-meta,
   .detail-actions,
-  .detail-info-head {
+  .detail-info-head,
+  .overview-title-row,
+  .overview-section-head {
     flex-direction: column;
     align-items: flex-start;
   }

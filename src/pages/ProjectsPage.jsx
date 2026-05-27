@@ -3,6 +3,7 @@ import {
   continueTechnicalOcr,
   deleteProject,
   getProjectDetail,
+  getProjectResults,
   ingestProjectDocuments,
   listProjects,
   runBusinessOcr,
@@ -17,6 +18,7 @@ import {
   getProjectSummary,
   stripExtension,
 } from '../utils/formatters'
+import { normalizeProjectResultsPayload } from '../utils/results'
 import StatusPill from '../components/StatusPill'
 import StatItem from '../components/StatItem'
 import EmptyBlock from '../components/EmptyBlock'
@@ -126,26 +128,39 @@ export default function ProjectsPage() {
 
     try {
       const listing = await listProjects({ pageSize: 24 })
-      const detailResults = await Promise.allSettled(
-        (listing.items ?? []).map((item) => getProjectDetail(getProjectIdentifier(item))),
+      const projectLoads = await Promise.allSettled(
+        (listing.items ?? []).map(async (item) => {
+          const projectId = getProjectIdentifier(item)
+          const [detailResult, resultsResult] = await Promise.allSettled([
+            getProjectDetail(projectId),
+            getProjectResults(projectId),
+          ])
+          const project = detailResult.status === 'fulfilled'
+            ? normalizeProject(detailResult.value)
+            : normalizeProjectFromListItem(item)
+          const resultsFailed = resultsResult.status === 'rejected' && Number(resultsResult.reason?.status) !== 404
+
+          return {
+            project: {
+              ...project,
+              results: resultsResult.status === 'fulfilled'
+                ? normalizeProjectResultsPayload(resultsResult.value)
+                : {},
+            },
+            detailFailed: detailResult.status === 'rejected',
+            resultsFailed,
+          }
+        }),
       )
 
-      const nextProjects = detailResults.map((result, index) =>
+      const nextProjects = projectLoads.map((result, index) =>
         result.status === 'fulfilled'
-          ? normalizeProject(result.value)
+          ? result.value.project
           : normalizeProjectFromListItem(listing.items[index]),
       )
 
       startTransition(() => {
-        setProjects((current) =>
-          nextProjects.map((project) => {
-            const existing = current.find((item) => item.id === project.id)
-            return {
-              ...project,
-              results: existing?.results ?? project.results,
-            }
-          }),
-        )
+        setProjects(nextProjects)
         setSelectedProjectId((current) => {
           if (current && nextProjects.some((item) => item.id === current)) {
             return current
@@ -154,10 +169,14 @@ export default function ProjectsPage() {
         })
       })
 
-      if (detailResults.some((item) => item.status === 'rejected')) {
+      if (projectLoads.some((item) => (
+        item.status === 'rejected' ||
+        item.value.detailFailed ||
+        item.value.resultsFailed
+      ))) {
         setNotice({
           type: 'warning',
-          message: '部分项目详情加载失败，已先展示项目列表数据。',
+          message: '部分项目详情或结果加载失败，已先展示可用数据。',
         })
       }
     } catch (error) {
