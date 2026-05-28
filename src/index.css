@@ -1,5 +1,5 @@
 :root {
-  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-family: 'Times New Roman', SimSun, '宋体', serif;
   line-height: 1.5;
   font-weight: 400;
   color: #334155;
@@ -18,6 +18,7 @@
   --muted: #64748b;
   --light-text: #94a3b8;
   --primary: #2f6fec;
+  --font-main: 'Times New Roman', SimSun, '宋体', serif;
 }
 
 * {
@@ -43,7 +44,7 @@ button,
 input,
 select,
 textarea {
-  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  font-family: var(--font-main);
 }
 
 button,
@@ -72,7 +73,7 @@ p {
 
 code,
 pre {
-  font-family: 'Consolas', 'SFMono-Regular', monospace;
+  font-family: var(--font-main);
 }
 
 #root {

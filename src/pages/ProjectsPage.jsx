@@ -6,7 +6,9 @@ import {
   getProjectResults,
   ingestProjectDocuments,
   listProjects,
+  runAnalysis,
   runBusinessOcr,
+  runFullOcr,
   runTenderOcr,
 } from '../lib/xtjsApi'
 import {
@@ -24,6 +26,34 @@ import StatItem from '../components/StatItem'
 import EmptyBlock from '../components/EmptyBlock'
 import FileUpload from '../components/FileUpload'
 
+const OCR_EXECUTION_MODES = {
+  BUSINESS_FIRST: 'business_first',
+  FULL: 'full',
+}
+
+const OCR_MODE_OPTIONS = [
+  {
+    value: OCR_EXECUTION_MODES.BUSINESS_FIRST,
+    label: '商务阶段优先',
+    description: '先完成招标文件与商务标 OCR，并自动生成商务审查结果。',
+  },
+  {
+    value: OCR_EXECUTION_MODES.FULL,
+    label: '全量 OCR',
+    description: '创建后直接完成招标文件、商务标、技术标 OCR。',
+  },
+]
+
+const BUSINESS_ANALYSIS_SERVICES = [
+  'business_bid_format_review',
+  'business_bid_duplicate_check',
+]
+
+const PARSING_STATUS_BUSINESS_READY = 2
+const PARSING_STATUS_TECHNICAL_READY = 3
+const PROJECT_STAGE_POLL_INTERVAL_MS = 5000
+const PROJECT_STAGE_POLL_ATTEMPTS = 360
+
 function createBidGroupDraft() {
   return {
     id: `group-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
@@ -37,8 +67,40 @@ function createInitialComposer() {
     projectName: '',
     tenderFile: null,
     bidGroupParallelism: 1,
+    ocrExecutionMode: OCR_EXECUTION_MODES.BUSINESS_FIRST,
     bidGroups: [createBidGroupDraft()],
   }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
+function hasBusinessAnalysisResults(project) {
+  const results = project?.results ?? {}
+  return BUSINESS_ANALYSIS_SERVICES.every((service) => Boolean(results[service]))
+}
+
+function hasTechnicalFileBindings(project) {
+  return (project?.relations ?? []).some((relation) => Boolean(relation.technicalFile?.identifierId))
+}
+
+function hasTenderStageBindings(project) {
+  return (project?.relations ?? []).some((relation) => Boolean(relation.tenderFile?.identifierId))
+}
+
+function hasBusinessStageBindings(project) {
+  return (project?.relations ?? []).some((relation) => (
+    Boolean(relation.tenderFile?.identifierId) &&
+    Boolean(relation.businessFile?.identifierId)
+  ))
+}
+
+function getAnalysisRunError(apiResult) {
+  const failedItem = (apiResult?.items ?? []).find((item) => item?.status && item.status !== 'success')
+  return failedItem?.error || failedItem?.message || ''
 }
 
 function normalizeRelation(rawRelation, index) {
@@ -212,6 +274,29 @@ export default function ProjectsPage() {
     projects[0] ??
     null
 
+  const activeProjectHasBusinessResults = hasBusinessAnalysisResults(activeProject)
+  const activeProjectParsingStatus = Number(activeProject?.parsingStatus || 0)
+  const isBeforeBusinessReady =
+    Boolean(activeProject) &&
+    activeProjectParsingStatus < PARSING_STATUS_BUSINESS_READY
+  const needsTenderOcr =
+    Boolean(activeProject) &&
+    activeProjectParsingStatus === 0 &&
+    hasTenderStageBindings(activeProject)
+  const needsBusinessOcr =
+    Boolean(activeProject) &&
+    activeProjectParsingStatus === 1 &&
+    hasBusinessStageBindings(activeProject)
+  const needsPreAnalysisOcr = needsTenderOcr || needsBusinessOcr
+  const canRunBusinessAnalysis =
+    Boolean(activeProject) &&
+    activeProjectParsingStatus >= PARSING_STATUS_BUSINESS_READY
+  const canContinueTechnicalOcr =
+    Boolean(activeProject) &&
+    activeProjectParsingStatus === PARSING_STATUS_BUSINESS_READY &&
+    activeProjectHasBusinessResults &&
+    hasTechnicalFileBindings(activeProject)
+
   const canSubmitComposer =
     Boolean(composer.projectName.trim()) &&
     Boolean(composer.tenderFile) &&
@@ -248,6 +333,109 @@ export default function ProjectsPage() {
     }))
   }
 
+  function upsertProject(nextProject) {
+    if (!nextProject?.id) return
+
+    setProjects((current) => {
+      const previousIndex = current.findIndex((item) => item.id === nextProject.id)
+      const previous = previousIndex >= 0 ? current[previousIndex] : null
+      const hasNextResults = Object.keys(nextProject.results ?? {}).length > 0
+      const mergedProject = {
+        ...previous,
+        ...nextProject,
+        results: hasNextResults ? nextProject.results : previous?.results ?? nextProject.results ?? {},
+      }
+
+      if (previousIndex < 0) {
+        return [mergedProject, ...current]
+      }
+
+      const nextProjects = [...current]
+      nextProjects[previousIndex] = mergedProject
+      return nextProjects
+    })
+  }
+
+  async function refreshProjectDetailSnapshot(projectId) {
+    const project = normalizeProject(await getProjectDetail(projectId))
+    upsertProject(project)
+    return project
+  }
+
+  async function refreshProjectSnapshot(projectId) {
+    const [detailResult, resultsResult] = await Promise.allSettled([
+      getProjectDetail(projectId),
+      getProjectResults(projectId),
+    ])
+
+    if (detailResult.status === 'rejected') {
+      throw detailResult.reason
+    }
+
+    const project = normalizeProject(detailResult.value)
+    if (resultsResult.status === 'fulfilled') {
+      project.results = normalizeProjectResultsPayload(resultsResult.value)
+    }
+    upsertProject(project)
+    return project
+  }
+
+  async function waitForProjectParsingStatus(projectId, targetStatus, targetLabel) {
+    for (let attempt = 0; attempt < PROJECT_STAGE_POLL_ATTEMPTS; attempt += 1) {
+      const project = await refreshProjectDetailSnapshot(projectId)
+      if (Number(project.parsingStatus || 0) >= targetStatus) {
+        return project
+      }
+      await delay(PROJECT_STAGE_POLL_INTERVAL_MS)
+    }
+
+    throw new Error(`${targetLabel}等待超时，请稍后刷新项目状态。`)
+  }
+
+  async function runBusinessAnalysisForProject(projectId) {
+    const apiResult = await runAnalysis({
+      projectIdentifier: projectId,
+      services: BUSINESS_ANALYSIS_SERVICES,
+    })
+    const runError = getAnalysisRunError(apiResult)
+    if (runError) {
+      throw new Error(runError)
+    }
+    await refreshProjectSnapshot(projectId)
+    return apiResult
+  }
+
+  async function runPostCreateWorkflow(projectId, executionMode, parallelism) {
+    if (executionMode === OCR_EXECUTION_MODES.FULL) {
+      setNotice({
+        type: 'info',
+        message: `项目 ${projectId} 创建成功，全量 OCR 已加入队列，正在等待完成...`,
+      })
+      await runFullOcr(projectId, { parallelism })
+      await waitForProjectParsingStatus(projectId, PARSING_STATUS_TECHNICAL_READY, '全量 OCR')
+    } else {
+      setNotice({
+        type: 'info',
+        message: `项目 ${projectId} 创建成功，商务阶段 OCR 已加入队列，正在等待完成...`,
+      })
+      await runBusinessOcr(projectId, { parallelism })
+      await waitForProjectParsingStatus(projectId, PARSING_STATUS_BUSINESS_READY, '商务阶段 OCR')
+    }
+
+    setNotice({
+      type: 'info',
+      message: `项目 ${projectId} OCR 已完成，正在生成商务标审查和查重结果...`,
+    })
+    await runBusinessAnalysisForProject(projectId)
+
+    setNotice({
+      type: 'success',
+      message: executionMode === OCR_EXECUTION_MODES.FULL
+        ? `项目 ${projectId} 全量 OCR 已完成，商务结果已生成。`
+        : `项目 ${projectId} 商务阶段结果已生成，可查看后决定是否继续技术标 OCR。`,
+    })
+  }
+
   async function handleCreateProject() {
     if (!canSubmitComposer) return
 
@@ -257,10 +445,12 @@ export default function ProjectsPage() {
     try {
       const businessBidFiles = composer.bidGroups.map((g) => g.businessFile)
       const technicalBidFiles = composer.bidGroups.map((g) => g.technicalFile)
+      const executionMode = composer.ocrExecutionMode
+      const parallelism = composer.bidGroupParallelism
 
       const payload = await ingestProjectDocuments({
         projectName: composer.projectName.trim(),
-        bidGroupParallelism: composer.bidGroupParallelism,
+        bidGroupParallelism: parallelism,
         tenderFile: composer.tenderFile,
         businessBidFiles,
         technicalBidFiles,
@@ -297,40 +487,131 @@ export default function ProjectsPage() {
         setIsComposerOpen(false)
       })
 
-      setNotice({
-        type: 'info',
-        message: `项目 ${projectId} 创建成功，正在启动 OCR 解析...`,
-      })
-
-      // 异步触发 OCR（招标文件 → 商务标 → 技术标）
-      const ocrResults = []
       try {
-        ocrResults.push(await runTenderOcr(projectId, { parallelism: composer.bidGroupParallelism }))
-      } catch (e) {
-        ocrResults.push({ error: e.message })
+        await runPostCreateWorkflow(projectId, executionMode, parallelism)
+      } catch (workflowError) {
+        await refreshProjectSnapshot(projectId).catch(() => null)
+        setNotice({
+          type: 'warning',
+          message: `项目 ${projectId} 创建成功，后续流程未完成：${workflowError.message || '请稍后手动重试。'}`,
+        })
       }
-      try {
-        ocrResults.push(await runBusinessOcr(projectId, { parallelism: composer.bidGroupParallelism }))
-      } catch (e) {
-        ocrResults.push({ error: e.message })
-      }
-      try {
-        ocrResults.push(await continueTechnicalOcr(projectId, { parallelism: composer.bidGroupParallelism }))
-      } catch (e) {
-        ocrResults.push({ error: e.message })
-      }
-
-      const ocrFailed = ocrResults.some((r) => r?.error)
-      setNotice({
-        type: ocrFailed ? 'warning' : 'success',
-        message: ocrFailed
-          ? `项目 ${projectId} 创建成功，部分 OCR 触发失败，请手动重试。`
-          : `项目 ${projectId} 创建成功，OCR 解析已全部启动。`,
-      })
     } catch (error) {
       setNotice({
         type: 'error',
         message: error.message || '创建项目失败。',
+      })
+    } finally {
+      setBusyToken('')
+    }
+  }
+
+  async function handleRunBusinessAnalysis() {
+    if (!activeProject || !canRunBusinessAnalysis) return
+
+    setBusyToken('business-analysis')
+    setNotice({
+      type: 'info',
+      message: `正在生成项目 ${activeProject.identifierId} 的商务标审查和查重结果...`,
+    })
+
+    try {
+      await runBusinessAnalysisForProject(activeProject.identifierId)
+      setNotice({
+        type: 'success',
+        message: `项目 ${activeProject.identifierId} 商务结果已生成。`,
+      })
+    } catch (error) {
+      setNotice({
+        type: 'warning',
+        message: error.message || '商务结果生成失败，请稍后重试。',
+      })
+    } finally {
+      setBusyToken('')
+    }
+  }
+
+  async function handleRunTenderOcr() {
+    if (!activeProject || !needsTenderOcr) return
+
+    const projectId = activeProject.identifierId
+    setBusyToken('tender-ocr')
+    setNotice({
+      type: 'info',
+      message: `项目 ${projectId} 招标文件 OCR 已加入队列，正在等待完成...`,
+    })
+
+    try {
+      await runTenderOcr(projectId, { parallelism: 1 })
+      await waitForProjectParsingStatus(projectId, 1, '招标文件 OCR')
+      await refreshProjectSnapshot(projectId)
+      setNotice({
+        type: 'success',
+        message: `项目 ${projectId} 招标文件 OCR 已完成，可继续进行商务标 OCR。`,
+      })
+    } catch (error) {
+      await refreshProjectSnapshot(projectId).catch(() => null)
+      setNotice({
+        type: 'warning',
+        message: error.message || '招标文件 OCR 触发失败，请稍后重试。',
+      })
+    } finally {
+      setBusyToken('')
+    }
+  }
+
+  async function handleRunBusinessStageOcr() {
+    if (!activeProject || !needsBusinessOcr) return
+
+    const projectId = activeProject.identifierId
+    setBusyToken('business-ocr')
+    setNotice({
+      type: 'info',
+      message: `项目 ${projectId} 商务标 OCR 已加入队列，正在等待完成...`,
+    })
+
+    try {
+      await runBusinessOcr(projectId, { parallelism: 1 })
+      await waitForProjectParsingStatus(projectId, PARSING_STATUS_BUSINESS_READY, '商务标 OCR')
+      await refreshProjectSnapshot(projectId)
+      setNotice({
+        type: 'success',
+        message: `项目 ${projectId} 商务标 OCR 已完成，可进入分析中心。`,
+      })
+    } catch (error) {
+      await refreshProjectSnapshot(projectId).catch(() => null)
+      setNotice({
+        type: 'warning',
+        message: error.message || '商务标 OCR 触发失败，请稍后重试。',
+      })
+    } finally {
+      setBusyToken('')
+    }
+  }
+
+  async function handleContinueTechnicalOcr() {
+    if (!activeProject || !canContinueTechnicalOcr) return
+
+    const projectId = activeProject.identifierId
+    setBusyToken('continue-technical-ocr')
+    setNotice({
+      type: 'info',
+      message: `项目 ${projectId} 技术标 OCR 已加入队列，正在等待完成...`,
+    })
+
+    try {
+      await continueTechnicalOcr(projectId, { parallelism: 1 })
+      await waitForProjectParsingStatus(projectId, PARSING_STATUS_TECHNICAL_READY, '技术标 OCR')
+      await refreshProjectSnapshot(projectId)
+      setNotice({
+        type: 'success',
+        message: `项目 ${projectId} 技术标 OCR 已完成。`,
+      })
+    } catch (error) {
+      await refreshProjectSnapshot(projectId).catch(() => null)
+      setNotice({
+        type: 'warning',
+        message: error.message || '技术标 OCR 触发失败，请稍后重试。',
       })
     } finally {
       setBusyToken('')
@@ -420,6 +701,28 @@ export default function ProjectsPage() {
                 label="拖拽或点击上传招标文件"
               />
             </div>
+
+            <div className="field field-wide ocr-field">
+              <span>OCR 执行模式</span>
+              <div className="ocr-mode-options">
+                {OCR_MODE_OPTIONS.map((option) => (
+                  <label
+                    className={`ocr-mode-option ${composer.ocrExecutionMode === option.value ? 'is-active' : ''}`}
+                    key={option.value}
+                  >
+                    <input
+                      type="radio"
+                      name="ocrExecutionMode"
+                      value={option.value}
+                      checked={composer.ocrExecutionMode === option.value}
+                      onChange={(event) => updateComposerField('ocrExecutionMode', event.target.value)}
+                    />
+                    <strong>{option.label}</strong>
+                    <small>{option.description}</small>
+                  </label>
+                ))}
+              </div>
+            </div>
           </div>
 
           <div className="group-toolbar">
@@ -461,7 +764,7 @@ export default function ProjectsPage() {
                       accept=".pdf"
                       onChange={(file) => updateBidGroup(group.id, 'technicalFile', file)}
                       fileName={group.technicalFile?.name}
-                      label="上传技术标"
+                      label="上传技术标（按模式决定 OCR 时机）"
                     />
                   </div>
                 </div>
@@ -476,7 +779,7 @@ export default function ProjectsPage() {
               onClick={handleCreateProject}
               disabled={!canSubmitComposer || busyToken === 'create-project'}
             >
-              {busyToken === 'create-project' ? '提交中...' : '创建并开始解析'}
+              {busyToken === 'create-project' ? '执行中...' : '创建并执行 OCR'}
             </button>
           </div>
         </section>
@@ -573,6 +876,13 @@ export default function ProjectsPage() {
                   <span>{getParsingProgress(activeProject.parsingStatus).label}</span>
                 </div>
 
+                {needsPreAnalysisOcr ? (
+                  <div className="project-stage-callout">
+                    <strong>{needsTenderOcr ? '需要先完成招标文件 OCR' : '需要先完成商务标 OCR'}</strong>
+                    <span>{needsTenderOcr ? '当前项目已绑定文件，但招标文件 OCR 尚未完成。' : '招标文件 OCR 已完成，还需完成商务标 OCR 后才能进入分析中心。'}</span>
+                  </div>
+                ) : null}
+
                 <div className="action-row">
                   {deleteConfirm === activeProject.identifierId ? (
                     <>
@@ -599,12 +909,59 @@ export default function ProjectsPage() {
                         type="button"
                         className="ghost-button"
                         onClick={() => setDeleteConfirm(activeProject.identifierId)}
+                        disabled={Boolean(busyToken)}
                       >
                         删除项目
                       </button>
-                      <a href={`#/analysis?projectId=${activeProject.identifierId}`} className="primary-button">
-                        进入分析中心 →
-                      </a>
+                      {canRunBusinessAnalysis ? (
+                        <button
+                          type="button"
+                          className="ghost-button"
+                          onClick={handleRunBusinessAnalysis}
+                          disabled={Boolean(busyToken)}
+                        >
+                          {busyToken === 'business-analysis'
+                            ? '生成中...'
+                            : activeProjectHasBusinessResults
+                              ? '重新生成商务结果'
+                              : '生成商务结果'}
+                        </button>
+                      ) : null}
+                      {needsTenderOcr ? (
+                        <button
+                          type="button"
+                          className="primary-button"
+                          onClick={handleRunTenderOcr}
+                          disabled={Boolean(busyToken)}
+                        >
+                          {busyToken === 'tender-ocr' ? '招标文件 OCR 中...' : '进行招标文件 OCR'}
+                        </button>
+                      ) : null}
+                      {needsBusinessOcr ? (
+                        <button
+                          type="button"
+                          className="primary-button"
+                          onClick={handleRunBusinessStageOcr}
+                          disabled={Boolean(busyToken)}
+                        >
+                          {busyToken === 'business-ocr' ? '商务标 OCR 中...' : '进行商务标 OCR'}
+                        </button>
+                      ) : null}
+                      {activeProjectParsingStatus === PARSING_STATUS_BUSINESS_READY ? (
+                        <button
+                          type="button"
+                          className="primary-button"
+                          onClick={handleContinueTechnicalOcr}
+                          disabled={!canContinueTechnicalOcr || Boolean(busyToken)}
+                        >
+                          {busyToken === 'continue-technical-ocr' ? '技术标 OCR 中...' : '继续技术标 OCR'}
+                        </button>
+                      ) : null}
+                      {!isBeforeBusinessReady ? (
+                        <a href={`#/analysis?projectId=${activeProject.identifierId}`} className="primary-button">
+                          进入分析中心 →
+                        </a>
+                      ) : null}
                     </>
                   )}
                 </div>

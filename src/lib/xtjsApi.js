@@ -225,6 +225,17 @@ export async function continueTechnicalOcr(projectName, { parallelism = 1 } = {}
   })
 }
 
+export async function runFullOcr(projectName, { parallelism = 1 } = {}) {
+  const formBody = new URLSearchParams()
+  formBody.append('parallelism', `${parallelism}`)
+
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/run-full-ocr`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: formBody,
+  })
+}
+
 // ─── Analysis Execution ──────────────────────────────
 
 export async function runAnalysis({
@@ -350,21 +361,26 @@ export function getDocumentSourceUrl(fileNameOrId, page) {
   return url
 }
 
-export async function getDocumentPreview(fileNameOrId, page, { highlight, highlightBbox, highlightRects } = {}) {
+export async function getDocumentPreview(fileNameOrId, page, { highlight, highlightBbox, highlightRects, highlightCoordinateSpace } = {}) {
   const url = `${API_BASE_URL}/api/postgresql/documents/${encodeURIComponent(fileNameOrId)}/preview/pages/${page}`
-  const params = new URLSearchParams()
+  const body = {}
   if (Array.isArray(highlight)) {
-    highlight.forEach((item) => {
-      if (item) params.append('highlight', item)
-    })
+    const phrases = highlight.filter(Boolean)
+    if (phrases.length > 0) body.highlight = phrases
   } else if (highlight) {
-    params.set('highlight', highlight)
+    body.highlight = [highlight]
   }
-  if (highlightBbox) params.set('highlight_bbox', highlightBbox)
-  if (highlightRects) params.set('highlight_rects', typeof highlightRects === 'string' ? highlightRects : JSON.stringify(highlightRects))
+  if (highlightBbox) body.highlight_bbox = highlightBbox
+  if (highlightRects) body.highlight_rects = highlightRects
+  if (highlightCoordinateSpace) body.highlight_coordinate_space = highlightCoordinateSpace
 
-  const queryString = params.toString()
-  const response = await fetch(queryString ? `${url}?${queryString}` : url)
+  const response = await fetch(url, {
+    method: 'POST',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+
   if (!response.ok) {
     throw createApiError(`Preview failed with status ${response.status}`, { status: response.status })
   }

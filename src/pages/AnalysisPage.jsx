@@ -14,6 +14,33 @@ import ProjectDropdown from '../components/ProjectDropdown'
 const PARSING_STATUS_BUSINESS_READY = 2
 const PARSING_STATUS_TECHNICAL_READY = 3
 
+const FORMAT_REVIEW_CHECKS = [
+  { key: 'integrity_check', label: '完整性' },
+  { key: 'consistency_check', label: '一致性' },
+  { key: 'pricing_check', label: '开标一览表' },
+  { key: 'itemized_pricing_check', label: '分项报价表' },
+  { key: 'deviation_check', label: '偏离表' },
+  { key: 'verification_check', label: '签字盖章日期' },
+]
+
+const OVERVIEW_CHECK_GROUPS = [
+  {
+    key: 'format',
+    title: '商务标形式审查',
+    checks: FORMAT_REVIEW_CHECKS,
+  },
+  {
+    key: 'risk',
+    title: '专项审查',
+    checks: [
+      { key: 'businessDuplicate', label: '商务标查重' },
+      { key: 'technicalDuplicate', label: '技术标查重' },
+      { key: 'personnelReuse', label: '一人多用' },
+      { key: 'typo', label: '错别字' },
+    ],
+  },
+]
+
 const ANALYSIS_TYPES = [
   {
     key: 'businessBidDuplicateCheck',
@@ -69,10 +96,30 @@ function objectValues(value) {
   return isPlainObject(value) ? Object.values(value) : []
 }
 
+function uniqueStrings(values) {
+  const seen = new Set()
+  const result = []
+  arrayify(values).forEach((value) => {
+    const text = String(value || '').trim()
+    if (!text || seen.has(text)) return
+    seen.add(text)
+    result.push(text)
+  })
+  return result
+}
+
 function collectionSize(value) {
   if (Array.isArray(value)) return value.length
   if (value && typeof value === 'object') return Object.keys(value).length
   return 0
+}
+
+function normalizeId(value) {
+  return String(value || '').trim()
+}
+
+function normalizeFileName(value) {
+  return String(value || '').trim().toLowerCase()
 }
 
 function normalizeCount(value) {
@@ -101,6 +148,40 @@ function getProjectName(project) {
   return project?.project_name || project?.projectName || project?.title || ''
 }
 
+function getRelationId(relation) {
+  return relation?.relation_id ?? relation?.id ?? ''
+}
+
+function getRelationBusinessId(relation) {
+  return relation?.business_bid_identifier_id || relation?.business_bid_document_identifier_id || relation?.business_bid_identifier || ''
+}
+
+function getRelationTechnicalId(relation) {
+  return relation?.technical_bid_identifier_id || relation?.technical_bid_document_identifier_id || relation?.technical_bid_identifier || ''
+}
+
+function getRelationBusinessFileName(relation) {
+  return relation?.business_bid_file_name || relation?.business_bid_document_name || relation?.business_file_name || ''
+}
+
+function getRelationTechnicalFileName(relation) {
+  return relation?.technical_bid_file_name || relation?.technical_bid_document_name || relation?.technical_file_name || ''
+}
+
+function getBidderBusinessDocument(bidder) {
+  return bidder?.documents?.business || bidder?.documents?.business_bid || bidder?.business_document || {}
+}
+
+function getBidderBusinessId(bidder) {
+  const document = getBidderBusinessDocument(bidder)
+  return document.identifier_id || document.document_identifier_id || bidder?.business_bid_identifier_id || ''
+}
+
+function getBidderBusinessFileName(bidder) {
+  const document = getBidderBusinessDocument(bidder)
+  return document.file_name || document.document_name || bidder?.business_bid_file_name || ''
+}
+
 function countRelationDocuments(relations, identifierKeys) {
   const ids = new Set()
 
@@ -112,6 +193,236 @@ function countRelationDocuments(relations, identifierKeys) {
   })
 
   return ids.size
+}
+
+function getIssueBucketCount(issues, key) {
+  const value = issues?.[key]
+  if (Array.isArray(value)) return value.length
+  if (value && typeof value === 'object') return Object.keys(value).length
+  return normalizeCount(value) ?? 0
+}
+
+function sumMetricCounts(metrics, patterns) {
+  if (!isPlainObject(metrics)) return 0
+
+  return Object.entries(metrics).reduce((total, [key, value]) => {
+    if (!patterns.some((pattern) => pattern.test(key))) return total
+    return total + (normalizeCount(value) ?? 0)
+  }, 0)
+}
+
+function getFormatCheckStatus(check) {
+  if (!check) return { state: 'pending', label: '未生成', count: 0 }
+
+  const status = String(
+    check.review?.status ||
+    check.status ||
+    check.validation?.status ||
+    check.execution?.status ||
+    '',
+  ).toLowerCase()
+  const executionStatus = String(check.execution?.status || '').toLowerCase()
+  const failedCount =
+    getIssueBucketCount(check.issues, 'failed') +
+    getIssueBucketCount(check.issues, 'missing') +
+    sumMetricCounts(check.metrics, [/^failed_/, /^missing_/, /^negative_/, /^late_/])
+  const unclearCount =
+    getIssueBucketCount(check.issues, 'unclear') +
+    sumMetricCounts(check.metrics, [/^unclear_/, /^pending_/])
+  const issueCount = failedCount + unclearCount
+
+  if (executionStatus === 'error' || status === 'error') {
+    return { state: 'fail', label: '执行失败', count: issueCount || 1 }
+  }
+
+  if (['fail', 'failed', 'missing'].includes(status)) {
+    return { state: 'fail', label: `${issueCount || 1} 项异常`, count: issueCount || 1 }
+  }
+
+  if (['unclear', 'pending'].includes(status) || unclearCount > 0) {
+    return { state: 'warning', label: issueCount > 0 ? `${issueCount} 项待复核` : '待复核', count: issueCount }
+  }
+
+  if (['pass', 'passed', 'ok', 'correct', 'success'].includes(status)) {
+    return { state: 'pass', label: '通过', count: 0 }
+  }
+
+  return { state: issueCount > 0 ? 'warning' : 'pending', label: issueCount > 0 ? `${issueCount} 项待复核` : '未生成', count: issueCount }
+}
+
+function getRiskStatus(issueCount, hasResult, unavailableLabel = '未生成') {
+  if (!hasResult) return { state: 'pending', label: unavailableLabel, count: 0 }
+  if (issueCount > 0) return { state: 'fail', label: `${issueCount} 个可疑项`, count: issueCount }
+  return { state: 'pass', label: '未发现', count: 0 }
+}
+
+function getDuplicateRiskStatus(result, issueCount, unavailableLabel = '未生成') {
+  if (!result) return { state: 'pending', label: unavailableLabel, count: 0 }
+  if (issueCount > 0) return getRiskStatus(issueCount, true, unavailableLabel)
+
+  const projectIssueCount = countDuplicateIssues(result)
+  if (projectIssueCount > 0) {
+    return { state: 'warning', label: `项目有 ${projectIssueCount} 项`, count: projectIssueCount }
+  }
+
+  return getRiskStatus(0, true, unavailableLabel)
+}
+
+function matchesDocument(item, { identifierId, relationId, fileName }) {
+  const targetId = normalizeId(identifierId)
+  const targetRelationId = normalizeId(relationId)
+  const targetFileName = normalizeFileName(fileName)
+
+  const candidateIds = [
+    item?.identifier_id,
+    item?.document_identifier_id,
+    item?.document_identifier,
+    item?.left_document_identifier,
+    item?.right_document_identifier,
+  ].map(normalizeId).filter(Boolean)
+
+  if (targetId && candidateIds.includes(targetId)) return true
+
+  const candidateRelationIds = [
+    item?.relation_id,
+    item?.left_relation_id,
+    item?.right_relation_id,
+  ].map(normalizeId).filter(Boolean)
+
+  if (targetRelationId && candidateRelationIds.includes(targetRelationId)) return true
+
+  const candidateFileNames = [
+    item?.file_name,
+    item?.document_name,
+    item?.left_file_name,
+    item?.right_file_name,
+  ].map(normalizeFileName).filter(Boolean)
+
+  return Boolean(targetFileName && candidateFileNames.includes(targetFileName))
+}
+
+function getDuplicateIssueCountForFile(result, groupKey, documentTarget) {
+  const group = result?.groups?.[groupKey]
+  if (!group) return 0
+
+  return arrayify(group.items).filter((item) => {
+    if (!isDuplicateIssueVisible(item)) return false
+    return matchesDocument(item, documentTarget)
+  }).length
+}
+
+function getPersonnelIssueCountForFile(result, documentTarget) {
+  let count = 0
+
+  objectValues(result?.groups).forEach((groupValue) => {
+    const check = groupValue?.personnel_reuse_check || {}
+    arrayify(check.items).concat(arrayify(check.issues)).forEach((item) => {
+      const candidates = [
+        item,
+        ...arrayify(item.documents),
+        ...arrayify(item.occurrences),
+        ...arrayify(item.files),
+      ]
+      if (candidates.some((candidate) => matchesDocument(candidate, documentTarget))) {
+        count += 1
+      }
+    })
+  })
+
+  return count
+}
+
+function getTypoIssueCountForFile(result, documentTargets) {
+  let count = 0
+
+  objectValues(result?.groups).forEach((groupValue) => {
+    arrayify(groupValue?.typo_check?.documents).forEach((document) => {
+      if (documentTargets.some((target) => matchesDocument(document, target))) {
+        count += firstAvailableCount(document.issue_count, arrayify(document.items).length)
+      }
+    })
+  })
+
+  return count
+}
+
+function findFormatBidder(result, relation) {
+  const relationBusinessId = normalizeId(getRelationBusinessId(relation))
+  const relationBusinessFileName = normalizeFileName(getRelationBusinessFileName(relation))
+  const bidders = getFormatReviewBidders(result)
+
+  return bidders.find((bidder) => {
+    const bidderBusinessId = normalizeId(getBidderBusinessId(bidder))
+    const bidderBusinessFileName = normalizeFileName(getBidderBusinessFileName(bidder))
+    if (relationBusinessId && bidderBusinessId === relationBusinessId) return true
+    return Boolean(relationBusinessFileName && bidderBusinessFileName === relationBusinessFileName)
+  }) || null
+}
+
+function buildOverviewCards(projectMeta, resultState, parsingStatus) {
+  const relations = arrayify(projectMeta?.relations)
+  const formatResult = resultState.businessBidFormatReview
+  const businessDuplicateResult = resultState.businessBidDuplicateCheck
+  const technicalDuplicateResult = resultState.technicalBidDuplicateCheck
+  const personnelResult = resultState.personnelReuseCheck
+  const typoResult = resultState.typoCheck
+
+  return relations.map((relation, index) => {
+    const relationId = getRelationId(relation)
+    const businessFileName = getRelationBusinessFileName(relation)
+    const technicalFileName = getRelationTechnicalFileName(relation)
+    const businessTarget = {
+      identifierId: getRelationBusinessId(relation),
+      relationId,
+      fileName: businessFileName,
+    }
+    const technicalTarget = {
+      identifierId: getRelationTechnicalId(relation),
+      relationId,
+      fileName: technicalFileName,
+    }
+    const bidder = findFormatBidder(formatResult, relation)
+    const formatChecks = Object.fromEntries(
+      FORMAT_REVIEW_CHECKS.map((check) => [
+        check.key,
+        getFormatCheckStatus(bidder?.checks?.[check.key]),
+      ]),
+    )
+    const businessDuplicateCount = getDuplicateIssueCountForFile(
+      businessDuplicateResult,
+      'business_bid',
+      businessTarget,
+    )
+    const technicalDuplicateCount = getDuplicateIssueCountForFile(
+      technicalDuplicateResult,
+      'technical_bid',
+      technicalTarget,
+    )
+    const personnelIssueCount = getPersonnelIssueCountForFile(personnelResult, businessTarget)
+    const typoIssueCount = getTypoIssueCountForFile(typoResult, [businessTarget, technicalTarget])
+
+    return {
+      id: relationId || `${businessFileName}-${technicalFileName}-${index}`,
+      title: bidder?.bidder_name || businessFileName || `标书组 ${index + 1}`,
+      subtitle: businessFileName || '商务标文件',
+      technicalFileName,
+      formatChecks,
+      riskChecks: {
+        businessDuplicate: getDuplicateRiskStatus(businessDuplicateResult, businessDuplicateCount),
+        technicalDuplicate: getDuplicateRiskStatus(
+          technicalDuplicateResult,
+          technicalDuplicateCount,
+          Number(parsingStatus || 0) >= PARSING_STATUS_TECHNICAL_READY ? '未生成' : '技术标未解析',
+        ),
+        personnelReuse: getRiskStatus(personnelIssueCount, Boolean(personnelResult)),
+        typo: getRiskStatus(
+          typoIssueCount,
+          Boolean(typoResult),
+          Number(parsingStatus || 0) >= PARSING_STATUS_TECHNICAL_READY ? '未生成' : '技术标未解析',
+        ),
+      },
+    }
+  })
 }
 
 function buildProjectMeta(project, relations = []) {
@@ -309,6 +620,36 @@ function countPersonnelIssues(result) {
   )
 }
 
+function getPersonnelEntryName(entry) {
+  return String(
+    entry?.name ||
+    entry?.person_name ||
+    entry?.personnel_name ||
+    entry?.display_name ||
+    ''
+  ).trim()
+}
+
+function collectPersonnelNames(result) {
+  let names = arrayify(result?.names)
+
+  objectValues(result?.groups).forEach((groupValue) => {
+    const check = groupValue?.personnel_reuse_check || {}
+    names = names.concat(arrayify(check.names))
+    arrayify(check.personnel_entries).forEach((entry) => {
+      names.push(getPersonnelEntryName(entry))
+    })
+    arrayify(check.documents).forEach((document) => {
+      names = names.concat(arrayify(document.names))
+      arrayify(document.personnel_entries).forEach((entry) => {
+        names.push(getPersonnelEntryName(entry))
+      })
+    })
+  })
+
+  return uniqueStrings(names)
+}
+
 function countPersonnelDocuments(result) {
   const groupedDocumentCount = objectValues(result?.groups).reduce((total, groupValue) => {
     const check = groupValue?.personnel_reuse_check || {}
@@ -441,12 +782,12 @@ function getAnalysisTypeRunError(analysisType, apiResult) {
   return ''
 }
 
-function getAnalysisStatusIcon(status) {
+function getAnalysisStatusIcon(status, suspiciousCount = 0) {
   switch (status) {
     case 'running':
       return '⏳'
     case 'success':
-      return '✅'
+      return Number(suspiciousCount || 0) > 0 ? '⚠️' : '✅'
     case 'error':
       return '❌'
     default:
@@ -505,6 +846,9 @@ export default function AnalysisPage() {
   ), [selectedProjectParsingStatus])
 
   const isRunning = useMemo(() => Object.values(analysisStatus).some((status) => status === 'running'), [analysisStatus])
+  const overviewCards = useMemo(() => (
+    buildOverviewCards(currentProjectMeta, results, selectedProjectParsingStatus)
+  ), [currentProjectMeta, results, selectedProjectParsingStatus])
 
   useEffect(() => {
     selectedProjectIdRef.current = selectedProjectId
@@ -782,6 +1126,9 @@ export default function AnalysisPage() {
           const status = analysisStatus[analysisType.key] ?? 'idle'
           const result = results[analysisType.key]
           const suspiciousCount = result?.summary?.suspicious ?? 0
+          const personnelNames = analysisType.key === 'personnelReuseCheck'
+            ? collectPersonnelNames(result)
+            : []
           const disabled = isServiceDisabled(analysisType)
           const disabledHint = getDisabledHint(analysisType, selectedProjectParsingStatus)
 
@@ -802,9 +1149,11 @@ export default function AnalysisPage() {
                 <span className="analysis-card-icon">{analysisType.icon}</span>
                 <div>
                   <strong>{analysisType.label}</strong>
-                  {getAnalysisStatusIcon(status) ? (
-                    <span className="analysis-status-icon">
-                      {getAnalysisStatusIcon(status)}
+                  {getAnalysisStatusIcon(status, suspiciousCount) ? (
+                    <span
+                      className={`analysis-status-icon ${status === 'success' && suspiciousCount > 0 ? 'analysis-status-warning' : ''}`}
+                    >
+                      {getAnalysisStatusIcon(status, suspiciousCount)}
                     </span>
                   ) : null}
                 </div>
@@ -826,6 +1175,13 @@ export default function AnalysisPage() {
                   ) : (
                     <span className="analysis-clean">未发现可疑项</span>
                   )}
+                  {personnelNames.length > 0 ? (
+                    <div className="analysis-personnel-names">
+                      {personnelNames.map((name) => (
+                        <span key={name}>{name}</span>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
 
@@ -868,6 +1224,61 @@ export default function AnalysisPage() {
       {!selectedProjectId ? (
         <section className="panel empty-panel">
           <EmptyBlock title="请先选择一个项目再执行分析" />
+        </section>
+      ) : null}
+
+      {selectedProjectId ? (
+        <section className="panel analysis-overview">
+          <div className="panel-header">
+            <div>
+              <h2>项目审查总览</h2>
+              <p>按投标文件汇总形式审查、查重、一人多用和错别字情况</p>
+            </div>
+            <a href={`#/review?projectId=${selectedProjectId}`} className="ghost-button">
+              查看审核详情 →
+            </a>
+          </div>
+
+          {overviewCards.length > 0 ? (
+            <div className="overview-file-grid">
+              {overviewCards.map((card) => (
+                <article className="overview-file-card" key={card.id}>
+                  <div className="overview-file-head">
+                    <div>
+                      <strong>{card.title}</strong>
+                      <span>{card.subtitle}</span>
+                      {card.technicalFileName ? <small>{card.technicalFileName}</small> : null}
+                    </div>
+                  </div>
+
+                  {OVERVIEW_CHECK_GROUPS.map((group) => (
+                    <div className="overview-check-group" key={group.key}>
+                      <h3>{group.title}</h3>
+                      <div className="overview-check-list">
+                        {group.checks.map((check) => {
+                          const status = group.key === 'format'
+                            ? card.formatChecks[check.key]
+                            : card.riskChecks[check.key]
+
+                          return (
+                            <div
+                              className={`overview-check-item overview-check-${status?.state || 'pending'}`}
+                              key={check.key}
+                            >
+                              <span>{check.label}</span>
+                              <strong>{status?.label || '未生成'}</strong>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </article>
+              ))}
+            </div>
+          ) : (
+            <EmptyBlock title="当前项目暂无可展示的投标文件总览" />
+          )}
         </section>
       ) : null}
 
