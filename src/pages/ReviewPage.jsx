@@ -6,39 +6,57 @@ import {
   getProjectDetail,
   getProjectResults,
   listProjects,
-  updateResultForFrontend,
+  confirmPersonnelReuseDraft,
+  getBusinessBidFormatReviewEditable,
+  updatePersonnelReuseDraft,
+  saveProjectManualReviewResultInputs,
+  saveBusinessBidFormatReviewManualInputs,
+  rerunBusinessBidFormatReviewWithManualInputs,
+  exportProjectResultReport,
 } from '../lib/xtjsApi'
-import { DOCUMENT_LABELS } from '../utils/formatters'
+import { DOCUMENT_LABELS, deriveBidderName } from '../utils/formatters'
 import { normalizeProjectResultsPayload } from '../utils/results'
 import EmptyBlock from '../components/EmptyBlock'
 import ProjectDropdown from '../components/ProjectDropdown'
+import BusinessManualReviewPanel from '../features/businessManualReview/BusinessManualReviewPanel'
+import {
+  buildManualReviewPayloadItems,
+  filterManualReviewItemsForPreviewDoc,
+  filterRealItemizedManualReviewItems,
+  stringifyManualReviewValue,
+} from '../features/businessManualReview/manualReviewUtils'
 
 var RESULT_TYPE_LABELS = {
   duplicate_check: '全文查重',
   business_bid_duplicate_check: '商务标查重',
+  business_itemized_duplicate_check: '商务分项报价查重',
+  bid_response_duplicate_check: '响应内容查重',
   technical_bid_duplicate_check: '技术标查重',
-  business_bid_format_review: '形式审查',
-  business_bid_format_review_passed: '形式审查通过项',
-  personnel_reuse_check: '人员复用',
-  typo_check: '错字检查',
+  business_bid_format_review: '商务标形式审查',
+  business_bid_format_review_passed: '商务标形式审查通过项',
+  deviation_check: '偏离项目审查',
+  personnel_reuse_check: '人员复用审查',
 }
 
 var RESULT_TYPE_COLORS = {
   duplicate_check: '#dc2626',
   business_bid_duplicate_check: '#ea580c',
+  business_itemized_duplicate_check: '#ea580c',
+  bid_response_duplicate_check: '#0891b2',
   technical_bid_duplicate_check: '#f59e0b',
   business_bid_format_review: '#2563eb',
   business_bid_format_review_passed: '#16a34a',
+  deviation_check: '#7c3aed',
   personnel_reuse_check: '#9333ea',
-  typo_check: '#0891b2',
 }
 
 var OVERVIEW_RESULT_ORDER = [
+  'business_bid_format_review',
+  'deviation_check',
+  'business_itemized_duplicate_check',
+  'bid_response_duplicate_check',
   'business_bid_duplicate_check',
   'technical_bid_duplicate_check',
-  'business_bid_format_review',
-  'business_bid_format_review_passed',
-  'typo_check',
   'personnel_reuse_check',
 ]
 
@@ -47,31 +65,39 @@ var FORMAT_REVIEW_PASSED_RESULT_KEY = 'business_bid_format_review_passed'
 var ISSUE_SNIPPET_LIMIT = 200
 
 var FORMAT_CHECK_LABELS = {
-  pricing_check: '报价校验',
+  pricing_check: '报价合理性审查',
   deviation_check: '偏离响应校验',
-  integrity_check: '完整性校验',
-  consistency_check: '格式一致性校验',
-  verification_check: '签章日期校验',
-  itemized_pricing_check: '分项报价校验',
+  integrity_check: '商务标完整性',
+  consistency_check: '模板一致性检查',
+  verification_check: '签字盖章日期检查',
+  itemized_pricing_check: '分项报价表检查',
 }
 
 var FORMAT_OVERVIEW_CHECK_ORDER = [
   'integrity_check',
   'consistency_check',
+  'verification_check',
   'pricing_check',
   'itemized_pricing_check',
-  'deviation_check',
-  'verification_check',
 ]
 
 var FORMAT_OVERVIEW_CHECK_LABELS = {
   integrity_check: '完整性',
   consistency_check: '一致性',
-  pricing_check: '开标一览表',
+  pricing_check: '报价合理性',
   itemized_pricing_check: '分项报价表',
   deviation_check: '偏离表',
   verification_check: '签字盖章日期检查',
 }
+
+var FORMAT_FILE_CHECK_FILTER_OPTIONS = [
+  ['all', '全部'],
+  ['integrity_check', '完整性检查'],
+  ['consistency_check', '一致性检查'],
+  ['pricing_check', '报价合理性审查'],
+  ['itemized_pricing_check', '分项报价表检查'],
+  ['verification_check', '签字盖章日期检查'],
+]
 
 function isObject(value) {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -266,7 +292,9 @@ function getGroupLabel(groupKey, defaultGroupKey) {
 }
 
 function isFormatReviewResultType(resultType) {
-  return resultType === FORMAT_REVIEW_RESULT_KEY || resultType === FORMAT_REVIEW_PASSED_RESULT_KEY
+  return resultType === FORMAT_REVIEW_RESULT_KEY ||
+    resultType === FORMAT_REVIEW_PASSED_RESULT_KEY ||
+    resultType === 'deviation_check'
 }
 
 function getFirstNumber(value) {
@@ -348,11 +376,28 @@ function normalizeDocRef(raw, defaults) {
     highlightBbox: source.highlightBbox || source.bbox || base.highlightBbox,
     highlightRects: source.highlightRects || source.highlight_rects || base.highlightRects,
     highlightPageRects: source.highlightPageRects || source.highlight_page_rects || base.highlightPageRects,
+    targetPages: source.targetPages || source.target_pages || base.targetPages,
+    lockStartPage: source.lockStartPage || source.lock_start_page || base.lockStartPage || base.lock_start_page,
   })
 }
 
 function getLookupKey(value) {
   return String(value || '').trim().toLowerCase()
+}
+
+function isFuzzyFileNameMatch(fileName, query) {
+  var target = getLookupKey(fileName).replace(/\s+/g, '')
+  var needle = getLookupKey(query).replace(/\s+/g, '')
+  if (!target || !needle) return false
+  if (target.indexOf(needle) >= 0) return true
+
+  var targetIndex = 0
+  for (var i = 0; i < needle.length; i += 1) {
+    targetIndex = target.indexOf(needle[i], targetIndex)
+    if (targetIndex < 0) return false
+    targetIndex += 1
+  }
+  return true
 }
 
 function addDocumentToLookup(lookup, doc) {
@@ -371,6 +416,9 @@ function addDocumentToLookup(lookup, doc) {
     var key = getLookupKey(alias)
     if (key) lookup[key] = value
   })
+  if (value.role) lookup['role:' + getLookupKey(value.role)] = value
+  if (value.purpose) lookup['purpose:' + getLookupKey(value.purpose)] = value
+  if (value.documentType) lookup['type:' + getLookupKey(value.documentType)] = value
 }
 
 function looksLikeDocument(value) {
@@ -436,7 +484,7 @@ function buildInlineDocumentLookup() {
 }
 
 function mergeDocumentCandidate(doc, lookup) {
-  var role = doc && doc.role
+  var role = doc && (doc.role || doc.document_role)
   var purpose = doc && doc.purpose
   var documentType = doc && (doc.document_type || doc.documentType)
   var match = lookup[getLookupKey(doc && (doc.document_identifier_id || doc.identifier_id || doc.docId))] ||
@@ -524,6 +572,53 @@ function buildExportPayload(alert, item) {
 function isDuplicateIssueVisible(item) {
   var riskLevel = String(item.risk_level || '').toLowerCase()
   return Boolean(item) && riskLevel !== '' && riskLevel !== 'none'
+}
+
+function getDuplicateResultIssueEntries(result) {
+  var entries = []
+  var seen = new Set()
+
+  function addIssue(item, groupKey, index) {
+    if (!isObject(item)) return
+    var signature = [
+      groupKey || '',
+      item.cluster_id || item.id || item.issue_id || '',
+      item.left_document_identifier || '',
+      item.right_document_identifier || '',
+      item.left_file_name || '',
+      item.right_file_name || '',
+      item.risk_level || '',
+      item.match_score || item.score_value || '',
+    ].join('|')
+    if (seen.has(signature)) return
+    seen.add(signature)
+    entries.push({ item: item, groupKey: groupKey, index: index })
+  }
+
+  arrayify(result && result.issues).forEach(function (item, index) {
+    addIssue(item, item && item.document_type || result && result.document_type, index)
+  })
+
+  Object.entries((result && result.groups) || {}).forEach(function (entry) {
+    var groupKey = entry[0]
+    var groupValue = entry[1] || {}
+    arrayify(groupValue.issues).forEach(function (item, index) {
+      addIssue(item, item && item.document_type || groupValue.document_type || groupKey, index)
+    })
+  })
+
+  return entries
+}
+
+function formatDuplicateReportReason(value) {
+  var text = String(value || '').trim()
+  if (!text) return ''
+  var labels = {
+    long_duplicate: '重复内容不少于 30 字',
+    number_match: '正文数字一致',
+    short_duplicate_typo: '短重复内容存在疑似错字',
+  }
+  return labels[text] || text
 }
 
 function getDuplicateClusterFileUrl(cluster, fileName) {
@@ -690,6 +785,11 @@ function getDuplicateClusterFileGroups(cluster) {
   return Object.values(groups).filter(function (group) {
     return group.locations.length > 0 || group.firstPage
   }).sort(function (a, b) {
+    var aFileOrder = arrayify(cluster.files).indexOf(a.fileName)
+    var bFileOrder = arrayify(cluster.files).indexOf(b.fileName)
+    if (aFileOrder >= 0 && bFileOrder >= 0 && aFileOrder !== bFileOrder) return aFileOrder - bFileOrder
+    if (aFileOrder >= 0) return -1
+    if (bFileOrder >= 0) return 1
     return Number(a.firstPage || 1) - Number(b.firstPage || 1)
   })
 }
@@ -764,6 +864,22 @@ function duplicateOccurrenceIsSimilar(occurrence, cluster) {
   return mode === 'similar' || kind.indexOf('similar') >= 0
 }
 
+function getDuplicateEvidenceSideText(evidence, side) {
+  return firstTextValue(
+    evidence && evidence[side + '_text'],
+    evidence && evidence[side + '_preview'],
+    evidence && evidence[side + '_rows'],
+    evidence && evidence[side + '_sample_rows'],
+    side === 'left' && evidence && evidence.text,
+  )
+}
+
+function getDuplicateEvidenceSidePage(evidence, side) {
+  return getFirstNumber(evidence && evidence[side + '_page']) ||
+    getFirstNumber(evidence && evidence[side + '_pages']) ||
+    getFirstNumber(evidence && evidence.page)
+}
+
 function buildDuplicateEvidenceRows(cluster) {
   var rows = []
 
@@ -791,6 +907,37 @@ function buildDuplicateEvidenceRows(cluster) {
     })
   })
 
+  function addPairEvidence(items, kind, sourceKey) {
+    arrayify(items).forEach(function (evidence, index) {
+      if (!isObject(evidence)) return
+      var leftText = getDuplicateEvidenceSideText(evidence, 'left')
+      var rightText = getDuplicateEvidenceSideText(evidence, 'right')
+      var primaryText = firstTextValue(leftText, rightText, evidence.text, evidence.preview)
+      if (!primaryText && !rightText) return
+
+      rows.push({
+        kind: kind,
+        source_key: sourceKey,
+        left_file_name: cluster && cluster.left_file_name,
+        right_file_name: cluster && cluster.right_file_name,
+        left_page: getDuplicateEvidenceSidePage(evidence, 'left'),
+        right_page: getDuplicateEvidenceSidePage(evidence, 'right'),
+        text: primaryText,
+        left_text: leftText,
+        right_text: rightText,
+        similarity: evidence.similarity || (cluster && cluster.similarity_match_score),
+        source_index: index,
+      })
+    })
+  }
+
+  addPairEvidence(cluster && cluster.duplicate_blocks, 'duplicate', 'duplicate_blocks')
+  addPairEvidence(cluster && cluster.duplicate_sections, 'duplicate', 'duplicate_sections')
+  addPairEvidence(cluster && cluster.duplicate_tables, 'duplicate', 'duplicate_tables')
+  addPairEvidence(cluster && cluster.similar_blocks, 'similar', 'similar_blocks')
+  addPairEvidence(cluster && cluster.similar_sections, 'similar', 'similar_sections')
+  addPairEvidence(cluster && cluster.similar_tables, 'similar', 'similar_tables')
+
   return rows
 }
 
@@ -808,6 +955,38 @@ function getAlertDuplicateEvidenceRows(alert) {
 }
 
 function renderDuplicateEvidenceRows(alert) {
+  var cluster = alert && alert.evidence && alert.evidence.cluster
+  if (isObject(cluster) && isObject(cluster.doc_previews_by_file)) {
+    var files = arrayify(cluster.files)
+    Object.keys(cluster.doc_previews_by_file).forEach(function (fileName) {
+      if (files.indexOf(fileName) < 0) files.push(fileName)
+    })
+    return (
+      <div className="duplicate-evidence-list duplicate-cluster-evidence-list">
+        {files.map(function (fileName, fileIndex) {
+          var previews = arrayify(cluster.doc_previews_by_file[fileName])
+          var ranges = arrayify(cluster.doc_ranges_by_file && cluster.doc_ranges_by_file[fileName])
+          return (
+            <div key={'dup-cluster-file-' + fileName} className="diff-block">
+              <span className="diff-block-page">
+                {fileIndex + 1}. {fileName}{ranges.length > 0 ? ' / ' + ranges.map(function (range) {
+                  var start = range.start_page || range.startPage || range.page
+                  var end = range.end_page || range.endPage
+                  return start && end && start !== end ? 'P' + start + '-P' + end : (start ? 'P' + start : '')
+                }).filter(Boolean).join('、') : ''}
+              </span>
+              {previews.length > 0 ? previews.map(function (preview, previewIndex) {
+                return <IssueSnippet as="p" text={preview} key={'dup-preview-' + previewIndex} threshold={600} defaultExpanded />
+              }) : (
+                <span className="overview-muted">暂无聚合文本</span>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
   var rows = getAlertDuplicateEvidenceRows(alert)
   if (rows.length === 0) return null
 
@@ -837,6 +1016,8 @@ function renderDuplicateEvidenceRows(alert) {
 
 function collectDuplicateAlerts(results, allAlerts) {
   var duplicateKeys = []
+  if (results.business_itemized_duplicate_check) duplicateKeys.push('business_itemized_duplicate_check')
+  if (results.bid_response_duplicate_check) duplicateKeys.push('bid_response_duplicate_check')
   if (results.business_bid_duplicate_check) duplicateKeys.push('business_bid_duplicate_check')
   if (results.technical_bid_duplicate_check) duplicateKeys.push('technical_bid_duplicate_check')
 
@@ -844,12 +1025,14 @@ function collectDuplicateAlerts(results, allAlerts) {
     var result = results[resultKey]
     if (!result) return
 
-    arrayify(result.issues).forEach(function (item, index) {
+    getDuplicateResultIssueEntries(result).forEach(function (entry) {
+      var item = entry.item
+      var index = entry.index
       if (!isDuplicateIssueVisible(item)) return
 
       var docs = buildDuplicateClusterDocs(item)
-      var score = item.score_display || item.score_value
-      var groupKey = item.document_type || result.document_type
+      var score = item.score_display || item.score_value || item.match_score || item.similarity_match_score || item.exact_match_score
+      var groupKey = entry.groupKey || item.document_type || result.document_type
       var duplicateEvidenceRows = buildDuplicateEvidenceRows(item)
       var duplicateBlocks = duplicateEvidenceRows.filter(function (row) {
         return row.kind !== 'similar'
@@ -866,18 +1049,23 @@ function collectDuplicateAlerts(results, allAlerts) {
         groupKey: groupKey,
         groupLabel: getGroupLabel(groupKey, item.document_type),
         riskLevel: normalizeRiskLevel(item.risk_level),
-        title: item.title,
+        title: item.title || [item.left_file_name, item.right_file_name].filter(Boolean).join(' / ') || '疑似重复内容',
         description: '共 ' + duplicateEvidenceRows.length + ' 条重复证据，匹配得分 ' + (score === undefined || score === null ? '--' : score),
         metrics: {
           '完全重复块': item.metrics && item.metrics.exact_block_count,
           '相似块': item.metrics && item.metrics.similar_block_count,
           '重复表格': item.metrics && item.metrics.exact_table_count,
+          '相似表格': item.metrics && item.metrics.similar_table_count,
+          '重复字数': item.duplicate_text_length || item.metrics && item.metrics.duplicate_text_length,
+          '上报规则': formatDuplicateReportReason(item.duplicate_report_reason),
+          '短文本错字': arrayify(item.short_duplicate_typo_issues).length || '',
         },
         evidence: {
           cluster: item,
           duplicateEvidenceRows: duplicateEvidenceRows,
           duplicateBlocks: duplicateBlocks,
           similarBlocks: similarBlocks,
+          shortDuplicateTypoIssues: item.short_duplicate_typo_issues,
         },
         documents: docs,
         page: docs[0] && docs[0].startPage,
@@ -886,156 +1074,6 @@ function collectDuplicateAlerts(results, allAlerts) {
 
       alert.exportPayload = buildExportPayload(alert, item)
       allAlerts.push(alert)
-    })
-  })
-}
-
-function getTypoResultGroups(result) {
-  if (!result) return []
-  if (!isObject(result.groups)) return [['default', result]]
-  return Object.entries(result.groups)
-}
-
-function getTypoCheckPayload(groupValue) {
-  if (!isObject(groupValue)) return {}
-  return isObject(groupValue.typo_check) ? groupValue.typo_check : groupValue
-}
-
-function isTypoIssueLike(value) {
-  if (!isObject(value)) return false
-  return Boolean(
-    value.issue_key ||
-    value.issueKey ||
-    value.matched_text ||
-    value.matchedText ||
-    value.wrong ||
-    value.correct ||
-    value.error_word ||
-    value.correct_word ||
-    value.source ||
-    value.target ||
-    value.suggestion
-  )
-}
-
-function getTypoIssueItems(doc) {
-  if (!isObject(doc)) return []
-
-  var items = []
-  ;['items', 'issues', 'issue_items', 'typo_items', 'typoIssues', 'typos'].forEach(function (key) {
-    items = items.concat(arrayify(doc[key]))
-  })
-
-  if (!items.length && isTypoIssueLike(doc)) {
-    items.push(doc)
-  }
-
-  return items
-}
-
-function getTypoDocuments(check) {
-  if (!isObject(check)) return []
-
-  var docs = arrayify(check.documents)
-  var directIssues = getTypoIssueItems(check)
-  var docsHaveIssues = docs.some(function (doc) {
-    return getTypoIssueItems(doc).length > 0
-  })
-  if (directIssues.length && (!docs.length || !docsHaveIssues || isTypoIssueLike(check))) {
-    docs = docs.concat([{ issues: directIssues }])
-  }
-
-  return docs
-}
-
-function getTypoText(value) {
-  if (!isObject(value)) return ''
-  return value.matched_text || value.matchedText || value.wrong || value.error_word || value.source || ''
-}
-
-function getTypoSuggestion(value) {
-  if (!isObject(value)) return ''
-  return value.suggestion || value.correct || value.correct_word || value.target || ''
-}
-
-function collectTypoAlertsFromGroups(resultKey, result, allAlerts, options) {
-  if (!result) return
-  var opts = options || {}
-  var seen = {}
-
-  getTypoResultGroups(result).forEach(function (entry) {
-    var groupKey = entry[0]
-    var groupValue = entry[1] || {}
-    var check = getTypoCheckPayload(groupValue)
-    var docs = getTypoDocuments(check)
-
-    docs.forEach(function (doc, docIndex) {
-      getTypoIssueItems(doc).forEach(function (item, itemIndex) {
-        var page = extractFirstPage(item) || extractFirstPage(doc) || 1
-        var fileName = item.file_name || item.fileName || doc.file_name || doc.fileName
-        var documentIdentifier = item.document_identifier_id ||
-          item.identifier_id ||
-          item.doc_id ||
-          doc.identifier_id ||
-          doc.document_identifier_id ||
-          doc.doc_id
-        var matchedText = getTypoText(item)
-        var suggestion = getTypoSuggestion(item)
-        var issueKey = item.issue_key || item.issueKey || [matchedText, suggestion].filter(Boolean).join('->')
-        var highlightRects = collectHighlightRects(item.bbox, 'xywh')
-          .concat(collectHighlightRects(item.box, 'xywh'))
-          .concat(collectHighlightRects(item.highlightRects))
-          .concat(collectHighlightPageRects(item.locations, page))
-        var dedupeKey = makeAlertId('typo', resultKey, groupKey, documentIdentifier || fileName, page, issueKey, matchedText, suggestion, itemIndex)
-        if (seen[dedupeKey]) return
-        seen[dedupeKey] = true
-
-        var docRef = normalizeDocRef({
-          document_identifier_id: documentIdentifier,
-          file_name: fileName,
-          file_url: item.file_url || item.file_path || doc.file_url || doc.file_path,
-          page: page,
-          highlight: collectHighlightPhrases(matchedText, issueKey, item.text, item.message),
-          highlightBbox: highlightRects[0],
-          highlightRects: highlightRects,
-          highlightPageRects: makeHighlightPageRects(page, highlightRects),
-        }, { page: page })
-        var label = opts.resultTypeLabel || RESULT_TYPE_LABELS[resultKey] || resultKey
-
-        var alert = {
-          id: makeAlertId('typo', resultKey, groupKey, documentIdentifier || fileName, page, issueKey, docIndex, itemIndex),
-          resultType: opts.resultType || resultKey,
-          sourceResultKey: resultKey,
-          subType: opts.subType,
-          resultTypeLabel: label,
-          groupKey: groupKey,
-          groupLabel: getGroupLabel(groupKey),
-          riskLevel: 'medium',
-          title: '错字：' + (matchedText || issueKey || '疑似错字'),
-          description: (fileName || '未知文件') + ' 第 ' + page + ' 页，建议改为 ' + (suggestion || '请人工确认'),
-          metrics: {
-            '文件': fileName || '--',
-            '页码': page,
-            '建议': suggestion || '--',
-          },
-          evidence: {
-            matchedText: matchedText,
-            suggestion: suggestion,
-            page: page,
-            bbox: item.bbox,
-            text: item.text,
-          },
-          documents: docRef ? [docRef] : [],
-          page: page,
-          sourceItem: item,
-        }
-
-        alert.exportPayload = buildExportPayload(alert, Object.assign({}, item, {
-          file_name: fileName,
-          document_identifier_id: documentIdentifier,
-        }))
-        allAlerts.push(alert)
-      })
     })
   })
 }
@@ -1058,6 +1096,18 @@ function getPersonnelEvidenceDocs(item) {
   return arrayify(item.occurrences)
     .concat(arrayify(item.documents))
     .concat(arrayify(item.locations))
+}
+
+function formatPagesByFile(pagesByFile) {
+  if (!isObject(pagesByFile)) return ''
+  return Object.entries(pagesByFile).map(function (entry) {
+    var fileName = entry[0]
+    var pages = arrayify(entry[1])
+      .map(getFirstNumber)
+      .filter(Boolean)
+      .sort(function (a, b) { return Number(a) - Number(b) })
+    return fileName + ': ' + (pages.length > 0 ? pages.map(function (page) { return 'P' + page }).join('、') : '页码待补充')
+  }).join('；')
 }
 
 function hasPersonnelPayloadData(value) {
@@ -1267,6 +1317,396 @@ function buildPersonnelDocRef(doc, personName, index) {
   }), { page: page })
 }
 
+var personnelDraftEntrySequence = 0
+
+function createPersonnelDraftEntryId() {
+  personnelDraftEntrySequence += 1
+  return 'personnel-draft-entry-' + personnelDraftEntrySequence
+}
+
+function ensurePersonnelDraftEntryId(entry) {
+  if (!isObject(entry)) return entry
+  if (entry._draft_id || entry.draft_id) return entry
+  return Object.assign({}, entry, { _draft_id: createPersonnelDraftEntryId() })
+}
+
+function normalizePersonnelDraftEntry(entry, fallbackDoc) {
+  var pages = collectPersonnelDraftEntryPages(entry)
+  var page = pages[0] || ''
+  return {
+    _draft_id: entry._draft_id || entry.draft_id || createPersonnelDraftEntryId(),
+    name: getPersonnelEntryName(entry) || '',
+    role: entry.role || entry.person_role || entry.position || '待确认',
+    page: page,
+    pages: pages,
+    text: entry.text || entry.evidence_text || '',
+    note: entry.note || '',
+    bbox: entry.bbox || entry.box,
+    source_type: entry.source_type || 'frontend_personnel_draft',
+    document_identifier_id: entry.document_identifier_id || entry.identifier_id || fallbackDoc.identifier_id || fallbackDoc.document_identifier_id || '',
+    document_type: entry.document_type || entry.documentType || fallbackDoc.document_type || fallbackDoc.documentType || '',
+    file_name: entry.file_name || fallbackDoc.file_name || fallbackDoc.fileName || '',
+    relation_id: entry.relation_id || fallbackDoc.relation_id,
+  }
+}
+
+function normalizePersonnelNameKey(value) {
+  return String(value || '').replace(/\s+/g, '').trim().toLowerCase()
+}
+
+function collectPersonnelDraftEntryPages(entry) {
+  var pages = []
+
+  function add(value) {
+    if (value === undefined || value === null || value === '') return
+    if (Array.isArray(value)) {
+      value.forEach(add)
+      return
+    }
+    if (isObject(value)) {
+      add(value.page || value.page_no || value.page_number || value.start_page || value.matched_page)
+      add(value.pages || value.page_refs || value.locations)
+      return
+    }
+    var page = getFirstNumber(value)
+    if (page && pages.indexOf(page) < 0) pages.push(page)
+  }
+
+  add(entry && entry.page)
+  add(entry && entry.pages)
+  add(entry && entry.page_refs)
+  add(entry && entry.locations)
+  add(extractFirstPage(entry))
+  return pages.sort(function (a, b) { return Number(a) - Number(b) })
+}
+
+function mergePersonnelDraftEntry(left, right) {
+  var leftPages = collectPersonnelDraftEntryPages(left)
+  var rightPages = collectPersonnelDraftEntryPages(right)
+  var pages = leftPages.concat(rightPages).filter(function (page, index, list) {
+    return page && list.indexOf(page) === index
+  }).sort(function (a, b) { return Number(a) - Number(b) })
+  var role = left.role && left.role !== '待确认' ? left.role : (right.role || left.role || '待确认')
+  return Object.assign({}, right, left, {
+    _draft_id: left._draft_id || right._draft_id || left.draft_id || right.draft_id || createPersonnelDraftEntryId(),
+    role: role,
+    page: left.page || right.page || pages[0] || '',
+    pages: pages,
+    text: left.text || right.text || '',
+    note: left.note || right.note || '',
+    bbox: left.bbox || right.bbox,
+  })
+}
+
+function dedupePersonnelDraftEntries(entries) {
+  var result = []
+  var byName = {}
+  arrayify(entries).forEach(function (entry) {
+    if (!isObject(entry)) return
+    var nameKey = normalizePersonnelNameKey(entry.name || getPersonnelEntryName(entry))
+    if (!nameKey) {
+      result.push(entry)
+      return
+    }
+    if (byName[nameKey] === undefined) {
+      byName[nameKey] = result.length
+      result.push(entry)
+      return
+    }
+    result[byName[nameKey]] = mergePersonnelDraftEntry(result[byName[nameKey]], entry)
+  })
+  return result
+}
+
+function getProjectPersonnelDocumentOrder(projectDetail) {
+  var order = {}
+  var index = 0
+  arrayify(projectDetail && projectDetail.relations).forEach(function (relation) {
+    [
+      [relation.business_bid_identifier_id, relation.business_bid_file_name],
+      [relation.technical_bid_identifier_id, relation.technical_bid_file_name],
+    ].forEach(function (pair) {
+      pair.forEach(function (value) {
+        var key = getLookupKey(value)
+        if (key && order[key] === undefined) order[key] = index
+      })
+      index += 1
+    })
+  })
+  return order
+}
+
+function sortPersonnelDraftDocuments(documents, projectDetail) {
+  var order = getProjectPersonnelDocumentOrder(projectDetail)
+  return arrayify(documents).slice().sort(function (a, b) {
+    var aKey = getLookupKey(a.document_identifier_id || a.identifier_id || a.file_name)
+    var bKey = getLookupKey(b.document_identifier_id || b.identifier_id || b.file_name)
+    var aOrder = order[aKey]
+    var bOrder = order[bKey]
+    if (aOrder !== undefined && bOrder !== undefined && aOrder !== bOrder) return aOrder - bOrder
+    if (aOrder !== undefined) return -1
+    if (bOrder !== undefined) return 1
+    return String(a.file_name || '').localeCompare(String(b.file_name || ''))
+  })
+}
+
+function getPersonnelDraftDocKey(doc) {
+  return doc && (doc.document_identifier_id || doc.identifier_id || doc.file_name) || ''
+}
+
+function getProjectPersonnelDocumentTypeLookup(projectDetail) {
+  var lookup = {}
+
+  function add(value, documentType) {
+    var key = getLookupKey(value)
+    if (key) lookup[key] = documentType
+  }
+
+  arrayify(projectDetail && projectDetail.relations).forEach(function (relation) {
+    add(relation.business_bid_identifier_id, 'business_bid')
+    add(relation.business_bid_document_identifier_id, 'business_bid')
+    add(relation.business_bid_file_name, 'business_bid')
+    add(relation.technical_bid_identifier_id, 'technical_bid')
+    add(relation.technical_bid_document_identifier_id, 'technical_bid')
+    add(relation.technical_bid_file_name, 'technical_bid')
+  })
+
+  return lookup
+}
+
+function normalizePersonnelDocumentType(rawDoc, documentType, fileName, typeLookup) {
+  var uploadType = typeLookup && (
+    typeLookup[getLookupKey(rawDoc && (rawDoc.document_identifier_id || rawDoc.identifier_id || rawDoc.doc_id))] ||
+    typeLookup[getLookupKey(fileName)]
+  )
+  if (uploadType) return uploadType
+
+  var typeKey = getLookupKey(rawDoc && (rawDoc.document_type || rawDoc.documentType) || documentType)
+  if (typeKey === 'technical_bid' || typeKey === 'technical') return 'technical_bid'
+  if (typeKey === 'business_bid' || typeKey === 'business') return 'business_bid'
+  return ''
+}
+
+function applyPersonnelDocumentTypeToEntries(entries, documentType) {
+  if (!documentType) return entries
+  return arrayify(entries).map(function (entry) {
+    return isObject(entry) ? Object.assign({}, entry, { document_type: documentType }) : entry
+  })
+}
+
+function getPersonnelRelationBidderName(relation, index) {
+  return String(
+    relation && (
+      relation.bidder_name ||
+      relation.bidderName ||
+      relation.company_name ||
+      relation.companyName ||
+      deriveBidderName(relation.business_bid_file_name) ||
+      deriveBidderName(relation.technical_bid_file_name)
+    ) ||
+    '投标人 ' + (index + 1)
+  ).trim()
+}
+
+function getPersonnelRelationBidderKey(relation, index, bidderName) {
+  var relationId = relation && (relation.relation_id || relation.relationId || relation.id)
+  if (relationId !== undefined && relationId !== null && relationId !== '') return 'relation:' + relationId
+  var nameKey = getLookupKey(bidderName)
+  return nameKey ? 'bidder:' + nameKey : 'relation-index:' + index
+}
+
+function getPersonnelDocBidderName(doc, fileName) {
+  return String(
+    doc && (
+      doc.bidder_name ||
+      doc.bidderName ||
+      doc.company_name ||
+      doc.companyName
+    ) ||
+    deriveBidderName(fileName || doc && doc.file_name) ||
+    ''
+  ).trim()
+}
+
+function getPersonnelDocBidderKey(doc, fileName, bidderName) {
+  var rawKey = doc && (doc.bidder_key || doc.bidderKey)
+  if (rawKey) return String(rawKey)
+  var relationId = doc && (doc.relation_id || doc.relationId)
+  if (relationId !== undefined && relationId !== null && relationId !== '') return 'relation:' + relationId
+  var nameKey = getLookupKey(bidderName || getPersonnelDocBidderName(doc, fileName))
+  if (nameKey) return 'bidder:' + nameKey
+  var docKey = getLookupKey(fileName || doc && doc.file_name || getPersonnelDraftDocKey(doc))
+  return docKey ? 'doc:' + docKey : ''
+}
+
+function getPersonnelDocumentTypeOrder(doc) {
+  var type = getLookupKey(doc && (doc.document_type || doc.documentType))
+  if (type === 'business_bid' || type === 'business') return 1
+  if (type === 'technical_bid' || type === 'technical') return 2
+  return 3
+}
+
+function getPersonnelDocumentTypeLabel(doc) {
+  var order = getPersonnelDocumentTypeOrder(doc)
+  if (order === 1) return '商务标'
+  if (order === 2) return '技术标'
+  return '投标文件'
+}
+
+function sortPersonnelCompanyDocuments(documents) {
+  return arrayify(documents).slice().sort(function (a, b) {
+    var orderDiff = getPersonnelDocumentTypeOrder(a) - getPersonnelDocumentTypeOrder(b)
+    if (orderDiff !== 0) return orderDiff
+    return String(a.file_name || '').localeCompare(String(b.file_name || ''))
+  })
+}
+
+function getPersonnelDraftCompanyGroups(documents) {
+  var groups = []
+  var seen = {}
+  arrayify(documents).forEach(function (doc) {
+    if (!isObject(doc)) return
+    var fileName = doc.file_name || ''
+    var bidderName = getPersonnelDocBidderName(doc, fileName)
+    var groupKey = getPersonnelDocBidderKey(doc, fileName, bidderName) || getPersonnelDraftDocKey(doc)
+    if (!groupKey) return
+    if (!seen[groupKey]) {
+      seen[groupKey] = {
+        key: groupKey,
+        label: bidderName || '投标人',
+        documents: [],
+        personnelCount: 0,
+      }
+      groups.push(seen[groupKey])
+    }
+    if (!seen[groupKey].label || seen[groupKey].label === '投标人') {
+      seen[groupKey].label = bidderName || seen[groupKey].label
+    }
+    seen[groupKey].documents.push(doc)
+  })
+  groups.forEach(function (group) {
+    group.documents = sortPersonnelCompanyDocuments(group.documents)
+    group.personnelCount = group.documents.reduce(function (total, doc) {
+      return total + arrayify(doc.personnel_entries).length
+    }, 0)
+  })
+  return groups
+}
+
+function getDefaultPersonnelCompanyDocument(group) {
+  return group && (
+    arrayify(group.documents).find(function (doc) { return getPersonnelDocumentTypeOrder(doc) === 1 }) ||
+    arrayify(group.documents)[0]
+  ) || null
+}
+
+function getPersonnelDraftDocuments(result, projectDetail) {
+  var docs = []
+  var seen = {}
+  var documentTypeLookup = getProjectPersonnelDocumentTypeLookup(projectDetail)
+
+  function addDoc(rawDoc, documentType) {
+    if (!isObject(rawDoc)) return
+    var docId = rawDoc.identifier_id || rawDoc.document_identifier_id || rawDoc.doc_id || ''
+    var fileName = rawDoc.file_name || rawDoc.fileName || rawDoc.document_name || ''
+    var relationId = rawDoc.relation_id || rawDoc.relationId
+    var bidderName = getPersonnelDocBidderName(rawDoc, fileName)
+    var bidderKey = getPersonnelDocBidderKey(rawDoc, fileName, bidderName)
+    var normalizedDocumentType = normalizePersonnelDocumentType(rawDoc, documentType, fileName, documentTypeLookup)
+    var key = getLookupKey(docId || fileName)
+    if (!key) return
+    var entries = getPersonnelDocumentEntries(rawDoc).map(function (entry) {
+      return normalizePersonnelDraftEntry(entry, rawDoc)
+    }).filter(function (entry) {
+      return entry.name
+    })
+    entries = applyPersonnelDocumentTypeToEntries(entries, normalizedDocumentType)
+    if (!seen[key]) {
+      seen[key] = {
+        document_identifier_id: docId,
+        identifier_id: docId,
+        document_type: normalizedDocumentType,
+        relation_id: relationId,
+        bidder_key: bidderKey,
+        bidder_name: bidderName,
+        file_name: fileName,
+        page_count: rawDoc.page_count,
+        layout_section_count: rawDoc.layout_section_count,
+        table_count: rawDoc.table_count,
+        personnel_entries: [],
+      }
+      docs.push(seen[key])
+    } else {
+      if (relationId) seen[key].relation_id = relationId
+      if (relationId && bidderKey) seen[key].bidder_key = bidderKey
+      if (!seen[key].bidder_key && bidderKey) seen[key].bidder_key = bidderKey
+      if (bidderName && (!seen[key].bidder_name || relationId)) seen[key].bidder_name = bidderName
+      if (normalizedDocumentType) {
+        seen[key].document_type = normalizedDocumentType
+      }
+      if (!seen[key].file_name && fileName) seen[key].file_name = fileName
+      if (!seen[key].page_count && rawDoc.page_count) seen[key].page_count = rawDoc.page_count
+    }
+    entries.forEach(function (entry) {
+      seen[key].personnel_entries.push(entry)
+    })
+    seen[key].personnel_entries = dedupePersonnelDraftEntries(seen[key].personnel_entries)
+    seen[key].personnel_entries = applyPersonnelDocumentTypeToEntries(
+      seen[key].personnel_entries,
+      seen[key].document_type,
+    )
+  }
+
+  arrayify(result && result.personnel_extraction && result.personnel_extraction.documents).forEach(function (doc) {
+    addDoc(doc, doc.document_type)
+  })
+  Object.entries((result && result.groups) || {}).forEach(function (entry) {
+    var groupKey = entry[0]
+    var groupValue = entry[1] || {}
+    arrayify(groupValue.documents).forEach(function (doc) { addDoc(doc, groupKey) })
+    arrayify(groupValue.personnel_reuse_check && groupValue.personnel_reuse_check.documents).forEach(function (doc) { addDoc(doc, groupKey) })
+  })
+  arrayify(projectDetail && projectDetail.relations).forEach(function (relation, relationIndex) {
+    var bidderName = getPersonnelRelationBidderName(relation, relationIndex)
+    var bidderKey = getPersonnelRelationBidderKey(relation, relationIndex, bidderName)
+    addDoc({
+      identifier_id: relation.business_bid_identifier_id,
+      relation_id: relation.relation_id,
+      bidder_key: bidderKey,
+      bidder_name: bidderName,
+      file_name: relation.business_bid_file_name,
+      document_type: 'business_bid',
+      personnel_entries: [],
+    }, 'business_bid')
+    addDoc({
+      identifier_id: relation.technical_bid_identifier_id,
+      relation_id: relation.relation_id,
+      bidder_key: bidderKey,
+      bidder_name: bidderName,
+      file_name: relation.technical_bid_file_name,
+      document_type: 'technical_bid',
+      personnel_entries: [],
+    }, 'technical_bid')
+  })
+
+  return sortPersonnelDraftDocuments(docs, projectDetail)
+}
+
+function buildPersonnelDraftDocRef(doc, page) {
+  if (!doc) return null
+  var targetPage = Number(page || 1) || 1
+  return normalizeDocRef({
+    document_identifier_id: doc.document_identifier_id || doc.identifier_id,
+    identifier_id: doc.document_identifier_id || doc.identifier_id,
+    file_name: doc.file_name,
+    document_type: doc.document_type,
+    relation_id: doc.relation_id,
+    page: targetPage,
+    docKey: (doc.document_identifier_id || doc.identifier_id || doc.file_name || 'personnel-draft') + '#personnel-editor',
+    highlight: doc.personnel_entries && doc.personnel_entries.map(function (entry) { return entry.name }).filter(Boolean),
+  }, { page: targetPage, label: doc.file_name || '投标文件' })
+}
+
 function mergePreviewDocsByKey(docs) {
   var merged = {}
   var order = []
@@ -1372,6 +1812,11 @@ function mergePreviewDocsByFile(docs) {
     addUniquePage(pages, existing.startPage)
     addUniquePage(pages, doc.startPage)
     pages.sort(function (a, b) { return Number(a) - Number(b) })
+    var lockedPages = []
+    if (existing.lockStartPage) addUniquePage(lockedPages, existing.startPage)
+    if (doc.lockStartPage) addUniquePage(lockedPages, doc.startPage)
+    lockedPages.sort(function (a, b) { return Number(a) - Number(b) })
+    var targetPages = lockedPages.length > 0 ? lockedPages : pages
 
     var existingRects = collectHighlightRects(existing.highlightRects)
     var nextRects = collectHighlightRects(doc.highlightRects)
@@ -1381,12 +1826,13 @@ function mergePreviewDocsByFile(docs) {
       fileUrl: existing.fileUrl || doc.fileUrl,
       sourceRef: existing.sourceRef || doc.sourceRef,
       label: existing.label || doc.label,
-      startPage: pages[0] || existing.startPage || doc.startPage || 1,
-      targetPages: pages,
+      startPage: targetPages[0] || existing.startPage || doc.startPage || 1,
+      targetPages: targetPages,
       pageCount: existing.pageCount || doc.pageCount,
       role: existing.role || doc.role,
       purpose: existing.purpose || doc.purpose,
       documentType: existing.documentType || doc.documentType,
+      lockStartPage: existing.lockStartPage || doc.lockStartPage,
       highlight: collectHighlightPhrases(existing.highlight, doc.highlight),
       highlightBbox: existing.highlightBbox || doc.highlightBbox,
       highlightRects: existingRects.concat(nextRects).slice(0, 24),
@@ -1536,6 +1982,7 @@ var FORMAT_TENDER_LOCATION_FIELDS = [
 
 function getFormatTenderLocationFields(checkKey) {
   if (checkKey === 'verification_check') return ['deadline_locations']
+  if (checkKey === 'itemized_pricing_check') return []
   return FORMAT_TENDER_LOCATION_FIELDS
 }
 
@@ -1554,7 +2001,7 @@ var FORMAT_TENDER_HIGHLIGHT_CONFIG = {
   consistency_check: {
     docKeyPrefix: 'consistency-template',
     defaultLabel: '招标文件模板',
-    labelSuffix: '（缺失内容位置）',
+    labelSuffix: '（招标附件模板页）',
   },
   pricing_check: {
     docKeyPrefix: 'pricing-tender',
@@ -1670,6 +2117,32 @@ function getTenderRoleLocationCandidates(values) {
   return uniqueLocationCandidates(locations)
 }
 
+function collectConsistencyTemplateLocationValues(issue) {
+  var evidence = (issue && issue.evidence) || {}
+  var attachmentLocations = []
+
+  arrayify(evidence.template_attachment_locations).forEach(function (location) {
+    attachmentLocations.push(withLocationDocumentRole(location, 'tender'))
+  })
+  attachmentLocations = uniqueLocationCandidates(attachmentLocations).filter(function (location) {
+    return Boolean(location && extractFirstPage(location))
+  })
+  if (attachmentLocations.length > 0) return attachmentLocations
+
+  var locations = []
+
+  arrayify(evidence.tender_highlight_locations).forEach(function (location) {
+    locations.push(withLocationDocumentRole(location, 'tender'))
+  })
+  arrayify(evidence.template_locations).forEach(function (location) {
+    locations.push(withLocationDocumentRole(location, 'tender'))
+  })
+
+  return uniqueLocationCandidates(locations).filter(function (location) {
+    return Boolean(location && extractFirstPage(location))
+  })
+}
+
 function getFormatTenderHighlightConfig(checkKey) {
   return FORMAT_TENDER_HIGHLIGHT_CONFIG[checkKey] || {
     docKeyPrefix: 'format-tender',
@@ -1679,6 +2152,11 @@ function getFormatTenderHighlightConfig(checkKey) {
 }
 
 function getFormatTenderHighlightLocations(issue, checkKey) {
+  if (checkKey === 'consistency_check') {
+    var consistencyTemplateLocations = collectConsistencyTemplateLocationValues(issue)
+    if (consistencyTemplateLocations.length > 0) return consistencyTemplateLocations
+  }
+
   var candidates = [collectFormatEvidenceLocations(issue, checkKey)]
   if (checkKey !== 'verification_check') {
     candidates.push(issue && issue.locations)
@@ -1758,6 +2236,22 @@ function collectFormatLocationValues(issue, checkKey) {
   var issueLocations = arrayify(issue && issue.locations).filter(function (location) {
     return checkKey !== 'verification_check' || getLocationDocumentRole(location) !== 'tender'
   })
+
+  if (checkKey === 'consistency_check') {
+    var nonTenderIssueLocations = issueLocations.filter(function (location) {
+      return getLocationDocumentRole(location) !== 'tender'
+    })
+    var nonTenderEvidenceLocations = evidenceLocations.filter(function (location) {
+      return getLocationDocumentRole(location) !== 'tender'
+    })
+    var templateLocations = collectConsistencyTemplateLocationValues(issue)
+
+    return uniqueLocationCandidates(
+      nonTenderIssueLocations.concat(nonTenderEvidenceLocations, templateLocations),
+    ).filter(function (location) {
+      return Boolean(location && extractFirstPage(location))
+    })
+  }
 
   var evidenceHasDocumentHint = evidenceLocations.some(function (location) {
     return Boolean(
@@ -1929,6 +2423,9 @@ function buildTenderLocationDocRefs(locations, options) {
       docKey: (location.document_identifier_id || location.identifier_id || location.file_name || resolvedDoc.docId || resolvedDoc.fileName || opts.docKeyPrefix || 'tender-location') +
         '#' + (opts.docKeyPrefix || 'tender-location') + '-' + index + '-' + entry.page,
       label: (location.file_name || resolvedDoc.fileName || resolvedDoc.file_name || opts.defaultLabel || '招标文件') + (opts.labelSuffix || ''),
+      purpose: opts.purpose,
+      targetPages: [entry.page],
+      lockStartPage: opts.lockStartPage,
       highlight: entry.highlights,
       highlightBbox: entry.rects[0],
       highlightRects: entry.rects,
@@ -1945,6 +2442,8 @@ function buildFormatTenderHighlightDocRefs(issue, checkKey, options) {
     docKeyPrefix: config.docKeyPrefix,
     defaultLabel: config.defaultLabel,
     labelSuffix: config.labelSuffix,
+    purpose: checkKey === 'consistency_check' ? 'consistency_template' : undefined,
+    lockStartPage: checkKey === 'consistency_check',
     highlights: getFormatTenderHighlightPhrases(issue, checkKey),
   })
 }
@@ -2224,10 +2723,21 @@ function orderFormatReviewDocRefs(docRefs) {
 }
 
 function collectPersonnelAlertsFromGroups(resultKey, result, allAlerts, options) {
-  if (!result || !result.groups) return
+  if (!result || (!result.groups && !isObject(result.combined_personnel_reuse_check))) return
   var opts = options || {}
+  var groupEntries = Object.entries(result.groups || {})
+  if (isObject(result.combined_personnel_reuse_check)) {
+    groupEntries = [[
+      '全部投标文件',
+      {
+        document_type: '全部投标文件',
+        personnel_reuse_check: result.combined_personnel_reuse_check,
+        summary: result.summary,
+      },
+    ]]
+  }
 
-  Object.entries(result.groups).forEach(function (entry) {
+  groupEntries.forEach(function (entry) {
     var groupKey = entry[0]
     var groupValue = entry[1] || {}
     var check = getPersonnelCheckPayload(groupValue)
@@ -2309,6 +2819,7 @@ function collectPersonnelAlertsFromGroups(resultKey, result, allAlerts, options)
         metrics: {
           '涉及文档': documentCount,
           '出现次数': item.occurrence_count || '--',
+          '出现页码': formatPagesByFile(item.pages_by_file),
           '角色': arrayify(item.roles).join('、') || item.role || '--',
         },
         evidence: {
@@ -2328,9 +2839,15 @@ function collectPersonnelAlertsFromGroups(resultKey, result, allAlerts, options)
   })
 }
 
-function collectFormatReviewAlerts(results, allAlerts) {
-  var result = results.business_bid_format_review
+function collectFormatReviewAlerts(results, allAlerts, options) {
+  var opts = options || {}
+  var sourceResultKey = opts.resultKey || FORMAT_REVIEW_RESULT_KEY
+  var result = opts.result || results[sourceResultKey]
   if (!result) return
+  var issueResultType = opts.resultType || FORMAT_REVIEW_RESULT_KEY
+  var passedResultType = opts.passedResultType || issueResultType
+  var defaultGroupKey = opts.groupKey || 'business_bid'
+  var defaultGroupLabel = opts.groupLabel || DOCUMENT_LABELS.business_bid
 
   arrayify(result.bidders).forEach(function (bidder, bidderIndex) {
     var bidderDocumentLookup = buildInlineDocumentLookup(
@@ -2351,8 +2868,8 @@ function collectFormatReviewAlerts(results, allAlerts) {
           issue: issue,
           issueIndex: issueIndex,
           idPrefix: 'format',
-          resultType: FORMAT_REVIEW_RESULT_KEY,
-          resultTypeLabel: RESULT_TYPE_LABELS[FORMAT_REVIEW_RESULT_KEY],
+          resultType: issueResultType,
+          resultTypeLabel: opts.resultTypeLabel || RESULT_TYPE_LABELS[issueResultType],
           sourceStatus: issue && issue.status,
         }
       }).concat(passedIssues.map(function (issue, issueIndex) {
@@ -2360,8 +2877,8 @@ function collectFormatReviewAlerts(results, allAlerts) {
           issue: issue,
           issueIndex: issueIndex,
           idPrefix: 'format-pass',
-          resultType: FORMAT_REVIEW_PASSED_RESULT_KEY,
-          resultTypeLabel: RESULT_TYPE_LABELS[FORMAT_REVIEW_PASSED_RESULT_KEY],
+          resultType: passedResultType,
+          resultTypeLabel: opts.passedResultTypeLabel || RESULT_TYPE_LABELS[passedResultType],
           sourceStatus: 'passed',
         }
       }))
@@ -2378,8 +2895,8 @@ function collectFormatReviewAlerts(results, allAlerts) {
           },
           issueIndex: 0,
           idPrefix: 'format',
-          resultType: FORMAT_REVIEW_RESULT_KEY,
-          resultTypeLabel: RESULT_TYPE_LABELS[FORMAT_REVIEW_RESULT_KEY],
+          resultType: issueResultType,
+          resultTypeLabel: opts.resultTypeLabel || RESULT_TYPE_LABELS[issueResultType],
           sourceStatus: reviewStatus,
         }]
       }
@@ -2408,6 +2925,7 @@ function collectFormatReviewAlerts(results, allAlerts) {
           var sourceDocPage = extractFirstPage(doc)
           var locationPage = getPageForDocFromLocations(doc, formatLocations)
           var sourceDocIsTender = isTenderTemplateDoc(doc)
+          var sourceDocIsTechnical = isTechnicalBidDoc(doc)
           var defaultPage = locationPage || sourceDocPage
           if (!defaultPage && !sourceDocIsTender) {
             defaultPage = bidFallbackPage
@@ -2417,11 +2935,11 @@ function collectFormatReviewAlerts(results, allAlerts) {
             fileName: doc.file_name || bidder.file_name,
             page: defaultPage,
             label: doc.file_name || doc.role || bidder.bidder_name || ('关联文档 ' + (docIndex + 1)),
-            role: sourceDocIsTender ? 'tender' : 'business_bid',
-            documentType: sourceDocIsTender ? 'tender' : 'business_bid',
+            role: sourceDocIsTender ? 'tender' : (sourceDocIsTechnical ? 'technical_bid' : 'business_bid'),
+            documentType: sourceDocIsTender ? 'tender' : (sourceDocIsTechnical ? 'technical_bid' : 'business_bid'),
           })
         }).filter(Boolean)
-        var formatTenderRefs = isDeviationTableMissing ? [] : buildFormatTenderHighlightDocRefs(issue, checkKey, {
+        var formatTenderRefs = (isDeviationTableMissing || checkKey === 'verification_check' || checkKey === 'itemized_pricing_check') ? [] : buildFormatTenderHighlightDocRefs(issue, checkKey, {
           documentLookup: bidderDocumentLookup,
         })
         if (checkKey === 'pricing_check' && formatTenderRefs.length === 0) {
@@ -2445,8 +2963,11 @@ function collectFormatReviewAlerts(results, allAlerts) {
           }))
         }
         docRefs = orderFormatReviewDocRefs(docRefs)
+        var previewLocations = checkKey === 'verification_check' || checkKey === 'consistency_check'
+          ? formatLocations.filter(function (location) { return getLocationDocumentRole(location) !== 'tender' })
+          : formatLocations
         var issueLocationRefs = isDeviationTableMissing ? [] : buildIssueLocationDocRefs(issue, {
-          locations: formatLocations,
+          locations: previewLocations,
           documentLookup: bidderDocumentLookup,
           docKeyPrefix: 'format-issue',
           defaultLabel: bidder.bidder_name || bidder.file_name || '定位文档',
@@ -2460,13 +2981,16 @@ function collectFormatReviewAlerts(results, allAlerts) {
             return !issueLocationKeys[(doc.docId || '') + '|' + (doc.fileName || '') + '|' + doc.startPage]
           }))
         }
-        if (isPassedItem) {
+        if (isPassedItem && checkKey !== 'verification_check' && checkKey !== 'itemized_pricing_check') {
           docRefs = ensureFormatTenderDocRef(
             docRefs,
             sourceDocs,
             bidderDocumentLookup,
             getFormatTenderFallbackPage(issue, checkKey, formatLocations, formatTenderRefs),
           )
+        }
+        if (checkKey === 'verification_check' || checkKey === 'itemized_pricing_check') {
+          docRefs = docRefs.filter(function (doc) { return !isTenderTemplateDoc(doc) })
         }
         docRefs = orderFormatReviewDocRefs(docRefs)
         var docRef = docRefs.find(function (doc) {
@@ -2480,11 +3004,15 @@ function collectFormatReviewAlerts(results, allAlerts) {
         var overviewDocuments = isDeviationTableMissing
           ? docRefs
           : buildFormatOverviewDocuments(bidder, bidderDocumentLookup, docRefs, previewPage)
+        var alertTitle = checkKey === 'pricing_check' && issue.title === '报价合理性'
+          ? '报价合理性（直接报价大小写一致、是否超过最高限价）'
+          : checkLabel + '：' + (issue.title || (isPassedItem ? '已符合要求' : '待确定'))
+        var alertDescription = issue.message || (check.review && check.review.summary) || (isPassedItem ? '系统审查通过，关键内容已匹配' : '发现需复核项')
 
         var alert = {
           id: makeAlertId(issueEntry.idPrefix, bidder.bidder_key || bidder.bidder_name || bidderIndex, checkKey, issue.title, issueIndex),
           resultType: issueEntry.resultType,
-          sourceResultKey: FORMAT_REVIEW_RESULT_KEY,
+          sourceResultKey: sourceResultKey,
           subType: checkKey,
           formatOverviewOrder: getFormatOverviewCheckOrder(checkKey),
           formatOverviewLabel: FORMAT_OVERVIEW_CHECK_LABELS[checkKey] || checkLabel,
@@ -2492,11 +3020,12 @@ function collectFormatReviewAlerts(results, allAlerts) {
           sourceStatus: issueEntry.sourceStatus,
           bidderKey: bidder.bidder_key,
           bidderName: bidder.bidder_name,
-          groupKey: 'business_bid',
-          groupLabel: DOCUMENT_LABELS.business_bid,
+          manualStatusPath: 'bidders[' + bidderIndex + '].checks.' + checkKey + '.review.status',
+          groupKey: defaultGroupKey,
+          groupLabel: defaultGroupLabel,
           riskLevel: isPassedItem ? 'none' : (riskLevel === 'none' ? 'medium' : riskLevel),
-          title: (isPassedItem ? '通过项：' : '') + checkLabel + '：' + (issue.title || '需人工复核'),
-          description: (bidder.bidder_name || bidder.bidder_key || '投标人') + ' - ' + (issue.message || (check.review && check.review.summary) || (isPassedItem ? '系统判断通过，可抽查复核' : '发现需复核项')),
+          title: (isPassedItem ? '符合项：' : '') + alertTitle,
+          description: (bidder.bidder_name || bidder.bidder_key || '投标人') + ' - ' + alertDescription,
           metrics: {
             '投标人': bidder.bidder_name || bidder.bidder_key || '--',
             '审查项': checkLabel,
@@ -2517,7 +3046,7 @@ function collectFormatReviewAlerts(results, allAlerts) {
         }
 
         alert.exportPayload = compactObject({
-          result_key: 'business_bid_format_review',
+          result_key: sourceResultKey,
           bidder_key: bidder.bidder_key,
           bidder_name: bidder.bidder_name,
           check_code: check.check_code || checkKey,
@@ -2538,10 +3067,18 @@ function collectAllAlerts(results) {
 
   var allAlerts = []
 
-  collectDuplicateAlerts(results, allAlerts)
-  collectTypoAlertsFromGroups('typo_check', results.typo_check, allAlerts)
-  collectPersonnelAlertsFromGroups('personnel_reuse_check', results.personnel_reuse_check, allAlerts)
   collectFormatReviewAlerts(results, allAlerts)
+  collectFormatReviewAlerts(results, allAlerts, {
+    resultKey: 'deviation_check',
+    resultType: 'deviation_check',
+    passedResultType: 'deviation_check',
+    resultTypeLabel: RESULT_TYPE_LABELS.deviation_check,
+    passedResultTypeLabel: RESULT_TYPE_LABELS.deviation_check,
+    groupKey: 'deviation_check',
+    groupLabel: '偏离表',
+  })
+  collectPersonnelAlertsFromGroups('personnel_reuse_check', results.personnel_reuse_check, allAlerts)
+  collectDuplicateAlerts(results, allAlerts)
 
   var order = { high: 3, medium: 2, low: 1, none: 0 }
   return allAlerts.sort(function (a, b) {
@@ -2560,7 +3097,7 @@ var RISK_LABELS = {
   high: 'HIGH',
   medium: 'MEDIUM',
   low: 'LOW',
-  none: 'PASS',
+  none: '通过',
 }
 
 var PREVIEW_HIGHLIGHTS_ENABLED = true
@@ -2631,7 +3168,7 @@ function getAlertDocIds(alert) {
     return scopePreviewDocsToAlert(alert, mergePreviewDocsByFile(docs))
   }
 
-  // Single document (typo, review-typo)
+  // Single document alert
   if (alert.documentId) {
     docs.push({
       docId: alert.documentId,
@@ -2840,6 +3377,51 @@ async function fetchDocumentPreviewForDoc(docInfo, page) {
   throw lastError || new Error('无法加载预览')
 }
 
+function getManualDeadlineSourceValue(item) {
+  if (isObject(item && item.effective_value)) return item.effective_value
+  if (isObject(item && item.manual_value)) return item.manual_value
+  if (isObject(item && item.original_value)) return item.original_value
+  return {}
+}
+
+function buildManualDeadlineLocator(item) {
+  var source = getManualDeadlineSourceValue(item)
+  var locations = uniqueLocationCandidates(arrayify(source.deadline_locations).map(function (location) {
+    return withLocationDocumentRole(location, 'tender')
+  }))
+  var page = getFirstNumber(source.deadline_page) ||
+    getFirstNumber(source.matched_deadline_page) ||
+    getFirstNumber(source.deadlinePage) ||
+    extractFirstPage(locations[0])
+  var pageLocations = locations.filter(function (location) {
+    var locationPage = extractFirstPage(location)
+    return !page || !locationPage || Number(locationPage) === Number(page)
+  })
+  var rects = pageLocations.map(locationBboxToRect).filter(Boolean)
+  var deadlineLocationText = pageLocations.map(function (location) {
+    return String((location && location.text) || '').trim()
+  }).find(function (text) {
+    return /递交|提交|截止|投标截止|响应截止/.test(text)
+  })
+  var deadlinePhrase = [
+    deadlineLocationText,
+    source.deadline_text,
+    source.matched_deadline_text,
+  ].map(function (text) {
+    return String(text || '').trim()
+  }).find(function (text) {
+    return /递交|提交|投标截止|响应截止/.test(text)
+  }) || ''
+  var highlightPhrases = collectHighlightPhrases(deadlinePhrase)
+
+  return {
+    page: page,
+    locations: locations,
+    highlightPhrases: highlightPhrases,
+    rects: rects,
+  }
+}
+
 function buildSelectedExportPayload(alert, reviewStatusMap) {
   var payload = cloneForExport(alert.exportPayload || buildExportPayload(alert, alert.sourceItem))
   var status = reviewStatusMap && reviewStatusMap[alert.id]
@@ -2955,12 +3537,6 @@ function getOverviewResultKeys(results, resultTypeKeys) {
   return keys
 }
 
-function countAlertsByRisk(alerts, riskLevel) {
-  return arrayify(alerts).filter(function (alert) {
-    return alert.riskLevel === riskLevel
-  }).length
-}
-
 function formatMetricValue(value) {
   if (value === undefined || value === null || value === '') return '--'
   if (typeof value === 'number') {
@@ -2982,6 +3558,83 @@ function getAlertMetricSummary(alert) {
 
 function isPersonnelAlert(alert) {
   return alert && alert.sourceResultKey === 'personnel_reuse_check'
+}
+
+function isPassedReviewItem(alert) {
+  return Boolean(alert) && (alert.sourceStatus === 'passed' || alert.resultType === FORMAT_REVIEW_PASSED_RESULT_KEY)
+}
+
+function getReviewItemIndexLabel(alert) {
+  return isPassedReviewItem(alert) ? '详情' : '问题'
+}
+
+function isPassReviewResult(alert) {
+  return isPassedReviewItem(alert) || normalizeRiskLevel(alert && alert.riskLevel) === 'none'
+}
+
+function getReviewResultLabel(alert) {
+  return isPassReviewResult(alert) ? '通过' : '不通过'
+}
+
+function getReviewResultClass(alert) {
+  return isPassReviewResult(alert) ? 'result-pass' : 'result-fail'
+}
+
+function getReviewResultFilterCounts(alerts) {
+  var counts = { all: 0, pass: 0, fail: 0 }
+  arrayify(alerts).forEach(function (alert) {
+    counts.all += 1
+    if (isPassReviewResult(alert)) counts.pass += 1
+    else counts.fail += 1
+  })
+  return counts
+}
+
+function filterReviewAlertsByResult(alerts, filterValue) {
+  var mode = filterValue || 'all'
+  if (mode === 'pass') {
+    return arrayify(alerts).filter(function (alert) { return isPassReviewResult(alert) })
+  }
+  if (mode === 'fail') {
+    return arrayify(alerts).filter(function (alert) { return !isPassReviewResult(alert) })
+  }
+  return arrayify(alerts)
+}
+
+function getResultFilterEmptyText(filterValue, fallbackText) {
+  if (filterValue === 'pass') return '该文件暂无通过项'
+  if (filterValue === 'fail') return '该文件暂无不通过项'
+  return fallbackText
+}
+
+function getReviewCheckFilterCounts(alerts) {
+  var counts = { all: 0 }
+  FORMAT_FILE_CHECK_FILTER_OPTIONS.forEach(function (option) {
+    if (option[0] !== 'all') counts[option[0]] = 0
+  })
+  arrayify(alerts).forEach(function (alert) {
+    counts.all += 1
+    if (Object.prototype.hasOwnProperty.call(counts, alert && alert.subType)) {
+      counts[alert.subType] += 1
+    }
+  })
+  return counts
+}
+
+function filterReviewAlertsByCheck(alerts, filterValue) {
+  var mode = filterValue || 'all'
+  if (mode === 'all') return arrayify(alerts)
+  return arrayify(alerts).filter(function (alert) { return alert && alert.subType === mode })
+}
+
+function getCheckFilterLabel(filterValue) {
+  var option = FORMAT_FILE_CHECK_FILTER_OPTIONS.find(function (item) { return item[0] === filterValue })
+  return option ? option[1] : ''
+}
+
+function getCheckFilterEmptyText(filterValue, fallbackText) {
+  if (!filterValue || filterValue === 'all') return fallbackText
+  return '该文件暂无' + getCheckFilterLabel(filterValue)
 }
 
 function renderAlertTitle(alert, props) {
@@ -3087,6 +3740,12 @@ function sortFormatOverviewAlerts(alerts) {
   return arrayify(alerts).slice().sort(compareFormatOverviewAlerts)
 }
 
+function sortAlertsForResultType(resultType, alerts) {
+  return isFormatReviewResultType(resultType)
+    ? sortFormatOverviewAlerts(alerts)
+    : sortAlertsForDisplay(alerts)
+}
+
 function buildFormatOverviewFileGroups(alerts) {
   var groups = {}
   var order = []
@@ -3123,8 +3782,13 @@ export default function ReviewPage() {
   var [allAlerts, setAllAlerts] = useState([])
   var [currentServiceType, setCurrentServiceType] = useState(null)
   var [currentAlertIndex, setCurrentAlertIndex] = useState(0)
+  var [alertJumpInput, setAlertJumpInput] = useState('')
   var [reviewStatus, setReviewStatus] = useState({})
   var [reviewNotes, setReviewNotes] = useState({})
+  var [overviewFileResultFilters, setOverviewFileResultFilters] = useState({})
+  var [overviewFileCheckFilters, setOverviewFileCheckFilters] = useState({})
+  var [overviewFilePages, setOverviewFilePages] = useState({})
+  var [overviewFileSearchInputs, setOverviewFileSearchInputs] = useState({})
   var [showExport, setShowExport] = useState(false)
   var [notice, setNotice] = useState(null)
   var [isLoading, setIsLoading] = useState(true)
@@ -3136,9 +3800,27 @@ export default function ReviewPage() {
   var [previewBusy, setPreviewBusy] = useState({})
   var [previewErrors, setPreviewErrors] = useState({})
   var [previewLoading, setPreviewLoading] = useState(false)
-  var [previewZoom, setPreviewZoom] = useState(60)
+  var [previewZoom, setPreviewZoom] = useState(100)
   var [previewLightbox, setPreviewLightbox] = useState(null)
   var [exportLoading, setExportLoading] = useState(false)
+  var [personnelDraftDocuments, setPersonnelDraftDocuments] = useState([])
+  var [personnelActiveBidderKey, setPersonnelActiveBidderKey] = useState('')
+  var [personnelActiveDocKey, setPersonnelActiveDocKey] = useState('')
+  var [personnelActivePage, setPersonnelActivePage] = useState(1)
+  var [personnelDraftDirty, setPersonnelDraftDirty] = useState(false)
+  var [personnelDraftSaving, setPersonnelDraftSaving] = useState(false)
+  var [personnelConfirming, setPersonnelConfirming] = useState(false)
+  var [formatEditableItems, setFormatEditableItems] = useState([])
+  var [formatManualDrafts, setFormatManualDrafts] = useState({})
+  var [formatManualEditing, setFormatManualEditing] = useState({})
+  var [formatManualLoading, setFormatManualLoading] = useState(false)
+  var [formatManualSaving, setFormatManualSaving] = useState(false)
+  var [formatManualRerunning, setFormatManualRerunning] = useState(false)
+  var [formatManualLocating, setFormatManualLocating] = useState(false)
+  var [deviationManualSaving, setDeviationManualSaving] = useState(false)
+  var resultsRef = useRef(results)
+  var projectDetailRef = useRef(projectDetail)
+  var savePersonnelDraftRef = useRef(null)
   var exportModalRef = useRef(null)
 
   var loadProjects = useCallback(function () {
@@ -3153,29 +3835,64 @@ export default function ReviewPage() {
     if (!projectId) {
       setIsLoading(false)
       setProjectDetail(null)
+      setFormatEditableItems([])
+      setFormatManualDrafts({})
+      setFormatManualEditing({})
+      setFormatManualLoading(false)
+      setPersonnelDraftDocuments([])
+      setPersonnelActiveBidderKey('')
+      setPersonnelActiveDocKey('')
       return
     }
 
     setIsLoading(true)
+    setFormatManualLoading(true)
     Promise.all([
       getProjectResults(projectId),
       getProjectDetail(projectId).catch(function () { return null }),
+      getBusinessBidFormatReviewEditable(projectId).catch(function () { return null }),
     ]).then(function (responses) {
       var data = responses[0]
       var loadedProjectDetail = responses[1]
+      var editablePayload = responses[2]
       var projectResults = normalizeProjectResultsPayload(data)
       setResults(projectResults)
       setProjectDetail(loadedProjectDetail)
       var alerts = enrichAlertsWithProjectFiles(collectAllAlerts(projectResults), loadedProjectDetail)
+      var draftDocs = getPersonnelDraftDocuments(projectResults.personnel_reuse_check, loadedProjectDetail)
+      var draftCompanyGroups = getPersonnelDraftCompanyGroups(draftDocs)
+      var firstDraftCompany = draftCompanyGroups[0] || null
+      var firstDraftDoc = getDefaultPersonnelCompanyDocument(firstDraftCompany) || draftDocs[0] || null
+      var editableItems = arrayify(editablePayload && editablePayload.items)
+      var manualDrafts = {}
+      editableItems.forEach(function (item) {
+        if (item.has_manual_value) {
+          manualDrafts[item.editable_id] = stringifyManualReviewValue(item.manual_value)
+        }
+      })
       setAllAlerts(alerts)
+      setFormatEditableItems(editableItems)
+      setFormatManualDrafts(manualDrafts)
+      setPersonnelDraftDocuments(draftDocs)
+      setPersonnelActiveBidderKey(firstDraftCompany && firstDraftCompany.key || '')
+      setPersonnelActiveDocKey(getPersonnelDraftDocKey(firstDraftDoc))
+      setPersonnelActivePage(1)
+      setPersonnelDraftDirty(false)
       setSelectedAlerts(new Set())
       setCurrentServiceType(null)
       setCurrentAlertIndex(0)
     }).catch(function () {
       setProjectDetail(null)
+      setFormatEditableItems([])
+      setFormatManualDrafts({})
+      setFormatManualEditing({})
+      setPersonnelDraftDocuments([])
+      setPersonnelActiveBidderKey('')
+      setPersonnelActiveDocKey('')
       setNotice({ type: 'error', message: '加载项目结果失败' })
     }).finally(function () {
       setIsLoading(false)
+      setFormatManualLoading(false)
     })
   }, [])
 
@@ -3186,6 +3903,14 @@ export default function ReviewPage() {
   useEffect(function () {
     loadData(selectedProjectId)
   }, [selectedProjectId, loadData])
+
+  useEffect(function () {
+    resultsRef.current = results
+  }, [results])
+
+  useEffect(function () {
+    projectDetailRef.current = projectDetail
+  }, [projectDetail])
 
   useEffect(function () {
     if (!previewLightbox) return undefined
@@ -3207,6 +3932,10 @@ export default function ReviewPage() {
     setSearchParams(projectId ? { projectId } : {})
     setReviewStatus({})
     setReviewNotes({})
+    setOverviewFileResultFilters({})
+    setOverviewFileCheckFilters({})
+    setOverviewFilePages({})
+    setOverviewFileSearchInputs({})
     setSelectedAlerts(new Set())
     setPreviewData({})
     setPreviewPages({})
@@ -3214,33 +3943,113 @@ export default function ReviewPage() {
     setPreviewBusy({})
     setPreviewErrors({})
     setProjectDetail(null)
+    setPersonnelDraftDocuments([])
+    setPersonnelActiveBidderKey('')
+    setPersonnelActiveDocKey('')
+    setPersonnelActivePage(1)
+    setPersonnelDraftDirty(false)
+    setPersonnelDraftSaving(false)
+    setPersonnelConfirming(false)
+    setFormatEditableItems([])
+    setFormatManualDrafts({})
+    setFormatManualEditing({})
+    setFormatManualLoading(false)
+    setFormatManualSaving(false)
+    setFormatManualRerunning(false)
     setCurrentServiceType(null)
     setCurrentAlertIndex(0)
   }
 
   // Compute alerts for current service type
   var serviceAlerts = currentServiceType
-    ? sortAlertsForDisplay(allAlerts.filter(function (a) { return a.resultType === currentServiceType }))
+    ? sortAlertsForResultType(currentServiceType, allAlerts.filter(function (a) { return a.resultType === currentServiceType }))
     : []
 
   var currentAlert = serviceAlerts[currentAlertIndex] || null
+  var personnelCompanyGroups = getPersonnelDraftCompanyGroups(personnelDraftDocuments)
+  var personnelActiveCompany = personnelCompanyGroups.find(function (group) {
+    return String(group.key || '') === String(personnelActiveBidderKey || '')
+  }) || personnelCompanyGroups[0] || null
+  var personnelVisibleDocuments = personnelActiveCompany ? personnelActiveCompany.documents : []
+  var personnelActiveDocument = personnelVisibleDocuments.find(function (doc) {
+    return String(getPersonnelDraftDocKey(doc) || '') === String(personnelActiveDocKey || '')
+  }) || getDefaultPersonnelCompanyDocument(personnelActiveCompany)
   var currentServiceIsPassedList = currentServiceType === FORMAT_REVIEW_PASSED_RESULT_KEY ||
     (serviceAlerts.length > 0 && serviceAlerts.every(function (alert) {
       return alert.sourceStatus === 'passed'
     }))
   var currentAlertIsPassedItem = currentAlert && currentAlert.sourceStatus === 'passed'
 
-  // Load previews for current alert
   useEffect(function () {
-    if (!currentAlert) {
-      setPreviewData({})
-      setPreviewPageInputs({})
-      setPreviewErrors({})
-      setPreviewBusy({})
+    if (!currentServiceType || serviceAlerts.length === 0) {
+      setAlertJumpInput('')
       return
     }
+    setAlertJumpInput(String(Math.min(currentAlertIndex + 1, serviceAlerts.length)))
+  }, [currentAlertIndex, currentServiceType, serviceAlerts.length])
 
-    var docIds = getAlertDocIds(currentAlert)
+  useEffect(function () {
+    if (currentServiceType !== 'personnel_reuse_check') return
+    var groups = getPersonnelDraftCompanyGroups(personnelDraftDocuments)
+    if (groups.length === 0) return
+    var activeGroup = groups.find(function (group) {
+      return String(group.key || '') === String(personnelActiveBidderKey || '')
+    }) || groups[0]
+    if (activeGroup && String(activeGroup.key || '') !== String(personnelActiveBidderKey || '')) {
+      setPersonnelActiveBidderKey(activeGroup.key || '')
+    }
+    var hasActiveDoc = arrayify(activeGroup && activeGroup.documents).some(function (doc) {
+      return String(getPersonnelDraftDocKey(doc) || '') === String(personnelActiveDocKey || '')
+    })
+    if (!hasActiveDoc) {
+      var nextDoc = getDefaultPersonnelCompanyDocument(activeGroup)
+      if (nextDoc) {
+        setPersonnelActiveDocKey(getPersonnelDraftDocKey(nextDoc))
+        setPersonnelActivePage(1)
+      }
+    }
+  }, [currentServiceType, personnelDraftDocuments, personnelActiveBidderKey, personnelActiveDocKey])
+
+  var getCurrentPreviewDocs = useCallback(function () {
+    if (currentServiceType === 'personnel_reuse_check' && personnelActiveDocument) {
+      var personnelDocRef = buildPersonnelDraftDocRef(personnelActiveDocument, personnelActivePage)
+      return personnelDocRef ? [personnelDocRef] : []
+    }
+    var docs = currentAlert ? getAlertDocIds(currentAlert) : []
+    if (
+      currentAlert &&
+      currentAlert.sourceResultKey === FORMAT_REVIEW_RESULT_KEY &&
+      currentAlert.subType === 'itemized_pricing_check'
+    ) {
+      var bidderKey = currentAlert.bidderKey
+      var itemizedItems = filterRealItemizedManualReviewItems(formatEditableItems.filter(function (item) {
+        if (item.check_code !== 'itemized_pricing_check') return false
+        if (bidderKey && item.bidder_key && String(item.bidder_key) !== String(bidderKey)) return false
+        return true
+      }))
+      var itemizedPage = null
+      itemizedItems.some(function (item) {
+        itemizedPage = arrayify(item.page_refs).map(Number).find(function (page) {
+          return Number.isFinite(page) && page > 0
+        }) || null
+        return Boolean(itemizedPage)
+      })
+      if (itemizedPage) {
+        docs = docs.map(function (doc) {
+          if (isTenderTemplateDoc(doc)) return doc
+          return Object.assign({}, doc, {
+            page: itemizedPage,
+            startPage: itemizedPage,
+          })
+        })
+      }
+    }
+    return docs
+  }, [currentServiceType, currentAlert, personnelActiveDocument, personnelActivePage, formatEditableItems])
+
+  // Load previews for current alert
+  useEffect(function () {
+    var docIds = getCurrentPreviewDocs()
     if (docIds.length === 0) {
       setPreviewData({})
       setPreviewPageInputs({})
@@ -3300,11 +4109,33 @@ export default function ReviewPage() {
     })
 
     return function () { cancelled = true }
-  }, [currentAlert])
+  }, [currentAlert, getCurrentPreviewDocs])
+
+  useEffect(function () {
+    if (!personnelDraftDirty || !selectedProjectId || personnelDraftDocuments.length === 0) return undefined
+    var saveDraft = savePersonnelDraftRef.current
+    if (!saveDraft) return undefined
+    var cancelled = false
+    var timer = window.setTimeout(function () {
+      saveDraft(personnelDraftDocuments, { silent: true }).finally(function () {
+        if (!cancelled) setPersonnelDraftDirty(false)
+      })
+    }, 700)
+    return function () {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [personnelDraftDirty, personnelDraftDocuments, selectedProjectId])
 
   function selectServiceType(key) {
     setCurrentServiceType(key)
     setCurrentAlertIndex(0)
+    if (key === 'personnel_reuse_check' && personnelActiveCompany) {
+      setPersonnelActiveBidderKey(personnelActiveCompany.key || '')
+      var nextPersonnelDoc = personnelActiveDocument || getDefaultPersonnelCompanyDocument(personnelActiveCompany)
+      setPersonnelActiveDocKey(getPersonnelDraftDocKey(nextPersonnelDoc))
+      setPersonnelActivePage(1)
+    }
     setPreviewData({})
     setPreviewPages({})
     setPreviewPageInputs({})
@@ -3314,7 +4145,7 @@ export default function ReviewPage() {
 
   function openAlertFromOverview(alert) {
     if (!alert) return
-    var sortedAlerts = sortAlertsForDisplay(allAlerts.filter(function (item) {
+    var sortedAlerts = sortAlertsForResultType(alert.resultType, allAlerts.filter(function (item) {
       return item.resultType === alert.resultType
     }))
     var targetIndex = sortedAlerts.findIndex(function (item) {
@@ -3350,6 +4181,33 @@ export default function ReviewPage() {
       setPreviewBusy({})
       setPreviewErrors({})
     }
+  }
+
+  function handleAlertJumpChange(event) {
+    setAlertJumpInput(String(event.target.value || '').replace(/\D/g, ''))
+  }
+
+  function handleAlertJumpSubmit(event) {
+    event.preventDefault()
+    if (serviceAlerts.length === 0) return
+
+    var parsed = Number(alertJumpInput)
+    if (!parsed) {
+      setAlertJumpInput(String(currentAlertIndex + 1))
+      return
+    }
+
+    var target = Math.max(1, Math.min(parsed, serviceAlerts.length))
+    var nextIndex = target - 1
+    setAlertJumpInput(String(target))
+    if (nextIndex === currentAlertIndex) return
+
+    setCurrentAlertIndex(nextIndex)
+    setPreviewData({})
+    setPreviewPages({})
+    setPreviewPageInputs({})
+    setPreviewBusy({})
+    setPreviewErrors({})
   }
 
   async function handleDocPageChange(docInfo, delta) {
@@ -3565,8 +4423,419 @@ export default function ReviewPage() {
     })
   }
 
-  async function persistFrontendResult(payload) {
-    return updateResultForFrontend(selectedProjectId, payload)
+  async function exportWordReport(payload) {
+    return exportProjectResultReport(selectedProjectId, payload)
+  }
+
+  var buildPersonnelDraftPayload = useCallback(function (documents) {
+    return arrayify(documents).map(function (doc) {
+      var personnelEntries = dedupePersonnelDraftEntries(arrayify(doc.personnel_entries)).filter(function (entry) {
+        return String(entry.name || '').trim()
+      })
+      return {
+        document_identifier_id: doc.document_identifier_id || doc.identifier_id || '',
+        identifier_id: doc.document_identifier_id || doc.identifier_id || '',
+        document_type: doc.document_type || '',
+        relation_id: doc.relation_id,
+        file_name: doc.file_name || '',
+        page_count: doc.page_count,
+        layout_section_count: doc.layout_section_count,
+        table_count: doc.table_count,
+        personnel_entries: personnelEntries.map(function (entry) {
+          var pages = collectPersonnelDraftEntryPages(entry)
+          return {
+            name: String(entry.name || '').trim(),
+            role: String(entry.role || '待确认').trim(),
+            page: Number(entry.page) > 0 ? Number(entry.page) : (pages[0] || null),
+            pages: pages,
+            text: entry.text || '',
+            note: entry.note || '',
+            bbox: entry.bbox,
+            source_type: entry.source_type || 'frontend_personnel_draft',
+          }
+        }),
+      }
+    })
+  }, [])
+
+  var refreshPersonnelResult = useCallback(function (nextResult) {
+    var nextResults = Object.assign({}, resultsRef.current || {}, {
+      personnel_reuse_check: nextResult,
+    })
+    resultsRef.current = nextResults
+    setResults(nextResults)
+    setAllAlerts(enrichAlertsWithProjectFiles(collectAllAlerts(nextResults), projectDetailRef.current))
+  }, [])
+
+  var savePersonnelDraft = useCallback(async function (documents, options) {
+    if (!selectedProjectId) return null
+    setPersonnelDraftSaving(true)
+    try {
+      var result = await updatePersonnelReuseDraft(selectedProjectId, buildPersonnelDraftPayload(documents))
+      refreshPersonnelResult(result)
+      if (!(options && options.silent)) {
+        setNotice({ type: 'success', message: '人员草稿已保存。' })
+      }
+      return result
+    } catch (error) {
+      if (!(options && options.silent)) {
+        setNotice({ type: 'error', message: '人员草稿保存失败: ' + (error.message || '未知错误') })
+      }
+      return null
+    } finally {
+      setPersonnelDraftSaving(false)
+    }
+  }, [buildPersonnelDraftPayload, refreshPersonnelResult, selectedProjectId])
+  savePersonnelDraftRef.current = savePersonnelDraft
+
+  async function handleConfirmPersonnelDraft() {
+    if (!selectedProjectId || personnelDraftDocuments.length === 0) return
+    setPersonnelConfirming(true)
+    try {
+      var result = await confirmPersonnelReuseDraft(selectedProjectId, buildPersonnelDraftPayload(personnelDraftDocuments))
+      refreshPersonnelResult(result)
+      setPersonnelDraftDirty(false)
+      setNotice({ type: 'success', message: '人员名单已确认，重名检查已完成。' })
+    } catch (error) {
+      setNotice({ type: 'error', message: '人员确认失败: ' + (error.message || '未知错误') })
+    } finally {
+      setPersonnelConfirming(false)
+    }
+  }
+
+  function applyFormatEditablePayload(payload) {
+    var editableItems = arrayify(payload && payload.items)
+    setFormatEditableItems(editableItems)
+    setFormatManualDrafts(function (current) {
+      var next = {}
+      for (var key in current) { next[key] = current[key] }
+      editableItems.forEach(function (item) {
+        if (item.has_manual_value) {
+          next[item.editable_id] = stringifyManualReviewValue(item.manual_value)
+        }
+      })
+      return next
+    })
+  }
+
+  function getCurrentFormatManualItems() {
+    if (!currentAlert || currentAlert.sourceResultKey !== FORMAT_REVIEW_RESULT_KEY) return []
+    var checkCode = currentAlert.subType
+    var bidderKey = currentAlert.bidderKey
+    return formatEditableItems.filter(function (item) {
+      if (item.check_code !== checkCode) return false
+      if (bidderKey && item.bidder_key && String(item.bidder_key) !== String(bidderKey)) return false
+      return true
+    })
+  }
+
+  function renderBusinessManualReviewPanelForDocs(docs) {
+    if (!currentAlert ||
+      currentAlert.sourceResultKey !== FORMAT_REVIEW_RESULT_KEY ||
+      !Object.prototype.hasOwnProperty.call(FORMAT_CHECK_LABELS, currentAlert.subType)) {
+      return null
+    }
+    var allDocs = arrayify(docs)
+    var manualDocInfo = allDocs.find(isBusinessBidDoc) ||
+      allDocs.find(function (doc) { return !isTenderTemplateDoc(doc) }) ||
+      allDocs[0]
+    if (!manualDocInfo) return null
+    var manualDocKey = manualDocInfo.docKey || manualDocInfo.docId || manualDocInfo.fileName || manualDocInfo.label
+    var manualCurrentPage = previewPages[manualDocKey] || getPreviewStartPage(manualDocInfo, currentAlert)
+    var manualItems = getCurrentFormatManualItems()
+    var scopedManualItems = filterManualReviewItemsForPreviewDoc(
+      manualItems,
+      manualDocInfo,
+      manualCurrentPage,
+      allDocs,
+      currentAlert
+    )
+    if (scopedManualItems.length === 0) return null
+    return (
+      <BusinessManualReviewPanel
+        currentAlert={currentAlert}
+        checkLabels={FORMAT_CHECK_LABELS}
+        items={manualItems}
+        docInfo={manualDocInfo}
+        currentPage={manualCurrentPage}
+        allDocs={allDocs}
+        manualDrafts={formatManualDrafts}
+        manualEditing={formatManualEditing}
+        loading={formatManualLoading}
+        saving={formatManualSaving}
+        rerunning={formatManualRerunning}
+        locating={formatManualLocating}
+        onDraftChange={handleFormatManualDraftChange}
+        onEditingChange={setFormatManualEditing}
+        onJumpToPage={jumpToManualReviewPage}
+        onSave={function () { saveCurrentFormatManualInputs() }}
+        onRerun={function () { saveCurrentFormatManualInputs({ rerun: true }) }}
+      />
+    )
+  }
+
+  function handleFormatManualDraftChange(editableId, value) {
+    setFormatManualDrafts(function (current) {
+      var next = {}
+      for (var key in current) { next[key] = current[key] }
+      next[editableId] = value
+      return next
+    })
+  }
+
+  async function jumpToManualReviewPage(item, field) {
+    if (field && field.locateTarget === 'deadline') {
+      var locator = buildManualDeadlineLocator(item)
+      if (!locator.page && locator.highlightPhrases.length === 0) {
+        setNotice({ type: 'error', message: '未找到最晚截止日期的页码或识别文本' })
+        return
+      }
+      var docsForDeadline = getCurrentPreviewDocs()
+      var targetTenderDoc = docsForDeadline.find(function (doc) {
+        return locator.locations.some(function (location) { return locationMatchesDoc(location, doc) })
+      }) || docsForDeadline.find(isTenderTemplateDoc)
+      if (!targetTenderDoc) {
+        var projectDocumentLookup = buildProjectDocumentLookup(projectDetail)
+        var locationTenderDoc = locator.locations.map(function (location) {
+          return normalizeDocRef(mergeDocumentCandidate(withLocationDocumentRole(location || {}, 'tender'), projectDocumentLookup), {
+            page: locator.page || extractFirstPage(location) || 1,
+            role: 'tender',
+            documentType: 'tender',
+            label: (location && location.file_name) || '招标文件',
+          })
+        }).find(function (doc) {
+          return doc && getPreviewTargets(doc).length > 0
+        })
+        targetTenderDoc = locationTenderDoc ||
+          normalizeDocRef(resolveRoleDocFromLookup('tender', projectDocumentLookup), {
+            page: locator.page || 1,
+            role: 'tender',
+            documentType: 'tender',
+            label: '招标文件',
+          })
+      }
+      if (!targetTenderDoc) {
+        setNotice({ type: 'error', message: '未找到招标文件预览，无法定位截止日期' })
+        return
+      }
+      var targetPage = locator.page || getPreviewStartPage(targetTenderDoc, currentAlert)
+      var highlightedDoc = Object.assign({}, targetTenderDoc, {
+        startPage: targetPage,
+        highlight: locator.rects.length > 0 ? [] : locator.highlightPhrases,
+        highlightBbox: locator.rects[0],
+        highlightRects: locator.rects.length > 0 ? locator.rects : undefined,
+        highlightPageRects: locator.rects.length > 0 ? makeHighlightPageRects(targetPage, locator.rects) : undefined,
+      })
+      setFormatManualLocating(true)
+      try {
+        var highlightedPreview = await fetchDocumentPreviewForDoc(highlightedDoc, targetPage)
+        setPreviewLightbox({
+          image: highlightedPreview && highlightedPreview.image_data_url,
+          label: (targetTenderDoc.label || targetTenderDoc.fileName || '招标文件') + '（截止日期位置）',
+          page: getPreviewCurrentPage(highlightedPreview, targetPage),
+          pageCount: getPreviewPageCount(highlightedPreview, highlightedDoc),
+        })
+      } catch (error) {
+        setNotice({ type: 'error', message: '截止日期预览打开失败，请稍后重试' })
+      } finally {
+        setFormatManualLocating(false)
+      }
+      return
+    }
+    var page = arrayify(item.page_refs)[0]
+    if (!page) return
+    var docs = getCurrentPreviewDocs()
+    if (docs.length === 0) return
+    var targetDoc = docs.find(function (doc) {
+      return item.document_identifier_id && String(doc.docId || '') === String(item.document_identifier_id)
+    }) || docs.find(function (doc) {
+      var itemFile = getLookupKey(item.file_name)
+      var docFile = getLookupKey(doc.fileName || doc.file_name || doc.label)
+      return itemFile && docFile && itemFile === docFile
+    }) || docs[0]
+    var docKey = targetDoc.docKey || targetDoc.docId || targetDoc.fileName || targetDoc.label
+    var currentPage = previewPages[docKey] || getPreviewStartPage(targetDoc, currentAlert)
+    handleDocPageChange(targetDoc, Number(page) - Number(currentPage || 1))
+  }
+
+  async function saveCurrentFormatManualInputs(options) {
+    if (!selectedProjectId) return null
+    var scopeItems = getCurrentFormatManualItems()
+    var payloadItems = buildManualReviewPayloadItems(scopeItems, formatManualDrafts)
+    if (payloadItems.length === 0 && !(options && options.rerun)) {
+      setNotice({ type: 'error', message: '请先修改识别内容' })
+      return null
+    }
+    if (options && options.rerun) {
+      setFormatManualRerunning(true)
+    } else {
+      setFormatManualSaving(true)
+    }
+    try {
+      var payload = options && options.rerun
+        ? await rerunBusinessBidFormatReviewWithManualInputs(selectedProjectId, payloadItems)
+        : await saveBusinessBidFormatReviewManualInputs(selectedProjectId, payloadItems)
+      applyFormatEditablePayload(payload)
+      setFormatManualEditing({})
+      if (options && options.rerun && payload && payload.review) {
+        var nextResults = Object.assign({}, results, {
+          business_bid_format_review: payload.review,
+        })
+        setResults(nextResults)
+        setAllAlerts(enrichAlertsWithProjectFiles(collectAllAlerts(nextResults), projectDetail))
+        setCurrentAlertIndex(0)
+      }
+      setNotice({
+        type: 'success',
+        message: options && options.rerun ? '人工识别内容已保存并完成二次审查' : '人工识别内容已保存',
+      })
+      return payload
+    } catch (error) {
+      setNotice({
+        type: 'error',
+        message: (options && options.rerun ? '二次审查失败: ' : '保存人工识别内容失败: ') + (error.message || '未知错误'),
+      })
+      return null
+    } finally {
+      setFormatManualSaving(false)
+      setFormatManualRerunning(false)
+    }
+  }
+
+  async function saveCurrentDeviationManualStatus(status) {
+    if (!selectedProjectId || !currentAlert || currentAlert.sourceResultKey !== 'deviation_check') return null
+    if (!currentAlert.manualStatusPath) {
+      setNotice({ type: 'error', message: '当前星标结果缺少可保存路径。' })
+      return null
+    }
+    setDeviationManualSaving(true)
+    try {
+      await saveProjectManualReviewResultInputs(selectedProjectId, 'deviation_check', {
+        schema_version: '1.0',
+        items: [
+          {
+            editable_id: currentAlert.id + ':review-status',
+            result_key: 'deviation_check',
+            result_path: currentAlert.manualStatusPath,
+            bidder_key: currentAlert.bidderKey,
+            bidder_name: currentAlert.bidderName,
+            check_code: 'deviation_check',
+            field_group: 'review_status',
+            field_name: 'review.status',
+            original_value: currentAlert.sourceStatus || '',
+            manual_value: status,
+            updated_at: new Date().toISOString(),
+          },
+        ],
+      })
+      var data = await getProjectResults(selectedProjectId, { forceRefresh: true })
+      var nextResults = normalizeProjectResultsPayload(data)
+      setResults(nextResults)
+      setAllAlerts(enrichAlertsWithProjectFiles(collectAllAlerts(nextResults), projectDetail))
+      setNotice({ type: 'success', message: '星标响应修正已保存。' })
+      return nextResults
+    } catch (error) {
+      setNotice({ type: 'error', message: '星标响应修正保存失败: ' + (error.message || '未知错误') })
+      return null
+    } finally {
+      setDeviationManualSaving(false)
+    }
+  }
+
+  function updatePersonnelDraftDocuments(updater) {
+    setPersonnelDraftDocuments(function (current) {
+      var next = updater(current)
+      return sortPersonnelDraftDocuments(arrayify(next).map(function (doc) {
+        return Object.assign({}, doc, {
+          personnel_entries: dedupePersonnelDraftEntries(arrayify(doc.personnel_entries).map(ensurePersonnelDraftEntryId)),
+        })
+      }), projectDetail)
+    })
+    setPersonnelDraftDirty(true)
+  }
+
+  function handlePersonnelEntryChange(docKey, entryIndex, field, value) {
+    updatePersonnelDraftDocuments(function (documents) {
+      return documents.map(function (doc) {
+        var key = doc.document_identifier_id || doc.identifier_id || doc.file_name
+        if (String(key || '') !== String(docKey || '')) return doc
+        var entries = arrayify(doc.personnel_entries).map(function (entry, index) {
+          if (index !== entryIndex) return entry
+          var nextEntry = Object.assign({}, entry, { [field]: value })
+          if (field === 'page') {
+            var nextPage = Number(value)
+            nextEntry.pages = nextPage > 0 ? [nextPage] : []
+          }
+          return nextEntry
+        })
+        return Object.assign({}, doc, { personnel_entries: entries })
+      })
+    })
+  }
+
+  function handleAddPersonnelEntry(doc) {
+    var docKey = doc.document_identifier_id || doc.identifier_id || doc.file_name
+    updatePersonnelDraftDocuments(function (documents) {
+      return documents.map(function (item) {
+        var key = item.document_identifier_id || item.identifier_id || item.file_name
+        if (String(key || '') !== String(docKey || '')) return item
+        return Object.assign({}, item, {
+          personnel_entries: arrayify(item.personnel_entries).concat([{
+            _draft_id: createPersonnelDraftEntryId(),
+            name: '',
+            role: '待确认',
+            page: personnelActivePage || 1,
+            pages: personnelActivePage ? [personnelActivePage] : [],
+            text: '',
+            note: '',
+            document_identifier_id: item.document_identifier_id || item.identifier_id,
+            file_name: item.file_name,
+          }]),
+        })
+      })
+    })
+  }
+
+  function handleRemovePersonnelEntry(docKey, entryIndex) {
+    updatePersonnelDraftDocuments(function (documents) {
+      return documents.map(function (doc) {
+        var key = doc.document_identifier_id || doc.identifier_id || doc.file_name
+        if (String(key || '') !== String(docKey || '')) return doc
+        return Object.assign({}, doc, {
+          personnel_entries: arrayify(doc.personnel_entries).filter(function (_, index) {
+            return index !== entryIndex
+          }),
+        })
+      })
+    })
+  }
+
+  function handlePersonnelCompanySelect(groupKey) {
+    var group = personnelCompanyGroups.find(function (item) {
+      return String(item.key || '') === String(groupKey || '')
+    })
+    if (!group) return
+    var doc = getDefaultPersonnelCompanyDocument(group)
+    setPersonnelActiveBidderKey(group.key || '')
+    if (doc) {
+      handlePersonnelDocSelect(doc, 1)
+    }
+  }
+
+  function handlePersonnelDocSelect(doc, page) {
+    var docKey = getPersonnelDraftDocKey(doc)
+    if (!docKey) return
+    var bidderName = getPersonnelDocBidderName(doc, doc && doc.file_name)
+    var bidderKey = getPersonnelDocBidderKey(doc, doc && doc.file_name, bidderName)
+    if (bidderKey) setPersonnelActiveBidderKey(bidderKey)
+    setPersonnelActiveDocKey(docKey)
+    setPersonnelActivePage(Number(page || 1) || 1)
+    setCurrentAlertIndex(0)
+    setPreviewData({})
+    setPreviewPages({})
+    setPreviewPageInputs({})
+    setPreviewBusy({})
+    setPreviewErrors({})
   }
 
   async function handleExportJson() {
@@ -3575,10 +4844,9 @@ export default function ReviewPage() {
     setExportLoading(true)
     try {
       var payload = buildFilteredResultJson(allAlerts, selectedAlerts, overviewResultKeys, reviewStatus)
-      await persistFrontendResult(payload)
       downloadJsonFile('review-result-' + selectedProjectId + '.json', payload)
 
-      setNotice({ type: 'success', message: '过滤后的结果已回传并导出' })
+      setNotice({ type: 'success', message: '过滤后的结果已导出' })
       setShowExport(false)
     } catch (e) {
       setNotice({ type: 'error', message: '导出失败: ' + (e.message || '未知错误') })
@@ -3593,15 +4861,15 @@ export default function ReviewPage() {
     setExportLoading(true)
     try {
       var payload = buildFilteredResultJson(allAlerts, selectedAlerts, overviewResultKeys, reviewStatus)
-      var response = await persistFrontendResult(payload)
+      var response = await exportWordReport(payload)
       var reportUrl = getReportDownloadUrl(response)
       var reportName = response?.report_name || ('review-report-' + selectedProjectId + '.docx')
 
       if (reportUrl) {
         downloadUrl(reportUrl, reportName)
-        setNotice({ type: 'success', message: '过滤后的结果已回传，Word 报告已生成' })
+        setNotice({ type: 'success', message: 'Word 报告已生成' })
       } else {
-        setNotice({ type: 'success', message: '过滤后的结果已回传，Word 报告已生成但未返回下载地址' })
+        setNotice({ type: 'success', message: 'Word 报告已生成但未返回下载地址' })
       }
       setShowExport(false)
     } catch (e) {
@@ -3626,7 +4894,8 @@ export default function ReviewPage() {
   var totalCount = allAlerts.length
   var progressPercent = totalCount > 0 ? Math.round((reviewedCount / totalCount) * 100) : 0
 
-  var sidebarKeys = resultTypeKeys
+  var overviewResultKeys = getOverviewResultKeys(results, resultTypeKeys)
+  var sidebarKeys = overviewResultKeys
 
   var selectedByType = {}
   selectedAlerts.forEach(function (id) {
@@ -3642,25 +4911,25 @@ export default function ReviewPage() {
   })
   var projectTitle = getProjectTitle(projectDetail, currentProject, selectedProjectId)
   var projectFiles = getProjectOverviewFiles(projectDetail)
-  var overviewResultKeys = getOverviewResultKeys(results, resultTypeKeys)
   var overviewSections = overviewResultKeys.map(function (key) {
     var sectionAlerts = allAlerts.filter(function (alert) { return alert.resultType === key })
     return {
       key: key,
       label: RESULT_TYPE_LABELS[key] || key,
       color: RESULT_TYPE_COLORS[key] || '#64748b',
-      alerts: isFormatReviewResultType(key) ? sortFormatOverviewAlerts(sectionAlerts) : sortAlertsForDisplay(sectionAlerts),
+      alerts: sortAlertsForResultType(key, sectionAlerts),
     }
   })
+  var overviewReviewCounts = getReviewResultFilterCounts(allAlerts)
   var overviewCards = [{
     key: 'total',
     label: '全部审核项',
     value: totalCount,
     color: '#0f766e',
   }, {
-    key: 'high',
-    label: '高风险',
-    value: countAlertsByRisk(allAlerts, 'high'),
+    key: 'fail-total',
+    label: '不通过项',
+    value: overviewReviewCounts.fail,
     color: '#dc2626',
   }].concat(overviewSections.map(function (section) {
     return {
@@ -3672,21 +4941,76 @@ export default function ReviewPage() {
   }))
 
   // Build PDF panels for current alert
-  var pdfDocIds = currentAlert ? getAlertDocIds(currentAlert) : []
+  var pdfDocIds = getCurrentPreviewDocs()
+
+  function setOverviewFileResultFilter(filterKey, filterValue) {
+    setOverviewFileResultFilters(function (prev) {
+      var next = {}
+      for (var key in prev) next[key] = prev[key]
+      if (!filterValue || filterValue === 'all') delete next[filterKey]
+      else next[filterKey] = filterValue
+      return next
+    })
+  }
+
+  function setOverviewFileCheckFilter(filterKey, filterValue) {
+    setOverviewFileCheckFilters(function (prev) {
+      var next = {}
+      for (var key in prev) next[key] = prev[key]
+      if (!filterValue || filterValue === 'all') delete next[filterKey]
+      else next[filterKey] = filterValue
+      return next
+    })
+  }
+
+  function setOverviewFormatFilePage(sectionKey, pageIndex, fileCount) {
+    setOverviewFilePages(function (prev) {
+      var maxIndex = Math.max(0, Number(fileCount || 1) - 1)
+      var nextIndex = Math.max(0, Math.min(Number(pageIndex || 0), maxIndex))
+      var next = {}
+      for (var key in prev) next[key] = prev[key]
+      if (nextIndex === 0) delete next[sectionKey]
+      else next[sectionKey] = nextIndex
+      return next
+    })
+  }
+
+  function setOverviewFormatFileSearchInput(sectionKey, value) {
+    setOverviewFileSearchInputs(function (prev) {
+      var next = {}
+      for (var key in prev) next[key] = prev[key]
+      next[sectionKey] = value
+      return next
+    })
+  }
+
+  function jumpOverviewFormatFileBySearch(sectionKey, fileGroups) {
+    var query = String(overviewFileSearchInputs[sectionKey] || '').trim()
+    if (!query) return
+
+    var targetIndex = arrayify(fileGroups).findIndex(function (group) {
+      return isFuzzyFileNameMatch(group && group.label, query)
+    })
+    if (targetIndex < 0) {
+      setNotice({ type: 'error', message: '未找到匹配文件：' + query })
+      return
+    }
+    setOverviewFormatFilePage(sectionKey, targetIndex, fileGroups.length)
+  }
 
   function renderOverviewRows(alerts, emptyText) {
     return arrayify(alerts).length === 0 ? (
       <tr>
         <td colSpan={6} className="overview-empty-cell">{emptyText}</td>
       </tr>
-    ) : alerts.map(function (alert, alertIndex) {
+    ) : alerts.map(function (alert) {
       var docs = getOverviewAlertDocs(alert)
       var status = reviewStatus[alert.id]
       return (
         <tr key={alert.id}>
           <td>
-            <span className={'risk-tag ' + (RISK_CLASSES[alert.riskLevel] || 'risk-none')}>
-              {RISK_LABELS[alert.riskLevel] || alert.riskLevel}
+            <span className={'risk-tag ' + getReviewResultClass(alert)}>
+              {getReviewResultLabel(alert)}
             </span>
           </td>
           <td className="overview-doc-cell">
@@ -3703,7 +5027,7 @@ export default function ReviewPage() {
             )}
           </td>
           <td className="overview-issue-cell">
-            <span className="overview-muted">问题 {alertIndex + 1}</span>
+            <span className="overview-muted">{getReviewItemIndexLabel(alert)}</span>
             {renderAlertTitle(alert, { as: 'strong', collapsedLines: 2, threshold: 80 })}
             <IssueSnippet as="span" text={alert.description} />
           </td>
@@ -3733,9 +5057,9 @@ export default function ReviewPage() {
         <table className="overview-table">
           <thead>
             <tr>
-              <th>风险</th>
+              <th>结果</th>
               <th>文件与页码</th>
-              <th>问题</th>
+              <th>详情</th>
               <th>指标</th>
               <th>状态</th>
               <th>操作</th>
@@ -3745,6 +5069,392 @@ export default function ReviewPage() {
             {renderOverviewRows(alerts, emptyText)}
           </tbody>
         </table>
+      </div>
+    )
+  }
+
+  function renderFormatOverviewFileGroups(section) {
+    var fallbackEmptyText = section.key === FORMAT_REVIEW_PASSED_RESULT_KEY ? '暂无形式审查通过项' : '未发现该类问题'
+    if (section.alerts.length === 0) return renderOverviewTable([], fallbackEmptyText)
+
+    var fileGroups = buildFormatOverviewFileGroups(section.alerts)
+    if (fileGroups.length === 0) return renderOverviewTable([], fallbackEmptyText)
+
+    var rawFileIndex = Number(overviewFilePages[section.key] || 0)
+    var activeFileIndex = Number.isFinite(rawFileIndex) ? rawFileIndex : 0
+    activeFileIndex = Math.max(0, Math.min(activeFileIndex, fileGroups.length - 1))
+    var group = fileGroups[activeFileIndex]
+    var filterKey = section.key + ':' + group.key
+    var showCheckFilter = section.key === FORMAT_REVIEW_RESULT_KEY || section.key === FORMAT_REVIEW_PASSED_RESULT_KEY
+    var activeResultFilter = overviewFileResultFilters[filterKey] || 'all'
+    var activeCheckFilter = showCheckFilter ? (overviewFileCheckFilters[filterKey] || 'all') : 'all'
+    var checkCounts = getReviewCheckFilterCounts(group.alerts)
+    var checkFilteredAlerts = filterReviewAlertsByCheck(group.alerts, activeCheckFilter)
+    var resultCounts = getReviewResultFilterCounts(checkFilteredAlerts)
+    var filteredAlerts = filterReviewAlertsByResult(checkFilteredAlerts, activeResultFilter)
+    var fileEmptyText = section.key === FORMAT_REVIEW_PASSED_RESULT_KEY ? '该文件暂无形式审查通过项' : '未发现该文件的形式审查问题'
+    var emptyText = getResultFilterEmptyText(activeResultFilter, getCheckFilterEmptyText(activeCheckFilter, fileEmptyText))
+    var fileSearchValue = overviewFileSearchInputs[section.key] || ''
+
+    return (
+      <>
+        <div className="overview-format-file-pager">
+          <div className="overview-format-file-nav">
+            <button
+              type="button"
+              className="ghost-button"
+              disabled={activeFileIndex <= 0}
+              onClick={function () { setOverviewFormatFilePage(section.key, activeFileIndex - 1, fileGroups.length) }}
+            >
+              上一份
+            </button>
+            <span>文件 {activeFileIndex + 1}/{fileGroups.length}</span>
+            <button
+              type="button"
+              className="ghost-button"
+              disabled={activeFileIndex >= fileGroups.length - 1}
+              onClick={function () { setOverviewFormatFilePage(section.key, activeFileIndex + 1, fileGroups.length) }}
+            >
+              下一份
+            </button>
+          </div>
+          <form
+            className="overview-format-file-search"
+            onSubmit={function (event) {
+              event.preventDefault()
+              jumpOverviewFormatFileBySearch(section.key, fileGroups)
+            }}
+          >
+            <input
+              type="search"
+              aria-label="按文件名检索跳转"
+              placeholder="输入文件名跳转"
+              value={fileSearchValue}
+              onChange={function (event) { setOverviewFormatFileSearchInput(section.key, event.target.value) }}
+            />
+            <button type="submit">跳转</button>
+          </form>
+        </div>
+
+        <div className="overview-format-group" key={group.key}>
+          <div className="overview-format-group-head">
+            <strong>{group.label}</strong>
+            <div className="overview-format-filter-stack">
+              {showCheckFilter ? (
+                <div className="overview-result-filter overview-check-filter" role="group" aria-label={group.label + '审查项筛选'}>
+                {FORMAT_FILE_CHECK_FILTER_OPTIONS.map(function (option) {
+                  var value = option[0]
+                  var label = option[1]
+                  var count = checkCounts[value] || 0
+                  return (
+                    <button
+                      type="button"
+                      className={activeCheckFilter === value ? 'overview-result-filter-btn active' : 'overview-result-filter-btn'}
+                      key={value}
+                      onClick={function () { setOverviewFileCheckFilter(filterKey, value) }}
+                    >
+                      {label} {count}
+                    </button>
+                    )
+                  })}
+                </div>
+              ) : null}
+              <div className="overview-result-filter" role="group" aria-label={group.label + '结果筛选'}>
+                {[
+                  ['all', '全部', resultCounts.all],
+                  ['pass', '通过', resultCounts.pass],
+                  ['fail', '不通过', resultCounts.fail],
+                ].map(function (option) {
+                  var value = option[0]
+                  var label = option[1]
+                  var count = option[2]
+                  return (
+                    <button
+                      type="button"
+                      className={activeResultFilter === value ? 'overview-result-filter-btn active' : 'overview-result-filter-btn'}
+                      key={value}
+                      onClick={function () { setOverviewFileResultFilter(filterKey, value) }}
+                    >
+                      {label} {count}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          </div>
+          {renderOverviewTable(filteredAlerts, emptyText)}
+        </div>
+      </>
+    )
+  }
+
+  function renderPersonnelDraftWorkspace() {
+    var activeDocInfo = pdfDocIds[0]
+    var preview = activeDocInfo && previewData[activeDocInfo.docKey || activeDocInfo.docId || activeDocInfo.fileName || activeDocInfo.label]
+    var activeDocKey = activeDocInfo && (activeDocInfo.docKey || activeDocInfo.docId || activeDocInfo.fileName || activeDocInfo.label)
+    var currentPage = activeDocInfo ? (previewPages[activeDocKey] || getPreviewStartPage(activeDocInfo, currentAlert)) : 1
+    var pageCount = activeDocInfo ? getPreviewPageCount(preview, activeDocInfo) : null
+    var isBusy = activeDocInfo ? Boolean(previewBusy[activeDocKey]) : false
+    var pageInputValue = activeDocInfo ? (previewPageInputs[activeDocKey] === undefined ? String(currentPage) : previewPageInputs[activeDocKey]) : ''
+    var errorMessage = activeDocInfo ? previewErrors[activeDocKey] : ''
+    var personnelResult = results && results.personnel_reuse_check
+    var combinedCheck = personnelResult && personnelResult.combined_personnel_reuse_check
+    var duplicateIssues = arrayify(combinedCheck && combinedCheck.issues)
+
+    return (
+      <div className="personnel-review-workspace">
+        <section className="panel personnel-review-head">
+          <div>
+            <h3>人员抽取确认</h3>
+            <p>按投标文件核对人员名单，编辑会自动保存草稿；确认后执行不同文件之间的重名检查。</p>
+          </div>
+          <div className="personnel-review-actions">
+            <span className="overview-muted">
+              {personnelDraftSaving ? '草稿保存中...' : personnelDraftDirty ? '草稿待保存' : '草稿已保存'}
+            </span>
+            <button
+              type="button"
+              className="primary-button"
+              onClick={handleConfirmPersonnelDraft}
+              disabled={personnelConfirming || personnelDraftDocuments.length === 0}
+            >
+              {personnelConfirming ? '确认中...' : '确认名单并查重'}
+            </button>
+          </div>
+        </section>
+
+        <div className="personnel-review-grid">
+          <section className="panel detail-pdf-panel personnel-preview-panel">
+            {activeDocInfo ? (
+              <>
+                <div className="detail-pdf-head">
+                  <div className="detail-pdf-title-group">
+                    <strong className="detail-pdf-name">{activeDocInfo.label || activeDocInfo.fileName || '投标文件'}</strong>
+                    <span className="detail-pdf-page-badge">
+                      定位{formatPreviewPageLabel(activeDocInfo, currentPage, pageCount)}
+                    </span>
+                  </div>
+                  <div className="preview-toolbox">
+                    <form
+                      className="preview-page-jump"
+                      onSubmit={function (event) {
+                        event.preventDefault()
+                        handleDocPageJump(activeDocInfo)
+                      }}
+                    >
+                      <span>跳到</span>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        value={pageInputValue}
+                        disabled={isBusy}
+                        onChange={function (event) { handlePageInputChange(activeDocInfo, event.target.value) }}
+                      />
+                      <span>页</span>
+                      <button type="submit" disabled={isBusy || !pageInputValue}>跳转</button>
+                    </form>
+                  </div>
+                </div>
+                <div className="diff-page-preview" style={{ '--preview-zoom': previewZoom / 100 }}>
+                  {preview && preview.image_data_url ? (
+                    <button
+                      type="button"
+                      className="preview-image-button"
+                      onClick={function () {
+                        setPreviewLightbox({
+                          image: preview.image_data_url,
+                          label: activeDocInfo.label,
+                          page: currentPage,
+                          pageCount: pageCount,
+                        })
+                      }}
+                    >
+                      <img src={preview.image_data_url} alt={activeDocInfo.label} className="diff-image" />
+                    </button>
+                  ) : null}
+                  {isBusy || previewLoading ? (
+                    <div className="preview-loading-overlay">正在加载第 {currentPage} 页...</div>
+                  ) : null}
+                  {!preview && !isBusy && !previewLoading && errorMessage ? <p className="preview-error">{errorMessage}</p> : null}
+                  {!preview && !isBusy && !previewLoading && !errorMessage ? <p>无预览</p> : null}
+                </div>
+                <div className="pdf-page-nav">
+                  <button type="button" className="pdf-page-btn" disabled={currentPage <= 1 || isBusy} onClick={function () { handleDocPageChange(activeDocInfo, -1) }}>
+                    ◀ 上一页
+                  </button>
+                  <span className="pdf-page-info">第 {currentPage}{pageCount ? ' / ' + pageCount : ''} 页</span>
+                  <button type="button" className="pdf-page-btn" disabled={isBusy || Boolean(pageCount && currentPage >= pageCount)} onClick={function () { handleDocPageChange(activeDocInfo, 1) }}>
+                    下一页 ▶
+                  </button>
+                </div>
+              </>
+            ) : (
+              <EmptyBlock title="暂无可预览的投标文件" />
+            )}
+          </section>
+
+          <section className="panel personnel-editor-panel">
+            <div className="personnel-company-selector">
+              <label htmlFor="personnel-company-select">公司</label>
+              <select
+                id="personnel-company-select"
+                value={personnelActiveCompany && personnelActiveCompany.key || ''}
+                disabled={personnelCompanyGroups.length <= 1}
+                onChange={function (event) { handlePersonnelCompanySelect(event.target.value) }}
+              >
+                {personnelCompanyGroups.length === 0 ? (
+                  <option value="">暂无公司</option>
+                ) : personnelCompanyGroups.map(function (group) {
+                  return (
+                    <option value={group.key} key={group.key}>
+                      {group.label}
+                    </option>
+                  )
+                })}
+              </select>
+              <span>
+                {personnelActiveCompany ? personnelVisibleDocuments.length + ' 份文件 / ' + personnelActiveCompany.personnelCount + ' 人' : '暂无文件'}
+              </span>
+            </div>
+
+            <div className="personnel-doc-tabs">
+              {personnelVisibleDocuments.map(function (doc) {
+                var docKey = getPersonnelDraftDocKey(doc)
+                var activeEditorDocKey = getPersonnelDraftDocKey(personnelActiveDocument)
+                var isActive = String(docKey || '') === String(activeEditorDocKey || '')
+                return (
+                  <button
+                    type="button"
+                    className={isActive ? 'personnel-doc-tab personnel-doc-tab-active' : 'personnel-doc-tab'}
+                    key={docKey}
+                    onClick={function () { handlePersonnelDocSelect(doc, 1) }}
+                  >
+                    <strong>{doc.file_name || '投标文件'}</strong>
+                    <span>{getPersonnelDocumentTypeLabel(doc)} · {arrayify(doc.personnel_entries).length} 人</span>
+                  </button>
+                )
+              })}
+            </div>
+
+            {personnelVisibleDocuments.length === 0 ? (
+              <EmptyBlock title="当前公司暂无商务标或技术标" />
+            ) : personnelVisibleDocuments.map(function (doc) {
+              var docKey = getPersonnelDraftDocKey(doc)
+              var activeEditorDocKey = getPersonnelDraftDocKey(personnelActiveDocument)
+              var isActive = String(docKey || '') === String(activeEditorDocKey || '')
+              if (!isActive) return null
+              return (
+                <div className="personnel-entry-editor" key={'editor-' + docKey}>
+                  <div className="personnel-entry-head">
+                    <strong>{doc.file_name || '投标文件'}</strong>
+                    <button type="button" className="ghost-button" onClick={function () { handleAddPersonnelEntry(doc) }}>
+                      添加人员
+                    </button>
+                  </div>
+                  <table className="personnel-entry-table">
+                    <thead>
+                      <tr>
+                        <th>姓名</th>
+                        <th>页码</th>
+                        <th>备注</th>
+                        <th>操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {arrayify(doc.personnel_entries).length === 0 ? (
+                        <tr>
+                          <td colSpan={4} className="overview-empty-cell">暂无人员，可手动添加</td>
+                        </tr>
+                      ) : arrayify(doc.personnel_entries).map(function (entry, entryIndex) {
+                        var entryPages = collectPersonnelDraftEntryPages(entry)
+                        var entryKey = entry._draft_id || entry.draft_id || ('fallback-' + entryIndex)
+                        return (
+                          <tr key={'personnel-entry-' + entryKey}>
+                            <td>
+                              <input value={entry.name || ''} onChange={function (event) { handlePersonnelEntryChange(docKey, entryIndex, 'name', event.target.value) }} />
+                            </td>
+                            <td>
+                              <div className="personnel-page-links">
+                                {entryPages.length > 0 ? entryPages.map(function (page) {
+                                  return (
+                                    <button
+                                      type="button"
+                                      className="personnel-page-link"
+                                      key={'personnel-entry-page-' + entryIndex + '-' + page}
+                                      onClick={function () { handlePersonnelDocSelect(doc, page) }}
+                                      title={'跳转到第 ' + page + ' 页'}
+                                    >
+                                      P{page}
+                                    </button>
+                                  )
+                                }) : <span className="overview-muted">页码待补充</span>}
+                              </div>
+                              <input
+                                value={entry.page || ''}
+                                inputMode="numeric"
+                                onChange={function (event) { handlePersonnelEntryChange(docKey, entryIndex, 'page', event.target.value.replace(/[^\d]/g, '')) }}
+                              />
+                            </td>
+                            <td>
+                              <input value={entry.note || ''} onChange={function (event) { handlePersonnelEntryChange(docKey, entryIndex, 'note', event.target.value) }} />
+                            </td>
+                            <td>
+                              <button type="button" className="ghost-button" onClick={function () { handleRemovePersonnelEntry(docKey, entryIndex) }}>
+                                删除
+                              </button>
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )
+            })}
+          </section>
+        </div>
+
+        <section className="panel personnel-duplicate-panel">
+          <div className="overview-section-head">
+            <h3>重名检查结果</h3>
+            <span>{duplicateIssues.length} 项</span>
+          </div>
+          {duplicateIssues.length === 0 ? (
+            <EmptyBlock title="确认后未发现跨文件重名，或尚未确认名单" />
+          ) : (
+            <div className="personnel-duplicate-list">
+              {duplicateIssues.map(function (issue, index) {
+                return (
+                  <div className="diff-block personnel-doc-block" key={'personnel-dup-' + index}>
+                    <span className="diff-block-page">{formatPagesByFile(issue.pages_by_file)}</span>
+                    <p><span className="personnel-name-duplicate">{issue.name}</span> / 出现 {issue.occurrence_count || '--'} 次</p>
+                    <div className="personnel-name-list">
+                      {arrayify(issue.occurrences).map(function (entry, entryIndex) {
+                        var fileName = entry.file_name || '投标文件'
+                        var page = extractFirstPage(entry)
+                        return (
+                          <button
+                            type="button"
+                            className="personnel-page-chip"
+                            key={'dup-location-' + entryIndex}
+                            onClick={function () {
+                              var targetDoc = personnelDraftDocuments.find(function (doc) {
+                                return getLookupKey(doc.document_identifier_id || doc.identifier_id || doc.file_name) === getLookupKey(entry.document_identifier_id || entry.identifier_id || entry.file_name)
+                              })
+                              if (targetDoc) handlePersonnelDocSelect(targetDoc, page || 1)
+                            }}
+                          >
+                            {fileName}{page ? ' / P' + page : ''}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </section>
       </div>
     )
   }
@@ -3902,9 +5612,9 @@ export default function ReviewPage() {
                             key={card.key}
                             className="overview-stat-card"
                             onClick={function () {
-                              if (card.key !== 'total' && card.key !== 'high') selectServiceType(card.key)
+                              if (card.key !== 'total' && card.key !== 'fail-total') selectServiceType(card.key)
                             }}
-                            disabled={card.key === 'high'}
+                            disabled={card.key === 'fail-total'}
                           >
                             <span>{card.label}</span>
                             <strong style={{ color: card.color }}>{card.value}</strong>
@@ -3944,26 +5654,16 @@ export default function ReviewPage() {
 
                           {isFormatReviewResultType(section.key) ? (
                             <div className="overview-format-groups">
-                              {section.alerts.length === 0 ? renderOverviewTable([], section.key === FORMAT_REVIEW_PASSED_RESULT_KEY ? '暂无形式审查通过项' : '未发现该类问题') : buildFormatOverviewFileGroups(section.alerts).map(function (group) {
-                                return (
-                                  <div className="overview-format-group" key={group.key}>
-                                    <div className="overview-format-group-head">
-                                      <strong>{group.label}</strong>
-                                      <span>{group.alerts.length} 项</span>
-                                    </div>
-                                    {renderOverviewTable(group.alerts, section.key === FORMAT_REVIEW_PASSED_RESULT_KEY ? '该文件暂无形式审查通过项' : '未发现该文件的形式审查问题')}
-                                  </div>
-                                )
-                              })}
+                              {renderFormatOverviewFileGroups(section)}
                             </div>
                           ) : (
                           <div className="overview-table-wrap">
                             <table className="overview-table">
                               <thead>
                                 <tr>
-                                  <th>风险</th>
+                                  <th>结果</th>
                                   <th>文件与页码</th>
-                                  <th>问题</th>
+                                  <th>详情</th>
                                   <th>指标</th>
                                   <th>状态</th>
                                   <th>操作</th>
@@ -3974,14 +5674,14 @@ export default function ReviewPage() {
                                   <tr>
                                     <td colSpan={6} className="overview-empty-cell">未发现该类问题</td>
                                   </tr>
-                                ) : section.alerts.map(function (alert, alertIndex) {
+                                ) : section.alerts.map(function (alert) {
                                   var docs = getOverviewAlertDocs(alert)
                                   var status = reviewStatus[alert.id]
                                   return (
                                     <tr key={alert.id}>
                                       <td>
-                                        <span className={'risk-tag ' + (RISK_CLASSES[alert.riskLevel] || 'risk-none')}>
-                                          {RISK_LABELS[alert.riskLevel] || alert.riskLevel}
+                                        <span className={'risk-tag ' + getReviewResultClass(alert)}>
+                                          {getReviewResultLabel(alert)}
                                         </span>
                                       </td>
                                       <td className="overview-doc-cell">
@@ -3998,7 +5698,7 @@ export default function ReviewPage() {
                                         )}
                                       </td>
                                       <td className="overview-issue-cell">
-                                        <span className="overview-muted">问题 {alertIndex + 1}</span>
+                                        <span className="overview-muted">{getReviewItemIndexLabel(alert)}</span>
                                         {renderAlertTitle(alert, { as: 'strong', collapsedLines: 2, threshold: 80 })}
                                         <IssueSnippet as="span" text={alert.description} />
                                       </td>
@@ -4036,6 +5736,8 @@ export default function ReviewPage() {
               ) : (
                 <EmptyBlock title="暂无分析结果" />
               )
+            ) : currentServiceType === 'personnel_reuse_check' ? (
+              renderPersonnelDraftWorkspace()
             ) : serviceAlerts.length === 0 ? (
               <EmptyBlock title={currentServiceIsPassedList ? '该类型下暂无通过项' : '该类型下未发现可疑项'} />
             ) : currentAlert ? (
@@ -4050,9 +5752,18 @@ export default function ReviewPage() {
                   >
                     ◀ 上一条
                   </button>
-                  <span className="detail-nav-info">
-                    第 {currentAlertIndex + 1}/{serviceAlerts.length} 条
-                  </span>
+                  <form className="detail-nav-jump" onSubmit={handleAlertJumpSubmit}>
+                    <span>第</span>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      aria-label="跳转到第几条"
+                      value={alertJumpInput}
+                      onChange={handleAlertJumpChange}
+                    />
+                    <span>/{serviceAlerts.length} 条</span>
+                    <button type="submit">跳转</button>
+                  </form>
                   <button
                     type="button"
                     className="ghost-button"
@@ -4066,10 +5777,7 @@ export default function ReviewPage() {
                 {/* ── Alert info ── */}
                 <div className="panel detail-info">
                   <div className="detail-info-head">
-                    <span className="alert-tag">问题 {currentAlertIndex + 1}</span>
-                    <span className={'risk-tag ' + (RISK_CLASSES[currentAlert.riskLevel] || 'risk-none')}>
-                      {RISK_LABELS[currentAlert.riskLevel] || currentAlert.riskLevel}
-                    </span>
+                    <span className="alert-tag">{getReviewItemIndexLabel(currentAlert)}</span>
                     <span className="alert-tag">{currentAlert.resultTypeLabel}</span>
                     <span className="alert-tag">{currentAlert.groupLabel}</span>
                     {reviewStatus[currentAlert.id] ? (
@@ -4077,6 +5785,11 @@ export default function ReviewPage() {
                         {getReviewStatusText(reviewStatus[currentAlert.id], currentAlert)}
                       </span>
                     ) : null}
+                  </div>
+                  <div className="detail-result-display">
+                    <span className={'detail-result-badge ' + getReviewResultClass(currentAlert)}>
+                      {getReviewResultLabel(currentAlert)}
+                    </span>
                   </div>
 
                   {renderAlertTitle(currentAlert, {
@@ -4103,6 +5816,27 @@ export default function ReviewPage() {
                   ) : null}
 
                   {renderDuplicateEvidenceRows(currentAlert)}
+
+                  {currentAlert.sourceResultKey === 'deviation_check' ? (
+                    <div className="manual-inline-actions">
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        disabled={deviationManualSaving}
+                        onClick={function () { saveCurrentDeviationManualStatus('pass') }}
+                      >
+                        {deviationManualSaving ? '保存中...' : '标记已响应'}
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost-button"
+                        disabled={deviationManualSaving}
+                        onClick={function () { saveCurrentDeviationManualStatus('fail') }}
+                      >
+                        标记未响应
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
 
                 {/* ── PDF preview row ── */}
@@ -4124,8 +5858,15 @@ export default function ReviewPage() {
                       })}
                     </div>
 
-                    <div className="detail-pdf-row">
-                      {previewLoading ? (
+                    {(function () {
+                      var detailManualReviewPanel = renderBusinessManualReviewPanelForDocs(pdfDocIds)
+                      var pdfRowClassName = previewLoading || pdfDocIds.length < 2
+                        ? 'detail-pdf-row'
+                        : 'detail-pdf-row detail-pdf-row-two-up'
+                      return (
+                        <div className={detailManualReviewPanel ? 'detail-pdf-layout detail-pdf-layout-with-editor' : 'detail-pdf-layout'}>
+                          <div className={pdfRowClassName}>
+                            {previewLoading ? (
                         <div className="panel detail-pdf-panel detail-pdf-loading">
                           <EmptyBlock title="加载预览..." />
                         </div>
@@ -4197,75 +5938,87 @@ export default function ReviewPage() {
                                   </div>
                                 </div>
                               </div>
-                              <div
-                                className="diff-page-preview"
-                                style={{ '--preview-zoom': previewZoom / 100 }}
-                              >
-                                {preview && preview.image_data_url ? (
-                                  <button
-                                    type="button"
-                                    className="preview-image-button"
-                                    onClick={function () {
-                                      setPreviewLightbox({
-                                        image: preview.image_data_url,
-                                        label: docInfo.label,
-                                        page: currentPage,
-                                        pageCount: pageCount,
-                                      })
-                                    }}
-                                    title="点击放大预览"
+                              <div className="detail-pdf-workbench">
+                                <div className="detail-pdf-preview-column">
+                                  <div
+                                    className="diff-page-preview"
+                                    style={{ '--preview-zoom': previewZoom / 100 }}
                                   >
-                                    <img
-                                      src={preview.image_data_url}
-                                      alt={docInfo.label}
-                                      className="diff-image"
-                                    />
-                                  </button>
-                                ) : null}
-                                {preview && !preview.image_data_url ? (
-                                  <p>第 {preview.page || currentPage} 页，共 {preview.page_count || pageCount || '--'} 页</p>
-                                ) : null}
-                                {isBusy ? (
-                                  <div className="preview-loading-overlay">
-                                    正在加载第 {currentPage} 页...
+                                    {preview && preview.image_data_url ? (
+                                      <button
+                                        type="button"
+                                        className="preview-image-button"
+                                        onClick={function () {
+                                          setPreviewLightbox({
+                                            image: preview.image_data_url,
+                                            label: docInfo.label,
+                                            page: currentPage,
+                                            pageCount: pageCount,
+                                          })
+                                        }}
+                                        title="点击放大预览"
+                                      >
+                                        <img
+                                          src={preview.image_data_url}
+                                          alt={docInfo.label}
+                                          className="diff-image"
+                                        />
+                                      </button>
+                                    ) : null}
+                                    {preview && !preview.image_data_url ? (
+                                      <p>第 {preview.page || currentPage} 页，共 {preview.page_count || pageCount || '--'} 页</p>
+                                    ) : null}
+                                    {isBusy ? (
+                                      <div className="preview-loading-overlay">
+                                        正在加载第 {currentPage} 页...
+                                      </div>
+                                    ) : null}
+                                    {!preview && !isBusy && errorMessage ? (
+                                      <p className="preview-error">{errorMessage}</p>
+                                    ) : null}
+                                    {!preview && !isBusy && !errorMessage ? (
+                                      <p>无预览</p>
+                                    ) : null}
                                   </div>
-                                ) : null}
-                                {!preview && !isBusy && errorMessage ? (
-                                  <p className="preview-error">{errorMessage}</p>
-                                ) : null}
-                                {!preview && !isBusy && !errorMessage ? (
-                                  <p>无预览</p>
-                                ) : null}
-                              </div>
-                              {errorMessage && preview ? (
-                                <p className="preview-error">{errorMessage}</p>
-                              ) : null}
-                              <div className="pdf-page-nav">
-                                <button
-                                  type="button"
-                                  className="pdf-page-btn"
-                                  disabled={currentPage <= 1 || isBusy}
-                                  onClick={function () { handleDocPageChange(docInfo, -1) }}
-                                >
-                                  ◀ 上一页
-                                </button>
-                                <span className="pdf-page-info">
-                                  第 {currentPage}{pageCount ? ' / ' + pageCount : ''} 页
-                                </span>
-                                <button
-                                  type="button"
-                                  className="pdf-page-btn"
-                                  disabled={isBusy || Boolean(pageCount && currentPage >= pageCount)}
-                                  onClick={function () { handleDocPageChange(docInfo, 1) }}
-                                >
-                                  下一页 ▶
-                                </button>
+                                  {errorMessage && preview ? (
+                                    <p className="preview-error">{errorMessage}</p>
+                                  ) : null}
+                                  <div className="pdf-page-nav">
+                                    <button
+                                      type="button"
+                                      className="pdf-page-btn"
+                                      disabled={currentPage <= 1 || isBusy}
+                                      onClick={function () { handleDocPageChange(docInfo, -1) }}
+                                    >
+                                      ◀ 上一页
+                                    </button>
+                                    <span className="pdf-page-info">
+                                      第 {currentPage}{pageCount ? ' / ' + pageCount : ''} 页
+                                    </span>
+                                    <button
+                                      type="button"
+                                      className="pdf-page-btn"
+                                      disabled={isBusy || Boolean(pageCount && currentPage >= pageCount)}
+                                      onClick={function () { handleDocPageChange(docInfo, 1) }}
+                                    >
+                                      下一页 ▶
+                                    </button>
+                                  </div>
+                                </div>
                               </div>
                             </div>
                           )
                         })
                       )}
-                    </div>
+                          </div>
+                          {detailManualReviewPanel ? (
+                            <div className="panel detail-manual-review-column">
+                              {detailManualReviewPanel}
+                            </div>
+                          ) : null}
+                        </div>
+                      )
+                    })()}
                   </div>
                 ) : null}
 
@@ -4278,7 +6031,7 @@ export default function ReviewPage() {
                     {currentAlert.evidence.matchedText ? (
                       <div className="diff-block">
                         <span className="diff-block-page">
-                          问题 1 / 第 {currentAlert.evidence.page} 页
+                          {getReviewItemIndexLabel(currentAlert)} / 第 {currentAlert.evidence.page} 页
                         </span>
                         <IssueSnippet
                           as="p"
@@ -4291,7 +6044,7 @@ export default function ReviewPage() {
                     {currentAlert.evidence.issue ? (
                       <div className="diff-block">
                         <span className="diff-block-page">
-                          问题 1 / {currentAlert.page ? '第 ' + currentAlert.page + ' 页' : '形式审查'}
+                          {getReviewItemIndexLabel(currentAlert)} / {currentAlert.page ? '第 ' + currentAlert.page + ' 页' : '形式审查'}
                         </span>
                         <IssueSnippet
                           as="p"
@@ -4532,11 +6285,15 @@ export default function ReviewPage() {
                 关闭
               </button>
             </div>
-            <img
-              src={previewLightbox.image}
-              alt={previewLightbox.label}
-              className="preview-lightbox-image"
-            />
+            {previewLightbox.image ? (
+              <img
+                src={previewLightbox.image}
+                alt={previewLightbox.label}
+                className="preview-lightbox-image"
+              />
+            ) : (
+              <p className="preview-error">预览图片加载失败</p>
+            )}
           </div>
         </div>
       ) : null}

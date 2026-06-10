@@ -1,4 +1,13 @@
 const DEFAULT_API_BASE_URL = ''
+const API_CACHE_PREFIX = 'xtjs-api-cache:'
+const API_CACHE_TTL = {
+  projectList: 30 * 1000,
+  projectDetail: 2 * 60 * 1000,
+  projectResults: 2 * 60 * 1000,
+}
+const apiMemoryCache = new Map()
+const apiInflightCache = new Map()
+let apiCacheEpoch = 0
 
 function resolveApiBaseUrl() {
   const rawValue = (import.meta.env.VITE_API_BASE_URL ?? DEFAULT_API_BASE_URL).trim()
@@ -101,6 +110,113 @@ async function request(path, { method = 'GET', query, body, headers } = {}) {
   return unwrapUnifiedPayload(payload, response)
 }
 
+function canUseSessionStorage() {
+  return typeof window !== 'undefined' && window.sessionStorage
+}
+
+function readCachedPayload(cacheKey) {
+  const now = Date.now()
+  const memoryItem = apiMemoryCache.get(cacheKey)
+  if (memoryItem && memoryItem.expiresAt > now) {
+    return memoryItem.payload
+  }
+  if (memoryItem) {
+    apiMemoryCache.delete(cacheKey)
+  }
+
+  if (!canUseSessionStorage()) return undefined
+
+  try {
+    const rawItem = window.sessionStorage.getItem(API_CACHE_PREFIX + cacheKey)
+    if (!rawItem) return undefined
+    const item = JSON.parse(rawItem)
+    if (!item || item.expiresAt <= now) {
+      window.sessionStorage.removeItem(API_CACHE_PREFIX + cacheKey)
+      return undefined
+    }
+    apiMemoryCache.set(cacheKey, item)
+    return item.payload
+  } catch {
+    return undefined
+  }
+}
+
+function writeCachedPayload(cacheKey, payload, ttl) {
+  if (!ttl || ttl <= 0) return
+  const item = {
+    expiresAt: Date.now() + ttl,
+    payload,
+  }
+  apiMemoryCache.set(cacheKey, item)
+
+  if (!canUseSessionStorage()) return
+  try {
+    window.sessionStorage.setItem(API_CACHE_PREFIX + cacheKey, JSON.stringify(item))
+  } catch {
+    // Large result payloads can exceed sessionStorage quota; memory cache still helps route changes.
+  }
+}
+
+function invalidateApiCache(match) {
+  apiCacheEpoch += 1
+  const matcher = typeof match === 'function'
+    ? match
+    : (key) => String(key).includes(String(match || ''))
+
+  Array.from(apiMemoryCache.keys()).forEach((key) => {
+    if (matcher(key)) apiMemoryCache.delete(key)
+  })
+  Array.from(apiInflightCache.keys()).forEach((key) => {
+    if (matcher(key)) apiInflightCache.delete(key)
+  })
+
+  if (!canUseSessionStorage()) return
+  try {
+    for (let index = window.sessionStorage.length - 1; index >= 0; index -= 1) {
+      const storageKey = window.sessionStorage.key(index)
+      if (!storageKey || !storageKey.startsWith(API_CACHE_PREFIX)) continue
+      const cacheKey = storageKey.slice(API_CACHE_PREFIX.length)
+      if (matcher(cacheKey)) window.sessionStorage.removeItem(storageKey)
+    }
+  } catch {
+    // Ignore cache cleanup failures; the next TTL expiry will clear stale entries.
+  }
+}
+
+function invalidateProjectCache(identifierId) {
+  const encodedIdentifier = encodeURIComponent(identifierId || '')
+  invalidateApiCache((key) => (
+    key.includes('/api/postgresql/projects?') ||
+    (encodedIdentifier && key.includes(`/api/postgresql/projects/${encodedIdentifier}`))
+  ))
+}
+
+function cachedRequest(path, { query, ttl, forceRefresh = false } = {}) {
+  const cacheKey = buildRequestUrl(path, query).href
+
+  if (!forceRefresh) {
+    const cached = readCachedPayload(cacheKey)
+    if (cached !== undefined) return Promise.resolve(cached)
+    const inflight = apiInflightCache.get(cacheKey)
+    if (inflight) return inflight
+  }
+
+  const requestEpoch = apiCacheEpoch
+  const requestPromise = request(path, { query })
+    .then((payload) => {
+      if (requestEpoch === apiCacheEpoch) {
+        writeCachedPayload(cacheKey, payload, ttl)
+      }
+      return payload
+    })
+    .finally(() => {
+      apiInflightCache.delete(cacheKey)
+    })
+
+  apiInflightCache.set(cacheKey, requestPromise)
+  return requestPromise
+}
+
 // ─── Health ──────────────────────────────────────────
 
 export async function probeBackend() {
@@ -109,44 +225,57 @@ export async function probeBackend() {
 
 // ─── Projects ────────────────────────────────────────
 
-export async function listProjects({ page = 1, pageSize = 24, keyword } = {}) {
-  return request('/api/postgresql/projects', {
+export async function listProjects({ page = 1, pageSize = 24, keyword, forceRefresh = false } = {}) {
+  return cachedRequest('/api/postgresql/projects', {
     query: { page, page_size: pageSize, keyword },
+    ttl: API_CACHE_TTL.projectList,
+    forceRefresh,
   })
 }
 
-export async function getProjectDetail(identifierId) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`)
+export async function getProjectDetail(identifierId, { forceRefresh = false } = {}) {
+  return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`, {
+    ttl: API_CACHE_TTL.projectDetail,
+    forceRefresh,
+  })
 }
 
 export async function createProject(projectName) {
-  return request('/api/postgresql/projects', {
+  const payload = await request('/api/postgresql/projects', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ project_name: projectName }),
   })
+  invalidateProjectCache(payload?.identifier_id || payload?.project?.identifier_id || projectName)
+  return payload
 }
 
 export async function updateProjectIdentifier(identifierId, newProjectName) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`, {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ project_name: newProjectName }),
   })
+  invalidateProjectCache(identifierId)
+  return payload
 }
 
 export async function deleteProject(identifierId) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`, {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`, {
     method: 'DELETE',
   })
+  invalidateProjectCache(identifierId)
+  return payload
 }
 
 export async function batchDeleteProjects(identifierIds) {
-  return request('/api/postgresql/projects/batch-delete', {
+  const payload = await request('/api/postgresql/projects/batch-delete', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ identifier_ids: identifierIds }),
   })
+  invalidateApiCache('/api/postgresql/projects')
+  return payload
 }
 
 export async function ingestProjectDocuments({
@@ -168,17 +297,21 @@ export async function ingestProjectDocuments({
     formData.append('technical_bid_files', file)
   })
 
-  return request('/api/postgresql/projects/batch/ingest-recognize', {
+  const payload = await request('/api/postgresql/projects/batch/ingest-recognize', {
     method: 'POST',
     body: formData,
   })
+  invalidateProjectCache(payload?.project?.identifier_id || projectName)
+  return payload
 }
 
 // ─── Project Results ─────────────────────────────────
 
-export async function getProjectResults(projectName) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/results`, {
+export async function getProjectResults(projectName, { forceRefresh = false } = {}) {
+  return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(projectName)}/results`, {
     query: { view: 'display', include_raw_results: 'false', include_result_record: 'false' },
+    ttl: API_CACHE_TTL.projectResults,
+    forceRefresh,
   })
 }
 
@@ -190,50 +323,98 @@ export async function getProjectVisualizationData(projectName) {
   return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/visualization-data`)
 }
 
+export async function getProjectWorkflowState(projectIdentifier, { forceRefresh = false } = {}) {
+  return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/workflow-state`, {
+    ttl: API_CACHE_TTL.projectDetail,
+    forceRefresh,
+  })
+}
+
+export async function saveProjectWorkflowScope(projectIdentifier, excludedBidders = []) {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/workflow-scope`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ excluded_bidders: excludedBidders }),
+  })
+  invalidateProjectCache(projectIdentifier)
+  return payload
+}
+
+export async function saveProjectManualReviewResultInputs(projectIdentifier, resultKey, inputs = {}) {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/manual-review-results/${encodeURIComponent(resultKey)}/inputs`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ inputs }),
+  })
+  invalidateProjectCache(projectIdentifier)
+  return payload
+}
+
+export async function rerunProjectManualReview(projectIdentifier, services = []) {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/manual-review-rerun`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ services }),
+  })
+  invalidateProjectCache(projectIdentifier)
+  return payload
+}
+
 // ─── OCR Execution ───────────────────────────────────
 
 export async function runTenderOcr(projectName, { parallelism = 1 } = {}) {
   const formBody = new URLSearchParams()
   formBody.append('parallelism', `${parallelism}`)
 
-  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/run-tender-ocr`, {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/run-tender-ocr`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: formBody,
   })
+  invalidateProjectCache(projectName)
+  return payload
 }
 
 export async function runBusinessOcr(projectName, { parallelism = 1 } = {}) {
   const formBody = new URLSearchParams()
   formBody.append('parallelism', `${parallelism}`)
 
-  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/run-business-ocr`, {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/run-business-ocr`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: formBody,
   })
+  invalidateProjectCache(projectName)
+  return payload
 }
 
-export async function continueTechnicalOcr(projectName, { parallelism = 1 } = {}) {
+export async function continueTechnicalOcr(projectName, { parallelism = 1, excludedTechnicalDocumentIds = [] } = {}) {
   const formBody = new URLSearchParams()
   formBody.append('parallelism', `${parallelism}`)
+  if (excludedTechnicalDocumentIds.length > 0) {
+    formBody.append('excluded_technical_document_identifiers_json', JSON.stringify(excludedTechnicalDocumentIds))
+  }
 
-  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/continue-technical-ocr`, {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/continue-technical-ocr`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: formBody,
   })
+  invalidateProjectCache(projectName)
+  return payload
 }
 
 export async function runFullOcr(projectName, { parallelism = 1 } = {}) {
   const formBody = new URLSearchParams()
   formBody.append('parallelism', `${parallelism}`)
 
-  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/run-full-ocr`, {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/run-full-ocr`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: formBody,
   })
+  invalidateProjectCache(projectName)
+  return payload
 }
 
 // ─── Analysis Execution ──────────────────────────────
@@ -244,19 +425,68 @@ export async function runAnalysis({
   maxEvidenceSections = 5,
   maxPairsPerType = 0,
 }) {
-  return request('/api/analysis/run', {
+  const requestPayload = {
+    project_identifier: projectIdentifier,
+    services,
+    max_evidence_sections: maxEvidenceSections,
+    max_pairs_per_type: maxPairsPerType,
+  }
+
+  const payload = await request('/api/analysis/run', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      project_identifier: projectIdentifier,
-      services,
-      max_evidence_sections: maxEvidenceSections,
-      max_pairs_per_type: maxPairsPerType,
-    }),
+    body: JSON.stringify(requestPayload),
   })
+  invalidateProjectCache(projectIdentifier)
+  return payload
+}
+
+export async function updatePersonnelReuseDraft(projectIdentifier, documents) {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/personnel-reuse-draft`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ documents }),
+  })
+  invalidateProjectCache(projectIdentifier)
+  return payload
+}
+
+export async function confirmPersonnelReuseDraft(projectIdentifier, documents) {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/personnel-reuse-confirm`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ documents }),
+  })
+  invalidateProjectCache(projectIdentifier)
+  return payload
 }
 
 // ─── Relations ───────────────────────────────────────
+
+export async function getBusinessBidFormatReviewEditable(projectIdentifier) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/business-bid-format-review/editable`)
+}
+
+export async function saveBusinessBidFormatReviewManualInputs(projectIdentifier, items) {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/business-bid-format-review/manual-inputs`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  })
+  invalidateProjectCache(projectIdentifier)
+  return payload
+}
+
+export async function rerunBusinessBidFormatReviewWithManualInputs(projectIdentifier, items) {
+  const savedPayload = await saveBusinessBidFormatReviewManualInputs(projectIdentifier, items)
+  const payload = await rerunProjectManualReview(projectIdentifier, ['business_bid_format_review'])
+  const review = payload?.latest?.business_bid_format_review || payload?.manual_review_results?.latest?.business_bid_format_review
+  invalidateProjectCache(projectIdentifier)
+  return Object.assign({}, savedPayload || {}, payload || {}, {
+    review,
+    items: savedPayload?.items || [],
+  })
+}
 
 export async function listRelations({ page = 1, pageSize = 50, projectIdentifier } = {}) {
   return request('/api/postgresql/relations', {
@@ -273,7 +503,7 @@ export async function bindDocuments(projectName, {
   businessBidDocumentIdentifier,
   technicalBidDocumentIdentifier,
 }) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/bind-documents`, {
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/bind-documents`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -282,28 +512,36 @@ export async function bindDocuments(projectName, {
       technical_bid_document_identifier: technicalBidDocumentIdentifier,
     }),
   })
+  invalidateProjectCache(projectName)
+  return payload
 }
 
 export async function updateRelation(relationId, body) {
-  return request(`/api/postgresql/relations/${relationId}`, {
+  const payload = await request(`/api/postgresql/relations/${relationId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
+  invalidateApiCache('/api/postgresql/projects')
+  return payload
 }
 
 export async function deleteRelation(relationId) {
-  return request(`/api/postgresql/relations/${relationId}`, {
+  const payload = await request(`/api/postgresql/relations/${relationId}`, {
     method: 'DELETE',
   })
+  invalidateApiCache('/api/postgresql/projects')
+  return payload
 }
 
 export async function batchDeleteRelations(relationIds) {
-  return request('/api/postgresql/relations/batch-delete', {
+  const payload = await request('/api/postgresql/relations/batch-delete', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ relation_ids: relationIds }),
   })
+  invalidateApiCache('/api/postgresql/projects')
+  return payload
 }
 
 // ─── Documents ───────────────────────────────────────
@@ -396,11 +634,13 @@ export async function listResults({ page = 1, pageSize = 50, keyword } = {}) {
 }
 
 export async function createOrOverwriteResult(projectIdentifierId, result) {
-  return request('/api/postgresql/results', {
+  const payload = await request('/api/postgresql/results', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ project_identifier_id: projectIdentifierId, result }),
   })
+  invalidateProjectCache(projectIdentifierId)
+  return payload
 }
 
 export async function getSingleResult(projectIdentifierId) {
@@ -408,52 +648,30 @@ export async function getSingleResult(projectIdentifierId) {
 }
 
 export async function updateResult(projectIdentifierId, result) {
-  return request(`/api/postgresql/results/${encodeURIComponent(projectIdentifierId)}`, {
+  const payload = await request(`/api/postgresql/results/${encodeURIComponent(projectIdentifierId)}`, {
     method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ result }),
+  })
+  invalidateProjectCache(projectIdentifierId)
+  return payload
+}
+
+export async function exportProjectResultReport(projectIdentifierId, result) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifierId)}/export-report`, {
+    method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ result }),
   })
 }
 
-export async function updateResultForFrontend(projectIdentifierId, resultFotFrontend) {
-  return request(`/api/postgresql/results/${encodeURIComponent(projectIdentifierId)}/frontend`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ result_fot_frontend: resultFotFrontend }),
-  })
-}
-
 export async function deleteResult(projectIdentifierId) {
-  return request(`/api/postgresql/results/${encodeURIComponent(projectIdentifierId)}`, {
+  const payload = await request(`/api/postgresql/results/${encodeURIComponent(projectIdentifierId)}`, {
     method: 'DELETE',
   })
+  invalidateProjectCache(projectIdentifierId)
+  return payload
 }
 
 // ─── Export Report ──────────────────────────────────
 
-export async function exportReport(identifierId, { alertIds, options = {} }) {
-  const url = `${API_BASE_URL}/api/postgresql/projects/${encodeURIComponent(identifierId)}/export-report`
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      alert_ids: alertIds,
-      options: {
-        include_screenshots: options.includeScreenshots || false,
-        include_notes: options.includeNotes !== false,
-        report_title: options.reportTitle || '',
-      },
-    }),
-  })
-
-  if (!response.ok) {
-    const errorText = await response.text()
-    throw createApiError(`Export failed: ${response.status}`, {
-      status: response.status,
-      payload: errorText,
-    })
-  }
-
-  return response.blob()
-}

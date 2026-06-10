@@ -17,10 +17,9 @@ const PARSING_STATUS_TECHNICAL_READY = 3
 const FORMAT_REVIEW_CHECKS = [
   { key: 'integrity_check', label: '完整性' },
   { key: 'consistency_check', label: '一致性' },
-  { key: 'pricing_check', label: '开标一览表' },
-  { key: 'itemized_pricing_check', label: '分项报价表' },
-  { key: 'deviation_check', label: '偏离表' },
   { key: 'verification_check', label: '签字盖章日期' },
+  { key: 'pricing_check', label: '报价合理性' },
+  { key: 'itemized_pricing_check', label: '分项报价表' },
 ]
 
 const OVERVIEW_CHECK_GROUPS = [
@@ -33,30 +32,60 @@ const OVERVIEW_CHECK_GROUPS = [
     key: 'risk',
     title: '专项审查',
     checks: [
-      { key: 'businessDuplicate', label: '商务标查重' },
+      { key: 'deviation', label: '偏离表' },
+      { key: 'personnelReuse', label: '人员复用' },
+      { key: 'businessDuplicate', label: '商务分项查重' },
+      { key: 'responseDuplicate', label: '响应内容查重' },
       { key: 'technicalDuplicate', label: '技术标查重' },
-      { key: 'personnelReuse', label: '一人多用' },
-      { key: 'typo', label: '错别字' },
     ],
   },
 ]
 
 const ANALYSIS_TYPES = [
   {
-    key: 'businessBidDuplicateCheck',
-    label: '商务标查重',
-    icon: '📄',
-    description: '仅对商务标文档之间进行内容查重',
-    services: ['business_bid_duplicate_check'],
+    key: 'businessBidFormatReview',
+    label: '商务标形式审查',
+    icon: '🔍',
+    description: '检查商务标格式规范性与完整性',
+    services: ['business_bid_format_review'],
     requiredParsingStatus: PARSING_STATUS_BUSINESS_READY,
+    stage: 'business',
+  },
+  {
+    key: 'deviationCheck',
+    label: '偏离项目审查',
+    icon: '📋',
+    description: '在商务标和技术标中查找商务/技术偏离表',
+    services: ['deviation_check'],
+    requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
+    stage: 'technical',
   },
   {
     key: 'personnelReuseCheck',
-    label: '人员复用',
+    label: '人员复用审查',
     icon: '👥',
-    description: '检测关键人员是否在不同标书中重复出现',
+    description: '抽取商务标和技术标人员，确认名单后检查跨文件复用',
     services: ['personnel_reuse_check'],
-    requiredParsingStatus: PARSING_STATUS_BUSINESS_READY,
+    requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
+    stage: 'technical',
+  },
+  {
+    key: 'businessItemizedDuplicateCheck',
+    label: '商务分项报价查重',
+    icon: '📄',
+    description: '对商务标分项报价表进行查重',
+    services: ['business_itemized_duplicate_check'],
+    requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
+    stage: 'duplicate',
+  },
+  {
+    key: 'bidResponseDuplicateCheck',
+    label: '响应内容查重',
+    icon: '📋',
+    description: '对商务响应和技术响应内容进行查重',
+    services: ['bid_response_duplicate_check'],
+    requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
+    stage: 'duplicate',
   },
   {
     key: 'technicalBidDuplicateCheck',
@@ -65,23 +94,14 @@ const ANALYSIS_TYPES = [
     description: '仅对技术标文档之间进行内容查重',
     services: ['technical_bid_duplicate_check'],
     requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
+    stage: 'duplicate',
   },
-  {
-    key: 'businessBidFormatReview',
-    label: '形式审查',
-    icon: '🔍',
-    description: '检查商务标格式规范性与完整性',
-    services: ['business_bid_format_review'],
-    requiredParsingStatus: PARSING_STATUS_BUSINESS_READY,
-  },
-  {
-    key: 'typoCheck',
-    label: '错字检查',
-    icon: '✏️',
-    description: '检查标书中的错别字与用词不当',
-    services: ['typo_check'],
-    requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
-  },
+]
+
+const ANALYSIS_STAGE_GROUPS = [
+  { key: 'business', title: '商务标审查' },
+  { key: 'technical', title: '技术标 OCR 后检查' },
+  { key: 'duplicate', title: '查重' },
 ]
 
 function arrayify(value) {
@@ -256,6 +276,15 @@ function getRiskStatus(issueCount, hasResult, unavailableLabel = '未生成') {
   return { state: 'pass', label: '未发现', count: 0 }
 }
 
+function countReviewCheckIssues(check) {
+  if (!check) return 0
+  const issues = check.issues || {}
+  return arrayify(issues.failed).length +
+    arrayify(issues.missing).length +
+    arrayify(issues.unclear).length +
+    sumMetricCounts(check.metrics, [/^failed_/, /^missing_/, /^negative_/, /^late_/, /^unclear_/, /^pending_/])
+}
+
 function getDuplicateRiskStatus(result, issueCount, unavailableLabel = '未生成') {
   if (!result) return { state: 'pending', label: unavailableLabel, count: 0 }
   if (issueCount > 0) return getRiskStatus(issueCount, true, unavailableLabel)
@@ -332,20 +361,6 @@ function getPersonnelIssueCountForFile(result, documentTarget) {
   return count
 }
 
-function getTypoIssueCountForFile(result, documentTargets) {
-  let count = 0
-
-  objectValues(result?.groups).forEach((groupValue) => {
-    arrayify(groupValue?.typo_check?.documents).forEach((document) => {
-      if (documentTargets.some((target) => matchesDocument(document, target))) {
-        count += firstAvailableCount(document.issue_count, arrayify(document.items).length)
-      }
-    })
-  })
-
-  return count
-}
-
 function findFormatBidder(result, relation) {
   const relationBusinessId = normalizeId(getRelationBusinessId(relation))
   const relationBusinessFileName = normalizeFileName(getRelationBusinessFileName(relation))
@@ -362,10 +377,11 @@ function findFormatBidder(result, relation) {
 function buildOverviewCards(projectMeta, resultState, parsingStatus) {
   const relations = arrayify(projectMeta?.relations)
   const formatResult = resultState.businessBidFormatReview
-  const businessDuplicateResult = resultState.businessBidDuplicateCheck
+  const deviationResult = resultState.deviationCheck
+  const businessDuplicateResult = resultState.businessItemizedDuplicateCheck || resultState.businessBidDuplicateCheck
+  const responseDuplicateResult = resultState.bidResponseDuplicateCheck
   const technicalDuplicateResult = resultState.technicalBidDuplicateCheck
   const personnelResult = resultState.personnelReuseCheck
-  const typoResult = resultState.typoCheck
 
   return relations.map((relation, index) => {
     const relationId = getRelationId(relation)
@@ -398,8 +414,26 @@ function buildOverviewCards(projectMeta, resultState, parsingStatus) {
       'technical_bid',
       technicalTarget,
     )
-    const personnelIssueCount = getPersonnelIssueCountForFile(personnelResult, businessTarget)
-    const typoIssueCount = getTypoIssueCountForFile(typoResult, [businessTarget, technicalTarget])
+    const responseDuplicateCount = getDuplicateIssueCountForFile(
+      responseDuplicateResult,
+      'business_bid',
+      businessTarget,
+    ) + getDuplicateIssueCountForFile(
+      responseDuplicateResult,
+      'technical_bid',
+      technicalTarget,
+    )
+    const personnelIssueCount = getPersonnelIssueCountForFile(personnelResult, businessTarget) +
+      getPersonnelIssueCountForFile(personnelResult, technicalTarget)
+    const deviationBidder = findFormatBidder(deviationResult, relation)
+    const deviationCheck = deviationBidder?.checks?.deviation_check
+    const deviationStatus = deviationResult
+      ? getRiskStatus(countReviewCheckIssues(deviationCheck), true)
+      : getRiskStatus(
+        0,
+        false,
+        Number(parsingStatus || 0) >= PARSING_STATUS_TECHNICAL_READY ? '未生成' : '技术标未解析',
+      )
 
     return {
       id: relationId || `${businessFileName}-${technicalFileName}-${index}`,
@@ -408,18 +442,15 @@ function buildOverviewCards(projectMeta, resultState, parsingStatus) {
       technicalFileName,
       formatChecks,
       riskChecks: {
+        deviation: deviationStatus,
         businessDuplicate: getDuplicateRiskStatus(businessDuplicateResult, businessDuplicateCount),
+        responseDuplicate: getDuplicateRiskStatus(responseDuplicateResult, responseDuplicateCount),
         technicalDuplicate: getDuplicateRiskStatus(
           technicalDuplicateResult,
           technicalDuplicateCount,
           Number(parsingStatus || 0) >= PARSING_STATUS_TECHNICAL_READY ? '未生成' : '技术标未解析',
         ),
         personnelReuse: getRiskStatus(personnelIssueCount, Boolean(personnelResult)),
-        typo: getRiskStatus(
-          typoIssueCount,
-          Boolean(typoResult),
-          Number(parsingStatus || 0) >= PARSING_STATUS_TECHNICAL_READY ? '未生成' : '技术标未解析',
-        ),
       },
     }
   })
@@ -480,22 +511,27 @@ function getProjectDocumentCountForAnalysis(analysisType, project) {
 
   const businessCount = normalizeCount(project.business_bid_count) ?? 0
   const technicalCount = normalizeCount(project.technical_bid_count) ?? 0
-  const totalCount = normalizeCount(project.document_count) ?? 0
 
   if (
-    analysisType.key === 'businessBidDuplicateCheck' ||
-    analysisType.key === 'personnelReuseCheck' ||
     analysisType.key === 'businessBidFormatReview'
   ) {
     return businessCount
   }
 
-  if (analysisType.key === 'technicalBidDuplicateCheck') {
-    return technicalCount
+  if (analysisType.key === 'personnelReuseCheck' || analysisType.key === 'deviationCheck') {
+    return businessCount + technicalCount
   }
 
-  if (analysisType.key === 'typoCheck') {
-    return firstAvailableCount(totalCount, project.tender_count + businessCount + technicalCount)
+  if (analysisType.key === 'businessBidDuplicateCheck' || analysisType.key === 'businessItemizedDuplicateCheck') {
+    return businessCount
+  }
+
+  if (analysisType.key === 'bidResponseDuplicateCheck') {
+    return businessCount + technicalCount
+  }
+
+  if (analysisType.key === 'technicalBidDuplicateCheck') {
+    return technicalCount
   }
 
   return 0
@@ -632,6 +668,8 @@ function getPersonnelEntryName(entry) {
 
 function collectPersonnelNames(result) {
   let names = arrayify(result?.names)
+    .concat(arrayify(result?.personnel_extraction?.names))
+    .concat(arrayify(result?.config?.confirmed_names))
 
   objectValues(result?.groups).forEach((groupValue) => {
     const check = groupValue?.personnel_reuse_check || {}
@@ -648,6 +686,28 @@ function collectPersonnelNames(result) {
   })
 
   return uniqueStrings(names)
+}
+
+function getPersonnelConfirmationStatus(result) {
+  return String(
+    result?.config?.confirmation_status ||
+    result?.personnel_extraction?.confirmation_status ||
+    '',
+  ).toLowerCase()
+}
+
+function isPersonnelConfirmationPending(result) {
+  if (!result) return false
+  if (result?.config?.confirmation_required) return true
+  return getPersonnelConfirmationStatus(result) === 'pending'
+}
+
+function isPersonnelConfirmed(result) {
+  if (!result) return false
+  const status = getPersonnelConfirmationStatus(result)
+  if (status === 'confirmed') return true
+  if (status === 'pending') return false
+  return !result?.config?.confirmation_required
 }
 
 function countPersonnelDocuments(result) {
@@ -672,44 +732,24 @@ function countPersonnelDocuments(result) {
   )
 }
 
-function countTypoIssues(result) {
-  let count = 0
-  objectValues(result?.groups).forEach((groupValue) => {
-    arrayify(groupValue?.typo_check?.documents).forEach((doc) => {
-      count += arrayify(doc.items).length
-    })
-  })
-  return firstAvailableCount(
-    count,
-    result?.summary?.suspicious_typo_document_count,
-    result?.summary?.suspicious_document_count,
-    result?.summary?.suspicious ? 1 : 0,
-  )
-}
-
-function countTypoDocuments(result) {
-  const groupedDocumentCount = objectValues(result?.groups).reduce((total, groupValue) => {
-    return total + firstAvailableCount(
-      groupValue?.summary?.document_count,
-      collectionSize(groupValue?.typo_check?.documents),
-      collectionSize(groupValue?.documents),
-    )
-  }, 0)
-
-  return firstAvailableCount(
-    result?.summary?.document_count,
-    result?.document_count,
-    groupedDocumentCount,
-    collectionSize(result?.documents),
-  )
-}
-
 const SERVICE_SUMMARIZERS = {
   business_bid_format_review: {
     countDocuments: countFormatReviewDocuments,
     countIssues: countFormatReviewIssues,
   },
+  deviation_check: {
+    countDocuments: countFormatReviewDocuments,
+    countIssues: countFormatReviewIssues,
+  },
   business_bid_duplicate_check: {
+    countDocuments: countDuplicateDocuments,
+    countIssues: countDuplicateIssues,
+  },
+  business_itemized_duplicate_check: {
+    countDocuments: countDuplicateDocuments,
+    countIssues: countDuplicateIssues,
+  },
+  bid_response_duplicate_check: {
     countDocuments: countDuplicateDocuments,
     countIssues: countDuplicateIssues,
   },
@@ -720,10 +760,6 @@ const SERVICE_SUMMARIZERS = {
   personnel_reuse_check: {
     countDocuments: countPersonnelDocuments,
     countIssues: countPersonnelIssues,
-  },
-  typo_check: {
-    countDocuments: countTypoDocuments,
-    countIssues: countTypoIssues,
   },
 }
 
@@ -841,9 +877,7 @@ export default function AnalysisPage() {
     return mergeProjectMeta(listProject, selectedProjectMeta)
   }, [projects, selectedProjectId, selectedProjectMeta])
 
-  const enabledAnalysisTypes = useMemo(() => (
-    ANALYSIS_TYPES.filter((analysisType) => canUseAnalysisType(analysisType, selectedProjectParsingStatus))
-  ), [selectedProjectParsingStatus])
+  const enabledAnalysisTypes = ANALYSIS_TYPES.filter((analysisType) => !isServiceDisabled(analysisType))
 
   const isRunning = useMemo(() => Object.values(analysisStatus).some((status) => status === 'running'), [analysisStatus])
   const overviewCards = useMemo(() => (
@@ -868,8 +902,8 @@ export default function AnalysisPage() {
     if (!projectId) return
 
     const [detailResult, resultsResult] = await Promise.allSettled([
-      getProjectDetail(projectId),
-      getProjectResults(projectId),
+      getProjectDetail(projectId, { forceRefresh: true }),
+      getProjectResults(projectId, { forceRefresh: true }),
     ])
 
     if (String(selectedProjectIdRef.current || '') !== String(projectId || '')) return
@@ -946,15 +980,18 @@ export default function AnalysisPage() {
   }, [projects, selectedProjectId])
 
   useEffect(() => {
+    const personnelConfirmed = isPersonnelConfirmed(results.personnelReuseCheck)
     setCheckedServices((prev) => {
       const next = new Set([...prev].filter((key) => {
         const analysisType = ANALYSIS_TYPES.find((item) => item.key === key)
-        return analysisType && canUseAnalysisType(analysisType, selectedProjectParsingStatus)
+        return analysisType &&
+          canUseAnalysisType(analysisType, selectedProjectParsingStatus) &&
+          (!analysisType.requiresPersonnelConfirmation || personnelConfirmed)
       }))
 
       return next.size === prev.size ? prev : next
     })
-  }, [selectedProjectParsingStatus])
+  }, [results.personnelReuseCheck, selectedProjectParsingStatus])
 
   function handleProjectChange(projectId) {
     setSelectedProjectId(projectId)
@@ -967,7 +1004,21 @@ export default function AnalysisPage() {
   }
 
   function isServiceDisabled(analysisType) {
-    return !canUseAnalysisType(analysisType, selectedProjectParsingStatus)
+    if (!canUseAnalysisType(analysisType, selectedProjectParsingStatus)) return true
+    if (analysisType.requiresPersonnelConfirmation && !isPersonnelConfirmed(results.personnelReuseCheck)) {
+      return true
+    }
+    return false
+  }
+
+  function getAnalysisDisabledHint(analysisType) {
+    if (!canUseAnalysisType(analysisType, selectedProjectParsingStatus)) {
+      return getDisabledHint(analysisType, selectedProjectParsingStatus)
+    }
+    if (analysisType.requiresPersonnelConfirmation && !isPersonnelConfirmed(results.personnelReuseCheck)) {
+      return '请先到结果审核确认人员抽取并完成人员复用检查'
+    }
+    return ''
   }
 
   function toggleService(key) {
@@ -1119,9 +1170,6 @@ export default function AnalysisPage() {
       </section>
 
       {(() => {
-        const businessGroup = ANALYSIS_TYPES.filter((t) => (t.requiredParsingStatus ?? 0) === 2)
-        const technicalGroup = ANALYSIS_TYPES.filter((t) => (t.requiredParsingStatus ?? 0) === 3)
-
         function renderCard(analysisType) {
           const status = analysisStatus[analysisType.key] ?? 'idle'
           const result = results[analysisType.key]
@@ -1129,8 +1177,9 @@ export default function AnalysisPage() {
           const personnelNames = analysisType.key === 'personnelReuseCheck'
             ? collectPersonnelNames(result)
             : []
+          const personnelPending = analysisType.key === 'personnelReuseCheck' && isPersonnelConfirmationPending(result)
           const disabled = isServiceDisabled(analysisType)
-          const disabledHint = getDisabledHint(analysisType, selectedProjectParsingStatus)
+          const disabledHint = getAnalysisDisabledHint(analysisType)
 
           return (
             <div
@@ -1170,12 +1219,14 @@ export default function AnalysisPage() {
                   <span>
                     共检查 {result.summary?.document_count ?? '--'} 份文档
                   </span>
-                  {suspiciousCount > 0 ? (
+                  {personnelPending ? (
+                    <span className="analysis-suspicious">待确认 {personnelNames.length} 个人名</span>
+                  ) : suspiciousCount > 0 ? (
                     <span className="analysis-suspicious">发现 {suspiciousCount} 个可疑项</span>
                   ) : (
                     <span className="analysis-clean">未发现可疑项</span>
                   )}
-                  {personnelNames.length > 0 ? (
+                  {personnelNames.length > 0 && !personnelPending ? (
                     <div className="analysis-personnel-names">
                       {personnelNames.map((name) => (
                         <span key={name}>{name}</span>
@@ -1191,7 +1242,7 @@ export default function AnalysisPage() {
                     href={`#/review?projectId=${selectedProjectId}`}
                     className="ghost-button"
                   >
-                    查看结果 →
+                    {analysisType.key === 'personnelReuseCheck' && personnelPending ? '确认人员 →' : '查看结果 →'}
                   </a>
                 </div>
               ) : null}
@@ -1201,22 +1252,19 @@ export default function AnalysisPage() {
 
         return (
           <>
-            {businessGroup.length > 0 ? (
-              <div className="analysis-group" key="business">
-                <h3 className="analysis-group-title">商务标查重</h3>
-                <div className="analysis-grid">
-                  {businessGroup.map(renderCard)}
+            {ANALYSIS_STAGE_GROUPS.map((group) => {
+              const stageTypes = ANALYSIS_TYPES.filter((analysisType) => analysisType.stage === group.key)
+              if (stageTypes.length === 0) return null
+
+              return (
+                <div className="analysis-group" key={group.key}>
+                  <h3 className="analysis-group-title">{group.title}</h3>
+                  <div className="analysis-grid">
+                    {stageTypes.map(renderCard)}
+                  </div>
                 </div>
-              </div>
-            ) : null}
-            {technicalGroup.length > 0 ? (
-              <div className="analysis-group" key="technical">
-                <h3 className="analysis-group-title">技术标查重</h3>
-                <div className="analysis-grid">
-                  {technicalGroup.map(renderCard)}
-                </div>
-              </div>
-            ) : null}
+              )
+            })}
           </>
         )
       })()}
@@ -1232,7 +1280,7 @@ export default function AnalysisPage() {
           <div className="panel-header">
             <div>
               <h2>项目审查总览</h2>
-              <p>按投标文件汇总形式审查、查重、一人多用和错别字情况</p>
+              <p>按投标文件汇总形式审查、偏离项目、人员复用和查重情况</p>
             </div>
             <a href={`#/review?projectId=${selectedProjectId}`} className="ghost-button">
               查看审核详情 →

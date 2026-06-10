@@ -4,14 +4,16 @@ import {
   deleteProject,
   getProjectDetail,
   getProjectResults,
+  getProjectWorkflowState,
   ingestProjectDocuments,
   listProjects,
   runAnalysis,
   runBusinessOcr,
-  runFullOcr,
   runTenderOcr,
+  saveProjectWorkflowScope,
 } from '../lib/xtjsApi'
 import {
+  DOCUMENT_LABELS,
   deriveBidderName,
   deriveProjectTitle,
   formatDateTime,
@@ -28,25 +30,18 @@ import FileUpload from '../components/FileUpload'
 
 const OCR_EXECUTION_MODES = {
   BUSINESS_FIRST: 'business_first',
-  FULL: 'full',
 }
 
 const OCR_MODE_OPTIONS = [
   {
     value: OCR_EXECUTION_MODES.BUSINESS_FIRST,
-    label: '商务阶段优先',
-    description: '先完成招标文件与商务标 OCR，并自动生成商务审查结果。',
-  },
-  {
-    value: OCR_EXECUTION_MODES.FULL,
-    label: '全量 OCR',
-    description: '创建后直接完成招标文件、商务标、技术标 OCR。',
+    label: '分阶段审查',
+    description: '先完成招标文件与商务标 OCR，并自动生成不含偏离表的商务审查结果。',
   },
 ]
 
 const BUSINESS_ANALYSIS_SERVICES = [
   'business_bid_format_review',
-  'business_bid_duplicate_check',
 ]
 
 const PARSING_STATUS_BUSINESS_READY = 2
@@ -96,6 +91,41 @@ function hasBusinessStageBindings(project) {
     Boolean(relation.tenderFile?.identifierId) &&
     Boolean(relation.businessFile?.identifierId)
   ))
+}
+
+function getTechnicalOcrCandidates(project) {
+  return (project?.relations ?? [])
+    .filter((relation) => Boolean(relation.technicalFile?.identifierId))
+    .map((relation, index) => ({
+      relationId: relation.id,
+      index,
+      businessFileName: relation.businessFile?.fileName || '',
+      businessBidderName: relation.businessFile?.bidderName || '',
+      technicalDocumentId: relation.technicalFile.identifierId,
+      technicalFileName: relation.technicalFile.fileName || '',
+      technicalBidderName: relation.technicalFile.bidderName || '',
+    }))
+}
+
+function getExcludedTechnicalIdsFromWorkflowState(workflowState) {
+  return (workflowState?.excluded_bidders ?? [])
+    .map((item) => item?.technical_bid_document_id || item?.technical_document_identifier_id)
+    .filter(Boolean)
+}
+
+function buildWorkflowExcludedBidders(candidates, excludedIds) {
+  const excludedSet = new Set(excludedIds)
+  return candidates
+    .filter((candidate) => excludedSet.has(candidate.technicalDocumentId))
+    .map((candidate) => ({
+      relation_id: candidate.relationId,
+      bidder_name: candidate.businessBidderName || candidate.technicalBidderName || candidate.businessFileName || candidate.technicalFileName || '',
+      business_file_name: candidate.businessFileName || '',
+      technical_bid_document_id: candidate.technicalDocumentId,
+      technical_file_name: candidate.technicalFileName || '',
+      reason: 'technical_ocr_excluded',
+      source_result_key: 'business_bid_format_review',
+    }))
 }
 
 function getAnalysisRunError(apiResult) {
@@ -183,6 +213,7 @@ export default function ProjectsPage() {
   const [isLoadingProjects, setIsLoadingProjects] = useState(true)
   const [busyToken, setBusyToken] = useState('')
   const [deleteConfirm, setDeleteConfirm] = useState('')
+  const [technicalOcrExcludedIdsByProject, setTechnicalOcrExcludedIdsByProject] = useState({})
 
   const loadProjects = useCallback(async () => {
     setIsLoadingProjects(true)
@@ -231,16 +262,6 @@ export default function ProjectsPage() {
         })
       })
 
-      if (projectLoads.some((item) => (
-        item.status === 'rejected' ||
-        item.value.detailFailed ||
-        item.value.resultsFailed
-      ))) {
-        setNotice({
-          type: 'warning',
-          message: '部分项目详情或结果加载失败，已先展示可用数据。',
-        })
-      }
     } catch (error) {
       startTransition(() => {
         setProjects([])
@@ -274,8 +295,35 @@ export default function ProjectsPage() {
     projects[0] ??
     null
 
+  useEffect(() => {
+    const projectId = activeProject?.identifierId
+    if (!projectId) return undefined
+
+    let cancelled = false
+    getProjectWorkflowState(projectId, { forceRefresh: true })
+      .then((workflowState) => {
+        if (cancelled) return
+        const excludedIds = getExcludedTechnicalIdsFromWorkflowState(workflowState)
+        setTechnicalOcrExcludedIdsByProject((current) => ({
+          ...current,
+          [projectId]: excludedIds,
+        }))
+      })
+      .catch(() => null)
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeProject?.identifierId])
+
   const activeProjectHasBusinessResults = hasBusinessAnalysisResults(activeProject)
   const activeProjectParsingStatus = Number(activeProject?.parsingStatus || 0)
+  const technicalOcrCandidates = getTechnicalOcrCandidates(activeProject)
+  const technicalOcrExcludedIds = technicalOcrExcludedIdsByProject[activeProject?.identifierId] ?? []
+  const technicalOcrExcludedSet = new Set(technicalOcrExcludedIds)
+  const technicalOcrSelectedCount = technicalOcrCandidates.filter((candidate) => (
+    !technicalOcrExcludedSet.has(candidate.technicalDocumentId)
+  )).length
   const isBeforeBusinessReady =
     Boolean(activeProject) &&
     activeProjectParsingStatus < PARSING_STATUS_BUSINESS_READY
@@ -295,7 +343,8 @@ export default function ProjectsPage() {
     Boolean(activeProject) &&
     activeProjectParsingStatus === PARSING_STATUS_BUSINESS_READY &&
     activeProjectHasBusinessResults &&
-    hasTechnicalFileBindings(activeProject)
+    hasTechnicalFileBindings(activeProject) &&
+    technicalOcrSelectedCount > 0
 
   const canSubmitComposer =
     Boolean(composer.projectName.trim()) &&
@@ -333,6 +382,47 @@ export default function ProjectsPage() {
     }))
   }
 
+  async function toggleTechnicalOcrCandidate(documentId) {
+    if (!activeProject?.identifierId || !documentId) return
+
+    const projectId = activeProject.identifierId
+    setTechnicalOcrExcludedIdsByProject((current) => {
+      const currentSet = new Set(current[projectId] ?? [])
+      if (currentSet.has(documentId)) {
+        currentSet.delete(documentId)
+      } else {
+        currentSet.add(documentId)
+      }
+      return {
+        ...current,
+        [projectId]: [...currentSet],
+      }
+    })
+
+    const currentSet = new Set(technicalOcrExcludedIds)
+    if (currentSet.has(documentId)) {
+      currentSet.delete(documentId)
+    } else {
+      currentSet.add(documentId)
+    }
+    const nextExcludedIds = [...currentSet]
+    try {
+      await saveProjectWorkflowScope(
+        projectId,
+        buildWorkflowExcludedBidders(technicalOcrCandidates, nextExcludedIds),
+      )
+    } catch (error) {
+      setTechnicalOcrExcludedIdsByProject((current) => ({
+        ...current,
+        [projectId]: technicalOcrExcludedIds,
+      }))
+      setNotice({
+        type: 'warning',
+        message: error.message || '剔除范围保存失败，请稍后重试。',
+      })
+    }
+  }
+
   function upsertProject(nextProject) {
     if (!nextProject?.id) return
 
@@ -357,15 +447,15 @@ export default function ProjectsPage() {
   }
 
   async function refreshProjectDetailSnapshot(projectId) {
-    const project = normalizeProject(await getProjectDetail(projectId))
+    const project = normalizeProject(await getProjectDetail(projectId, { forceRefresh: true }))
     upsertProject(project)
     return project
   }
 
   async function refreshProjectSnapshot(projectId) {
     const [detailResult, resultsResult] = await Promise.allSettled([
-      getProjectDetail(projectId),
-      getProjectResults(projectId),
+      getProjectDetail(projectId, { forceRefresh: true }),
+      getProjectResults(projectId, { forceRefresh: true }),
     ])
 
     if (detailResult.status === 'rejected') {
@@ -405,34 +495,23 @@ export default function ProjectsPage() {
     return apiResult
   }
 
-  async function runPostCreateWorkflow(projectId, executionMode, parallelism) {
-    if (executionMode === OCR_EXECUTION_MODES.FULL) {
-      setNotice({
-        type: 'info',
-        message: `项目 ${projectId} 创建成功，全量 OCR 已加入队列，正在等待完成...`,
-      })
-      await runFullOcr(projectId, { parallelism })
-      await waitForProjectParsingStatus(projectId, PARSING_STATUS_TECHNICAL_READY, '全量 OCR')
-    } else {
-      setNotice({
-        type: 'info',
-        message: `项目 ${projectId} 创建成功，商务阶段 OCR 已加入队列，正在等待完成...`,
-      })
-      await runBusinessOcr(projectId, { parallelism })
-      await waitForProjectParsingStatus(projectId, PARSING_STATUS_BUSINESS_READY, '商务阶段 OCR')
-    }
+  async function runPostCreateWorkflow(projectId, parallelism) {
+    setNotice({
+      type: 'info',
+      message: `项目 ${projectId} 创建成功，招标文件与商务标 OCR 已加入队列，正在等待完成...`,
+    })
+    await runBusinessOcr(projectId, { parallelism })
+    await waitForProjectParsingStatus(projectId, PARSING_STATUS_BUSINESS_READY, '招标文件与商务标 OCR')
 
     setNotice({
       type: 'info',
-      message: `项目 ${projectId} OCR 已完成，正在生成商务标审查和查重结果...`,
+      message: `项目 ${projectId} 招标文件与商务标 OCR 已完成，正在生成商务标审查结果...`,
     })
     await runBusinessAnalysisForProject(projectId)
 
     setNotice({
       type: 'success',
-      message: executionMode === OCR_EXECUTION_MODES.FULL
-        ? `项目 ${projectId} 全量 OCR 已完成，商务结果已生成。`
-        : `项目 ${projectId} 商务阶段结果已生成，可查看后决定是否继续技术标 OCR。`,
+      message: `项目 ${projectId} 商务标审查结果已生成，可继续技术标 OCR 后执行偏离表、人员和查重检查。`,
     })
   }
 
@@ -445,7 +524,6 @@ export default function ProjectsPage() {
     try {
       const businessBidFiles = composer.bidGroups.map((g) => g.businessFile)
       const technicalBidFiles = composer.bidGroups.map((g) => g.technicalFile)
-      const executionMode = composer.ocrExecutionMode
       const parallelism = composer.bidGroupParallelism
 
       const payload = await ingestProjectDocuments({
@@ -488,7 +566,7 @@ export default function ProjectsPage() {
       })
 
       try {
-        await runPostCreateWorkflow(projectId, executionMode, parallelism)
+        await runPostCreateWorkflow(projectId, parallelism)
       } catch (workflowError) {
         await refreshProjectSnapshot(projectId).catch(() => null)
         setNotice({
@@ -512,19 +590,19 @@ export default function ProjectsPage() {
     setBusyToken('business-analysis')
     setNotice({
       type: 'info',
-      message: `正在生成项目 ${activeProject.identifierId} 的商务标审查和查重结果...`,
+      message: `正在生成项目 ${activeProject.identifierId} 的商务标审查结果...`,
     })
 
     try {
       await runBusinessAnalysisForProject(activeProject.identifierId)
       setNotice({
         type: 'success',
-        message: `项目 ${activeProject.identifierId} 商务结果已生成。`,
+        message: `项目 ${activeProject.identifierId} 商务标审查结果已生成。`,
       })
     } catch (error) {
       setNotice({
         type: 'warning',
-        message: error.message || '商务结果生成失败，请稍后重试。',
+        message: error.message || '商务标审查结果生成失败，请稍后重试。',
       })
     } finally {
       setBusyToken('')
@@ -590,22 +668,44 @@ export default function ProjectsPage() {
   }
 
   async function handleContinueTechnicalOcr() {
-    if (!activeProject || !canContinueTechnicalOcr) return
+    if (!activeProject) return
+    if (technicalOcrSelectedCount <= 0) {
+      setNotice({
+        type: 'warning',
+        message: '请至少保留一份技术标用于 OCR。',
+      })
+      return
+    }
+    if (!canContinueTechnicalOcr) return
 
     const projectId = activeProject.identifierId
+    const excludedTechnicalDocumentIds = technicalOcrCandidates
+      .filter((candidate) => technicalOcrExcludedSet.has(candidate.technicalDocumentId))
+      .map((candidate) => candidate.technicalDocumentId)
     setBusyToken('continue-technical-ocr')
     setNotice({
       type: 'info',
-      message: `项目 ${projectId} 技术标 OCR 已加入队列，正在等待完成...`,
+      message: excludedTechnicalDocumentIds.length > 0
+        ? `项目 ${projectId} 已剔除 ${excludedTechnicalDocumentIds.length} 份技术标，其余技术标 OCR 已加入队列，正在等待完成...`
+        : `项目 ${projectId} 技术标 OCR 已加入队列，正在等待完成...`,
     })
 
     try {
-      await continueTechnicalOcr(projectId, { parallelism: 1 })
+      await saveProjectWorkflowScope(
+        projectId,
+        buildWorkflowExcludedBidders(technicalOcrCandidates, excludedTechnicalDocumentIds),
+      )
+      await continueTechnicalOcr(projectId, {
+        parallelism: 1,
+        excludedTechnicalDocumentIds,
+      })
       await waitForProjectParsingStatus(projectId, PARSING_STATUS_TECHNICAL_READY, '技术标 OCR')
       await refreshProjectSnapshot(projectId)
       setNotice({
         type: 'success',
-        message: `项目 ${projectId} 技术标 OCR 已完成。`,
+        message: excludedTechnicalDocumentIds.length > 0
+          ? `项目 ${projectId} 技术标 OCR 已完成，已剔除不合适技术标 ${excludedTechnicalDocumentIds.length} 份。`
+          : `项目 ${projectId} 技术标 OCR 已完成。`,
       })
     } catch (error) {
       await refreshProjectSnapshot(projectId).catch(() => null)
@@ -640,12 +740,6 @@ export default function ProjectsPage() {
     } finally {
       setBusyToken('')
     }
-  }
-
-  const DOCUMENT_LABELS = {
-    tender: '招标文件',
-    business_bid: '商务标',
-    technical_bid: '技术标',
   }
 
   return (
@@ -764,7 +858,7 @@ export default function ProjectsPage() {
                       accept=".pdf"
                       onChange={(file) => updateBidGroup(group.id, 'technicalFile', file)}
                       fileName={group.technicalFile?.name}
-                      label="上传技术标（按模式决定 OCR 时机）"
+                      label="上传技术标（商务审查后再 OCR）"
                     />
                   </div>
                 </div>
@@ -883,6 +977,51 @@ export default function ProjectsPage() {
                   </div>
                 ) : null}
 
+                {activeProjectParsingStatus === PARSING_STATUS_BUSINESS_READY && technicalOcrCandidates.length > 0 ? (
+                  <div className="technical-ocr-filter">
+                    <div className="technical-ocr-filter-head">
+                      <div>
+                        <strong>技术标 OCR 范围</strong>
+                        <span>
+                          已选择 {technicalOcrSelectedCount} / {technicalOcrCandidates.length} 份技术标参与 OCR
+                        </span>
+                      </div>
+                      {technicalOcrExcludedIds.length > 0 ? (
+                        <span className="technical-ocr-excluded-count">
+                          剔除 {technicalOcrExcludedIds.length} 份
+                        </span>
+                      ) : null}
+                    </div>
+
+                    <div className="technical-ocr-candidate-list">
+                      {technicalOcrCandidates.map((candidate) => {
+                        const checked = !technicalOcrExcludedSet.has(candidate.technicalDocumentId)
+                        const bidderName = candidate.businessBidderName || candidate.technicalBidderName || `标书组 ${candidate.index + 1}`
+
+                        return (
+                          <label
+                            className={`technical-ocr-candidate ${checked ? 'is-included' : 'is-excluded'}`}
+                            key={candidate.technicalDocumentId}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={Boolean(busyToken)}
+                              onChange={() => toggleTechnicalOcrCandidate(candidate.technicalDocumentId)}
+                            />
+                            <div>
+                              <strong>{bidderName}</strong>
+                              <span>{candidate.technicalFileName}</span>
+                              {candidate.businessFileName ? <small>商务标：{candidate.businessFileName}</small> : null}
+                            </div>
+                            <em>{checked ? '参与 OCR' : '已剔除'}</em>
+                          </label>
+                        )
+                      })}
+                    </div>
+                  </div>
+                ) : null}
+
                 <div className="action-row">
                   {deleteConfirm === activeProject.identifierId ? (
                     <>
@@ -923,8 +1062,8 @@ export default function ProjectsPage() {
                           {busyToken === 'business-analysis'
                             ? '生成中...'
                             : activeProjectHasBusinessResults
-                              ? '重新生成商务结果'
-                              : '生成商务结果'}
+                              ? '重新生成商务审查'
+                              : '生成商务审查'}
                         </button>
                       ) : null}
                       {needsTenderOcr ? (
@@ -982,7 +1121,9 @@ export default function ProjectsPage() {
                         </div>
 
                         <div className="relation-files">
-                          {[relation.tenderFile, relation.businessFile, relation.technicalFile].map(
+                          {[relation.tenderFile, relation.businessFile, relation.technicalFile].filter(
+                            (file) => Boolean(file?.identifierId),
+                          ).map(
                             (file) => (
                               <div className="file-card" key={file.identifierId}>
                                 <span>{DOCUMENT_LABELS[file.documentType]}</span>
