@@ -5,6 +5,7 @@ export const MANUAL_REVIEW_STATUS_OPTIONS = [
 ]
 
 export const MANUAL_REVIEW_GROUP_LABELS = {
+  rate_quote: '涓嬫诞鐜囨姤浠?',
   opening_amount: '开标报价',
   bid_total_amount: '投标总金额',
   price_constraint: '招标最高限价',

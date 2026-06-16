@@ -191,6 +191,12 @@ function invalidateProjectCache(identifierId) {
   ))
 }
 
+function invalidateProjectResultsCache(identifierId) {
+  const encodedIdentifier = encodeURIComponent(identifierId || '')
+  if (!encodedIdentifier) return
+  invalidateApiCache((key) => key.includes(`/api/postgresql/projects/${encodedIdentifier}/results`))
+}
+
 function cachedRequest(path, { query, ttl, forceRefresh = false } = {}) {
   const cacheKey = buildRequestUrl(path, query).href
 
@@ -308,10 +314,17 @@ export async function ingestProjectDocuments({
 // ─── Project Results ─────────────────────────────────
 
 export async function getProjectResults(projectName, { forceRefresh = false } = {}) {
+  const path = `/api/postgresql/projects/${encodeURIComponent(projectName)}/results`
+  const query = { view: 'display', include_raw_results: 'false', include_result_record: 'false' }
+  if (forceRefresh) {
+    invalidateProjectResultsCache(projectName)
+    return request(path, {
+      query: Object.assign({}, query, { force_refresh: 'true' }),
+    })
+  }
   return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(projectName)}/results`, {
-    query: { view: 'display', include_raw_results: 'false', include_result_record: 'false' },
+    query,
     ttl: API_CACHE_TTL.projectResults,
-    forceRefresh,
   })
 }
 
@@ -478,14 +491,13 @@ export async function saveBusinessBidFormatReviewManualInputs(projectIdentifier,
 }
 
 export async function rerunBusinessBidFormatReviewWithManualInputs(projectIdentifier, items) {
-  const savedPayload = await saveBusinessBidFormatReviewManualInputs(projectIdentifier, items)
-  const payload = await rerunProjectManualReview(projectIdentifier, ['business_bid_format_review'])
-  const review = payload?.latest?.business_bid_format_review || payload?.manual_review_results?.latest?.business_bid_format_review
-  invalidateProjectCache(projectIdentifier)
-  return Object.assign({}, savedPayload || {}, payload || {}, {
-    review,
-    items: savedPayload?.items || [],
+  await saveBusinessBidFormatReviewManualInputs(projectIdentifier, items)
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/business-bid-format-review/manual-rerun`, {
+    method: 'POST',
   })
+  invalidateProjectResultsCache(projectIdentifier)
+  invalidateProjectCache(projectIdentifier)
+  return payload
 }
 
 export async function listRelations({ page = 1, pageSize = 50, projectIdentifier } = {}) {

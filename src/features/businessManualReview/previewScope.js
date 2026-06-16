@@ -63,6 +63,63 @@ function templateItemMatchesCurrentAlert(item, currentAlert) {
   return Boolean(alertText && (alertText.indexOf(itemLabel) >= 0 || itemLabel.indexOf(alertText) >= 0))
 }
 
+function normalizeVerificationAttachmentTitle(value, options) {
+  var stripPackageOptions = !(options && options.preservePackageOptions)
+  var text = String(value || '').trim().toLowerCase()
+  if (!text) return ''
+  text = text
+    .replace(/签字盖章日期(?:审查|检查)?/g, '')
+    .replace(/附件\s*[a-z0-9一二三四五六七八九十百千万]+(?:\s*[-./]\s*[a-z0-9一二三四五六七八九十百千万]+)*/g, '')
+    .replace(/^\s*\d+(?:\s*[-./]\s*\d+)*\s*/g, '')
+  if (stripPackageOptions) {
+    text = text.replace(/[（(][^）)]*(?:格式|包件|盖章|签字|样式|模板|原件|复印件)?[^）)]*[）)]/g, '')
+  }
+  text = text
+    .replace(/[（）()]/g, '')
+    .replace(/[^0-9a-z\u4e00-\u9fa5]/g, '')
+  return text
+}
+
+function verificationItemMatchLevel(item, currentAlert) {
+  if (!currentAlert || item.field_group !== 'attachment_result') return 0
+  var itemCandidates = [
+    item.field_name,
+    item.fieldName,
+    item.original_value && item.original_value.matched_bid_title,
+    item.original_value && item.original_value.title,
+    item.original_value && item.original_value.attachment_number,
+  ]
+  var strictItemKeys = itemCandidates.map(function (value) {
+    return normalizeVerificationAttachmentTitle(value, { preservePackageOptions: true })
+  }).filter(Boolean)
+  var looseItemKeys = itemCandidates.map(normalizeVerificationAttachmentTitle).filter(Boolean)
+  if (strictItemKeys.length === 0 && looseItemKeys.length === 0) return 0
+
+  var alertCandidates = [
+    currentAlert.title,
+    currentAlert.sourceItem && currentAlert.sourceItem.title,
+  ]
+  var strictAlertKeys = alertCandidates.map(function (value) {
+    return normalizeVerificationAttachmentTitle(value, { preservePackageOptions: true })
+  }).filter(Boolean)
+  var looseAlertKeys = alertCandidates.map(normalizeVerificationAttachmentTitle).filter(Boolean)
+  if (strictAlertKeys.length === 0 && looseAlertKeys.length === 0) return 0
+
+  var strictMatched = strictAlertKeys.some(function (alertKey) {
+    return strictItemKeys.some(function (itemKey) {
+      return alertKey === itemKey || alertKey.indexOf(itemKey) >= 0 || itemKey.indexOf(alertKey) >= 0
+    })
+  })
+  if (strictMatched) return 2
+
+  var looseMatched = looseAlertKeys.some(function (alertKey) {
+    return looseItemKeys.some(function (itemKey) {
+      return alertKey === itemKey || alertKey.indexOf(itemKey) >= 0 || itemKey.indexOf(alertKey) >= 0
+    })
+  })
+  return looseMatched ? 1 : 0
+}
+
 function normalizeManualReviewSearchText(value) {
   return getLookupKey(value).replace(/\s+/g, '')
 }
@@ -147,6 +204,7 @@ export function filterManualReviewItemsForPreviewDoc(items, docInfo, currentPage
       return [
         'price_constraint',
         'opening_amount',
+        'rate_quote',
       ].indexOf(item.field_group) >= 0
     }).map(function (item) {
       return withPricingComparisonOnOpeningAmount(item, comparisonValue)
@@ -174,6 +232,26 @@ export function filterManualReviewItemsForPreviewDoc(items, docInfo, currentPage
     if (!documentMatches) return false
 
     var pages = getManualReviewItemPages(item)
+    if (
+      currentAlert &&
+      currentAlert.subType === 'consistency_check' &&
+      item &&
+      item.field_group === 'template_segment'
+    ) {
+      var alertPage = Number(currentAlert.page)
+      if (pages.length > 0 && Number.isFinite(alertPage) && alertPage > 0 && pages.indexOf(alertPage) >= 0) {
+        return Number(pageNumber) === alertPage
+      }
+    }
+    if (
+      currentAlert &&
+      currentAlert.subType === 'verification_check' &&
+      item &&
+      item.field_group === 'attachment_result' &&
+      pages.length === 0
+    ) {
+      return verificationItemMatchLevel(item, currentAlert) > 0
+    }
     if (pages.length === 0 || !Number.isFinite(pageNumber)) {
       return item.field_group === 'template_segment' ? templateItemMatchesCurrentAlert(item, currentAlert) : true
     }
@@ -184,10 +262,29 @@ export function filterManualReviewItemsForPreviewDoc(items, docInfo, currentPage
     var templateSegmentItems = scopedItems.filter(function (item) {
       return item && item.field_group === 'template_segment'
     })
+    var alertMatchedTemplateSegmentItems = templateSegmentItems.filter(function (item) {
+      return templateItemMatchesCurrentAlert(item, currentAlert)
+    })
+    if (alertMatchedTemplateSegmentItems.length > 0) return alertMatchedTemplateSegmentItems
     if (templateSegmentItems.length > 0) return templateSegmentItems
     return scopedItems.filter(function (item) {
       return item && item.field_group !== 'template_skeleton_item'
     })
+  }
+
+  if (currentAlert && currentAlert.subType === 'verification_check') {
+    var attachmentResultItems = scopedItems.filter(function (item) {
+      return item && item.field_group === 'attachment_result'
+    })
+    var strictMatchedAttachmentResultItems = attachmentResultItems.filter(function (item) {
+      return verificationItemMatchLevel(item, currentAlert) === 2
+    })
+    if (strictMatchedAttachmentResultItems.length > 0) return strictMatchedAttachmentResultItems
+    var looseMatchedAttachmentResultItems = attachmentResultItems.filter(function (item) {
+      return verificationItemMatchLevel(item, currentAlert) === 1
+    })
+    if (looseMatchedAttachmentResultItems.length > 0) return looseMatchedAttachmentResultItems
+    return attachmentResultItems.length > 0 ? [] : scopedItems
   }
 
   return scopedItems

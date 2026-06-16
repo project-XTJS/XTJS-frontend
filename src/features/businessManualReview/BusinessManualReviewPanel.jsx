@@ -54,6 +54,17 @@ function getDifferenceItemText(item, keys) {
   return ''
 }
 
+function cloneStructuredValue(value) {
+  if (value === undefined || value === null) return value
+  try {
+    return JSON.parse(JSON.stringify(value))
+  } catch {
+    if (Array.isArray(value)) return value.slice()
+    if (typeof value === 'object') return Object.assign({}, value)
+  }
+  return value
+}
+
 function renderPlainDifferenceText(value, emptyText) {
   var text = String(value || '').trim()
   return text || emptyText || '无'
@@ -180,6 +191,10 @@ function renderHighlightedText(segments, emptyText) {
   })
 }
 
+function getDifferenceEditKey(fieldKey, itemIndex) {
+  return fieldKey + '::difference::' + itemIndex
+}
+
 export default function BusinessManualReviewPanel({
   currentAlert,
   checkLabels,
@@ -290,7 +305,74 @@ export default function BusinessManualReviewPanel({
     })
   }
 
-  function renderDifferenceField(fieldKey, field, currentValue) {
+  function setDifferenceEditing(fieldKey, itemIndex, editing, item, currentValue) {
+    var editingKey = getDifferenceEditKey(fieldKey, itemIndex)
+    if (editing && manualDrafts[item.editable_id] === undefined) {
+      onDraftChange(
+        item.editable_id,
+        stringifyManualReviewValue(cloneStructuredValue(currentValue || item.original_value || {}))
+      )
+    }
+    onEditingChange(function (current) {
+      var next = {}
+      for (var key in current) next[key] = current[key]
+      if (editing) {
+        next[editingKey] = true
+      } else {
+        delete next[editingKey]
+      }
+      return next
+    })
+  }
+
+  function updateDifferenceBidText(item, currentValue, itemIndex, bidText, originalDiffItem) {
+    var baseValue = getManualReviewCurrentValue(item, manualDrafts)
+    if (!baseValue || typeof baseValue !== 'object' || Array.isArray(baseValue)) {
+      baseValue = currentValue || item.original_value || {}
+    }
+    var nextValue = cloneStructuredValue(baseValue) || {}
+    var nextItems = arrayify(nextValue.difference_items)
+    if (nextItems.length === 0) {
+      nextItems = arrayify(
+        (currentValue && currentValue.difference_items) ||
+        (item.original_value && item.original_value.difference_items)
+      )
+    }
+    nextItems = nextItems.map(function (entry) {
+      return entry && typeof entry === 'object' ? Object.assign({}, entry) : entry
+    })
+    while (nextItems.length <= itemIndex) nextItems.push({})
+    nextItems[itemIndex] = Object.assign({}, nextItems[itemIndex] || {}, {
+      bid_text: bidText,
+      matched_text: bidText,
+    })
+    if (originalDiffItem && originalDiffItem.status && !nextItems[itemIndex].status) {
+      nextItems[itemIndex].status = originalDiffItem.status
+    }
+    nextValue.difference_items = nextItems
+    if (!nextValue.manual_status) {
+      nextValue.manual_status = String(
+        nextValue.consistency_status ||
+        nextValue.status ||
+        nextValue.result ||
+        'unclear'
+      ).trim().toLowerCase() || 'unclear'
+    }
+    onDraftChange(item.editable_id, stringifyManualReviewValue(nextValue))
+  }
+
+  function restoreDifferenceBidText(item, currentValue, itemIndex) {
+    var originalDiffItem = arrayify(item && item.original_value && item.original_value.difference_items)[itemIndex] || {}
+    updateDifferenceBidText(
+      item,
+      currentValue,
+      itemIndex,
+      getDifferenceItemText(originalDiffItem, ['bid_text', 'matched_text', 'ocr_text', 'current_text', 'recognized_text']),
+      originalDiffItem
+    )
+  }
+
+  function renderDifferenceField(itemRecord, fieldKey, field, currentValue) {
     if (field.differenceMode === 'template_pass') {
       return (
         <div className="manual-review-diff-card manual-review-diff-card-pass">
@@ -321,6 +403,10 @@ export default function BusinessManualReviewPanel({
     var isTemplateViolation = field.differenceMode === 'template_violation'
     var templateText = getDifferenceItemText(item, ['template_text', 'reference_text', 'original_text', 'expected_text'])
     var bidText = getDifferenceItemText(item, ['bid_text', 'matched_text', 'ocr_text', 'current_text', 'recognized_text'])
+    var originalDiffItem = arrayify(itemRecord && itemRecord.original_value && itemRecord.original_value.difference_items)[pageIndex] || {}
+    var originalBidText = getDifferenceItemText(originalDiffItem, ['bid_text', 'matched_text', 'ocr_text', 'current_text', 'recognized_text'])
+    var differenceEditingKey = getDifferenceEditKey(fieldKey, pageIndex)
+    var isDifferenceEditing = Boolean(manualEditing[differenceEditingKey])
     var highlightedDiff = buildHighlightedTextDiff(item.template_text || '', item.bid_text || '')
     return (
       <div className="manual-review-diff-pager">
@@ -354,10 +440,42 @@ export default function BusinessManualReviewPanel({
                 </p>
               </div>
               <div className="manual-review-diff-block manual-review-diff-block-bid">
-                <span>投标识别内容（导致不通过）</span>
-                <p className="manual-review-diff-text">
-                  {renderPlainDifferenceText(bidText || summary, '未识别到对应投标内容')}
-                </p>
+                <div className="manual-review-diff-block-head">
+                  <span>投标识别内容（导致不通过）</span>
+                  <div className="manual-review-diff-inline-actions">
+                    <button
+                      type="button"
+                      className="manual-review-edit-btn"
+                      onClick={function () { setDifferenceEditing(fieldKey, pageIndex, !isDifferenceEditing, itemRecord, currentValue) }}
+                    >
+                      {isDifferenceEditing ? '完成编辑' : '修改'}
+                    </button>
+                    <button
+                      type="button"
+                      className="manual-review-restore-btn"
+                      disabled={isManualValueBlank(originalBidText)}
+                      onClick={function () { restoreDifferenceBidText(itemRecord, currentValue, pageIndex) }}
+                    >
+                      恢复OCR
+                    </button>
+                  </div>
+                </div>
+                {isDifferenceEditing ? (
+                  <label className="manual-review-input manual-review-diff-inline-editor">
+                    <span>人工修正投标识别内容</span>
+                    <textarea
+                      value={bidText || ''}
+                      rows={4}
+                      onChange={function (event) {
+                        updateDifferenceBidText(itemRecord, currentValue, pageIndex, event.target.value, originalDiffItem)
+                      }}
+                    />
+                  </label>
+                ) : (
+                  <p className="manual-review-diff-text">
+                    {renderPlainDifferenceText(bidText || summary, '未识别到对应投标内容')}
+                  </p>
+                )}
               </div>
             </>
           ) : item.template_text || item.bid_text ? (
@@ -415,18 +533,6 @@ export default function BusinessManualReviewPanel({
               </div>
               <div className="manual-review-meta">
                 <span>{item.has_manual_value || manualDrafts[item.editable_id] !== undefined ? '已人工修正' : '未修正'}</span>
-                {arrayify(item.page_refs).map(function (page) {
-                  return (
-                    <button
-                      type="button"
-                      className="personnel-page-chip"
-                      key={item.editable_id + '-p' + page}
-                      onClick={function () { onJumpToPage(item) }}
-                    >
-                      第 {page} 页
-                    </button>
-                  )
-                })}
               </div>
               <div className="manual-review-field-list">
                 {fields.map(function (field) {
@@ -469,7 +575,7 @@ export default function BusinessManualReviewPanel({
                         ) : null}
                       </div>
                       {field.valueType === 'difference_list' ? (
-                        renderDifferenceField(fieldKey, field, currentValue)
+                        renderDifferenceField(item, fieldKey, field, currentValue)
                       ) : field.readOnly ? (
                         <div className={'manual-review-value-row' + longValueClass}>
                           <span>内容</span>

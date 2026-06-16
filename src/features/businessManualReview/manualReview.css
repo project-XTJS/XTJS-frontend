@@ -332,6 +332,21 @@
   background: #f8fafc;
 }
 
+.manual-review-diff-block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.manual-review-diff-inline-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 .manual-review-diff-block-template {
   background: #fff7ed;
 }
@@ -348,6 +363,10 @@
   color: #64748b;
   font-size: 0.76rem;
   font-weight: 700;
+}
+
+.manual-review-diff-inline-editor {
+  margin-top: 2px;
 }
 
 .manual-review-input {

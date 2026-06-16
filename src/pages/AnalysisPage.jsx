@@ -34,8 +34,7 @@ const OVERVIEW_CHECK_GROUPS = [
     checks: [
       { key: 'deviation', label: '偏离表' },
       { key: 'personnelReuse', label: '人员复用' },
-      { key: 'businessDuplicate', label: '商务分项查重' },
-      { key: 'responseDuplicate', label: '响应内容查重' },
+      { key: 'businessDuplicate', label: '\u5546\u52a1\u6807\u67e5\u91cd' },
       { key: 'technicalDuplicate', label: '技术标查重' },
     ],
   },
@@ -70,21 +69,12 @@ const ANALYSIS_TYPES = [
     stage: 'technical',
   },
   {
-    key: 'businessItemizedDuplicateCheck',
-    label: '商务分项报价查重',
-    icon: '📄',
-    description: '对商务标分项报价表进行查重',
-    services: ['business_itemized_duplicate_check'],
-    requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
-    stage: 'duplicate',
-  },
-  {
-    key: 'bidResponseDuplicateCheck',
-    label: '响应内容查重',
-    icon: '📋',
-    description: '对商务响应和技术响应内容进行查重',
-    services: ['bid_response_duplicate_check'],
-    requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
+    key: 'businessBidDuplicateCheck',
+    label: '\u5546\u52a1\u6807\u67e5\u91cd',
+    icon: '\uD83D\uDCC4',
+    description: '\u53ea\u67e5\u5546\u52a1\u6807\u8303\u56f4\uff0c\u5305\u62ec\u5546\u52a1\u5206\u9879\u62a5\u4ef7\u548c\u5546\u52a1\u504f\u79bb/\u54cd\u5e94\u5185\u5bb9',
+    services: ['business_bid_duplicate_check'],
+    requiredParsingStatus: PARSING_STATUS_BUSINESS_READY,
     stage: 'duplicate',
   },
   {
@@ -378,8 +368,7 @@ function buildOverviewCards(projectMeta, resultState, parsingStatus) {
   const relations = arrayify(projectMeta?.relations)
   const formatResult = resultState.businessBidFormatReview
   const deviationResult = resultState.deviationCheck
-  const businessDuplicateResult = resultState.businessItemizedDuplicateCheck || resultState.businessBidDuplicateCheck
-  const responseDuplicateResult = resultState.bidResponseDuplicateCheck
+  const businessDuplicateResult = resultState.businessBidDuplicateCheck
   const technicalDuplicateResult = resultState.technicalBidDuplicateCheck
   const personnelResult = resultState.personnelReuseCheck
 
@@ -414,15 +403,6 @@ function buildOverviewCards(projectMeta, resultState, parsingStatus) {
       'technical_bid',
       technicalTarget,
     )
-    const responseDuplicateCount = getDuplicateIssueCountForFile(
-      responseDuplicateResult,
-      'business_bid',
-      businessTarget,
-    ) + getDuplicateIssueCountForFile(
-      responseDuplicateResult,
-      'technical_bid',
-      technicalTarget,
-    )
     const personnelIssueCount = getPersonnelIssueCountForFile(personnelResult, businessTarget) +
       getPersonnelIssueCountForFile(personnelResult, technicalTarget)
     const deviationBidder = findFormatBidder(deviationResult, relation)
@@ -444,7 +424,6 @@ function buildOverviewCards(projectMeta, resultState, parsingStatus) {
       riskChecks: {
         deviation: deviationStatus,
         businessDuplicate: getDuplicateRiskStatus(businessDuplicateResult, businessDuplicateCount),
-        responseDuplicate: getDuplicateRiskStatus(responseDuplicateResult, responseDuplicateCount),
         technicalDuplicate: getDuplicateRiskStatus(
           technicalDuplicateResult,
           technicalDuplicateCount,
@@ -522,12 +501,8 @@ function getProjectDocumentCountForAnalysis(analysisType, project) {
     return businessCount + technicalCount
   }
 
-  if (analysisType.key === 'businessBidDuplicateCheck' || analysisType.key === 'businessItemizedDuplicateCheck') {
+  if (analysisType.key === 'businessBidDuplicateCheck') {
     return businessCount
-  }
-
-  if (analysisType.key === 'bidResponseDuplicateCheck') {
-    return businessCount + technicalCount
   }
 
   if (analysisType.key === 'technicalBidDuplicateCheck') {
@@ -643,6 +618,7 @@ function countDuplicateDocuments(result) {
 }
 
 function countPersonnelIssues(result) {
+  if (isPersonnelConfirmationPending(result)) return 0
   let count = 0
   Object.values(result?.groups || {}).forEach((groupValue) => {
     const check = groupValue?.personnel_reuse_check || {}
@@ -742,14 +718,6 @@ const SERVICE_SUMMARIZERS = {
     countIssues: countFormatReviewIssues,
   },
   business_bid_duplicate_check: {
-    countDocuments: countDuplicateDocuments,
-    countIssues: countDuplicateIssues,
-  },
-  business_itemized_duplicate_check: {
-    countDocuments: countDuplicateDocuments,
-    countIssues: countDuplicateIssues,
-  },
-  bid_response_duplicate_check: {
     countDocuments: countDuplicateDocuments,
     countIssues: countDuplicateIssues,
   },
@@ -1173,11 +1141,11 @@ export default function AnalysisPage() {
         function renderCard(analysisType) {
           const status = analysisStatus[analysisType.key] ?? 'idle'
           const result = results[analysisType.key]
-          const suspiciousCount = result?.summary?.suspicious ?? 0
+          const personnelPending = analysisType.key === 'personnelReuseCheck' && isPersonnelConfirmationPending(result)
+          const suspiciousCount = personnelPending ? 0 : (result?.summary?.suspicious ?? 0)
           const personnelNames = analysisType.key === 'personnelReuseCheck'
             ? collectPersonnelNames(result)
             : []
-          const personnelPending = analysisType.key === 'personnelReuseCheck' && isPersonnelConfirmationPending(result)
           const disabled = isServiceDisabled(analysisType)
           const disabledHint = getAnalysisDisabledHint(analysisType)
 

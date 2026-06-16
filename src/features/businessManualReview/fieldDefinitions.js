@@ -34,12 +34,10 @@ function getTemplateDifferenceItemKey(item) {
     item.item_id,
     item.type,
     item.difference_category,
-    item.status,
     item.label,
     item.template_text,
     item.reference_text,
-    item.bid_text,
-    item.matched_text,
+    item.page,
   ].map(function (value) { return String(value || '').trim() }).join('|')
 }
 
@@ -117,6 +115,24 @@ function formatManualNumber(value) {
   return number === null ? '' : number.toFixed(2)
 }
 
+function rateQuoteText(value, originalValue, keys) {
+  return getManualReviewObjectValue(value, keys) || getManualReviewObjectValue(originalValue, keys)
+}
+
+function rateQuoteCurrentLabel(value, originalValue) {
+  var rateLabel = String(rateQuoteText(value, originalValue, ['rate_label']) || '')
+  return rateLabel.indexOf('折扣率') >= 0 ? '当前折扣率（%）' : '当前下浮率（%）'
+}
+
+function rateQuoteThresholdLabel(value, originalValue) {
+  var rateLabel = String(rateQuoteText(value, originalValue, ['rate_label']) || '')
+  var operator = String(rateQuoteText(value, originalValue, ['rule_operator', 'op']) || '').trim()
+  if (rateLabel.indexOf('折扣率') >= 0 || operator === '<' || operator === '<=') {
+    return '要求最高折扣率（%）'
+  }
+  return '要求最低下浮率（%）'
+}
+
 export function buildManualReviewDisplayFields(item, currentValue) {
   var originalValue = item.original_value
   var fields = []
@@ -156,6 +172,24 @@ export function buildManualReviewDisplayFields(item, currentValue) {
     addField({ path: ['capital_amount_yuan'], label: '大写报价（元）', valueType: 'amount', sourceKeys: ['capital_amount_yuan', 'capital_amount', 'capital_price'] })
     addField({ path: ['case_consistency_status'], label: '大小写是否一致', valueType: 'text', sourceKeys: ['case_consistency_status', 'case_consistency_summary'], readOnly: true })
     addField({ path: ['limit_comparison_status'], label: '是否超过最高限价', valueType: 'text', sourceKeys: ['limit_comparison_status', 'price_limit_status', 'tender_limit_status', 'limit_comparison_summary'], readOnly: true })
+    return fields
+  }
+
+  if (item.field_group === 'rate_quote') {
+    addField({
+      path: ['current_float_rate'],
+      label: rateQuoteCurrentLabel(currentValue, originalValue),
+      valueType: 'amount',
+      sourceKeys: ['current_float_rate', 'float_rate'],
+      amountFallback: true,
+    })
+    addField({
+      path: ['required_min_float_rate'],
+      label: rateQuoteThresholdLabel(currentValue, originalValue),
+      valueType: 'amount',
+      sourceKeys: ['required_min_float_rate', 'rule_threshold', 'threshold'],
+      amountFallback: true,
+    })
     return fields
   }
 
@@ -227,6 +261,12 @@ export function buildManualReviewDisplayFields(item, currentValue) {
       differenceItems: templateViolationItems,
       multiline: true,
       readOnly: true,
+    })
+    addField({
+      path: ['manual_status'],
+      label: '人工复核结论',
+      valueType: 'status',
+      sourceKeys: ['manual_status', 'consistency_status', 'status', 'result'],
     })
     return fields
   }

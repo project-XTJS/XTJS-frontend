@@ -29,8 +29,7 @@ import {
 var RESULT_TYPE_LABELS = {
   duplicate_check: '全文查重',
   business_bid_duplicate_check: '商务标查重',
-  business_itemized_duplicate_check: '商务分项报价查重',
-  bid_response_duplicate_check: '响应内容查重',
+  business_itemized_duplicate_check: '分项报价表查重',
   technical_bid_duplicate_check: '技术标查重',
   business_bid_format_review: '商务标形式审查',
   business_bid_format_review_passed: '商务标形式审查通过项',
@@ -41,8 +40,7 @@ var RESULT_TYPE_LABELS = {
 var RESULT_TYPE_COLORS = {
   duplicate_check: '#dc2626',
   business_bid_duplicate_check: '#ea580c',
-  business_itemized_duplicate_check: '#ea580c',
-  bid_response_duplicate_check: '#0891b2',
+  business_itemized_duplicate_check: '#d97706',
   technical_bid_duplicate_check: '#f59e0b',
   business_bid_format_review: '#2563eb',
   business_bid_format_review_passed: '#16a34a',
@@ -53,15 +51,15 @@ var RESULT_TYPE_COLORS = {
 var OVERVIEW_RESULT_ORDER = [
   'business_bid_format_review',
   'deviation_check',
-  'business_itemized_duplicate_check',
-  'bid_response_duplicate_check',
   'business_bid_duplicate_check',
+  'business_itemized_duplicate_check',
   'technical_bid_duplicate_check',
   'personnel_reuse_check',
 ]
 
 var FORMAT_REVIEW_RESULT_KEY = 'business_bid_format_review'
 var FORMAT_REVIEW_PASSED_RESULT_KEY = 'business_bid_format_review_passed'
+var BUSINESS_ITEMIZED_DUPLICATE_RESULT_KEY = 'business_itemized_duplicate_check'
 var ISSUE_SNIPPET_LIMIT = 200
 
 var FORMAT_CHECK_LABELS = {
@@ -357,7 +355,10 @@ function normalizeDocRef(raw, defaults) {
   var fileUrl = source.file_url || source.fileUrl || source.file_path || source.filePath ||
     source.minio_url || source.minioUrl || source.source_url || source.sourceUrl || base.fileUrl
   var label = source.label || fileName || base.label || docId
-  var page = extractFirstPage(source) || base.page || base.startPage || 1
+  var shouldUseBasePage = Boolean(base.forcePage || source.forcePage || source.force_page)
+  var page = shouldUseBasePage
+    ? (base.page || base.startPage || extractFirstPage(source) || 1)
+    : (extractFirstPage(source) || base.page || base.startPage || 1)
 
   if (!docId && !fileName && !fileUrl) return null
 
@@ -378,6 +379,7 @@ function normalizeDocRef(raw, defaults) {
     highlightPageRects: source.highlightPageRects || source.highlight_page_rects || base.highlightPageRects,
     targetPages: source.targetPages || source.target_pages || base.targetPages,
     lockStartPage: source.lockStartPage || source.lock_start_page || base.lockStartPage || base.lock_start_page,
+    forcePage: source.forcePage || source.force_page || base.forcePage || base.force_page,
   })
 }
 
@@ -572,6 +574,130 @@ function buildExportPayload(alert, item) {
 function isDuplicateIssueVisible(item) {
   var riskLevel = String(item.risk_level || '').toLowerCase()
   return Boolean(item) && riskLevel !== '' && riskLevel !== 'none'
+}
+
+function normalizeDuplicateSubtypeText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/\[/g, '')
+    .replace(/]/g, '')
+    .replace(/[()（）【】<>《》:：\-—_、,，。；;|/\\]/g, '')
+}
+
+function isItemizedDuplicateTitle(text) {
+  var compact = normalizeDuplicateSubtypeText(text)
+  if (!compact) return false
+  return compact.indexOf('分项报价表') >= 0 ||
+    compact.indexOf('分项报价') >= 0 ||
+    compact.indexOf('报价明细表') >= 0 ||
+    compact.indexOf('已标价工程量清单') >= 0 ||
+    compact.indexOf('工程量清单') >= 0
+}
+
+function isItemizedDuplicateRows(rows) {
+  var compact = normalizeDuplicateSubtypeText(arrayify(rows).join(' '))
+  if (!compact) return false
+
+  var headerTokens = [
+    '单位工程名称',
+    '项目名称',
+    '规格型号',
+    '数量',
+    '单位',
+    '单价',
+    '总价',
+    '合计',
+    '金额',
+    '税率',
+    '下浮率',
+  ]
+  var hits = headerTokens.filter(function (token) {
+    return compact.indexOf(normalizeDuplicateSubtypeText(token)) >= 0
+  }).length
+  var hasPriceAxis = ['单价', '总价', '合计', '金额', '税率', '下浮率'].some(function (token) {
+    return compact.indexOf(normalizeDuplicateSubtypeText(token)) >= 0
+  })
+  var hasQuantityAxis = ['数量', '单位'].some(function (token) {
+    return compact.indexOf(normalizeDuplicateSubtypeText(token)) >= 0
+  })
+  return hits >= 3 && hasPriceAxis && hasQuantityAxis
+}
+
+function duplicateItemLooksItemized(value) {
+  var found = false
+
+  function collect(node) {
+    if (found || !node) return
+    if (Array.isArray(node)) {
+      node.forEach(collect)
+      return
+    }
+    if (!isObject(node)) {
+      if (isItemizedDuplicateTitle(node)) found = true
+      return
+    }
+
+    var nodeSource = normalizeDuplicateSubtypeText(
+      node.source ||
+      node.kind ||
+      node.type
+    )
+    if (nodeSource.indexOf('itemizedpricing') >= 0) {
+      found = true
+      return
+    }
+
+    if (
+      isItemizedDuplicateTitle(node.left_title) ||
+      isItemizedDuplicateTitle(node.right_title) ||
+      isItemizedDuplicateTitle(node.title)
+    ) {
+      found = true
+      return
+    }
+
+    if (
+      isItemizedDuplicateRows(node.left_rows) ||
+      isItemizedDuplicateRows(node.right_rows) ||
+      isItemizedDuplicateRows(node.sample_rows) ||
+      isItemizedDuplicateRows(node.left_sample_rows) ||
+      isItemizedDuplicateRows(node.right_sample_rows)
+    ) {
+      found = true
+      return
+    }
+
+    Object.keys(node).forEach(function (key) {
+      if (found) return
+      if (['left_title', 'right_title', 'title', 'left_rows', 'right_rows', 'sample_rows', 'left_sample_rows', 'right_sample_rows'].indexOf(key) >= 0) {
+        return
+      }
+      collect(node[key])
+    })
+  }
+
+  collect(value)
+  return found
+}
+
+function getDuplicateAlertResultType(resultKey, item) {
+  if (
+    resultKey === 'business_bid_duplicate_check' &&
+    duplicateItemLooksItemized(item)
+  ) {
+    return BUSINESS_ITEMIZED_DUPLICATE_RESULT_KEY
+  }
+  return resultKey
+}
+
+function matchesResultTypeFilter(alert, resultType) {
+  if (!alert || !resultType) return false
+  if (resultType === 'business_bid_duplicate_check') {
+    return alert.resultType === 'business_bid_duplicate_check' ||
+      alert.parentResultType === 'business_bid_duplicate_check'
+  }
+  return alert.resultType === resultType
 }
 
 function getDuplicateResultIssueEntries(result) {
@@ -1016,8 +1142,6 @@ function renderDuplicateEvidenceRows(alert) {
 
 function collectDuplicateAlerts(results, allAlerts) {
   var duplicateKeys = []
-  if (results.business_itemized_duplicate_check) duplicateKeys.push('business_itemized_duplicate_check')
-  if (results.bid_response_duplicate_check) duplicateKeys.push('bid_response_duplicate_check')
   if (results.business_bid_duplicate_check) duplicateKeys.push('business_bid_duplicate_check')
   if (results.technical_bid_duplicate_check) duplicateKeys.push('technical_bid_duplicate_check')
 
@@ -1030,6 +1154,7 @@ function collectDuplicateAlerts(results, allAlerts) {
       var index = entry.index
       if (!isDuplicateIssueVisible(item)) return
 
+      var alertResultType = getDuplicateAlertResultType(resultKey, item)
       var docs = buildDuplicateClusterDocs(item)
       var score = item.score_display || item.score_value || item.match_score || item.similarity_match_score || item.exact_match_score
       var groupKey = entry.groupKey || item.document_type || result.document_type
@@ -1043,9 +1168,10 @@ function collectDuplicateAlerts(results, allAlerts) {
 
       var alert = {
         id: makeAlertId('duplicate', resultKey, groupKey, item.cluster_id, index),
-        resultType: resultKey,
+        resultType: alertResultType,
+        parentResultType: alertResultType !== resultKey ? resultKey : '',
         sourceResultKey: resultKey,
-        resultTypeLabel: RESULT_TYPE_LABELS[resultKey] || RESULT_TYPE_LABELS.duplicate_check,
+        resultTypeLabel: RESULT_TYPE_LABELS[alertResultType] || RESULT_TYPE_LABELS[resultKey] || RESULT_TYPE_LABELS.duplicate_check,
         groupKey: groupKey,
         groupLabel: getGroupLabel(groupKey, item.document_type),
         riskLevel: normalizeRiskLevel(item.risk_level),
@@ -1774,6 +1900,10 @@ function mergePreviewDocsByFile(docs) {
   var order = []
   var aliasLookup = {}
 
+  function isLockedDoc(doc) {
+    return Boolean(doc && (doc.lockStartPage || doc.lock_start_page || doc.forcePage || doc.force_page))
+  }
+
   function findGroupKey(aliases) {
     for (var i = 0; i < aliases.length; i++) {
       var aliasKey = getLookupKey(aliases[i])
@@ -1808,6 +1938,27 @@ function mergePreviewDocsByFile(docs) {
     registerAliases(groupKey, aliases)
 
     var existing = merged[groupKey]
+    var existingLocked = isLockedDoc(existing)
+    var nextLocked = isLockedDoc(doc)
+    if (nextLocked && !existingLocked) {
+      merged[groupKey] = compactObject(Object.assign({}, doc, {
+        docKey: existing.docKey,
+        docId: doc.docId || existing.docId,
+        fileName: doc.fileName || existing.fileName,
+        fileUrl: doc.fileUrl || existing.fileUrl,
+        sourceRef: doc.sourceRef || existing.sourceRef,
+        label: doc.label || existing.label,
+        targetPages: [doc.startPage].filter(Boolean),
+        lockStartPage: doc.lockStartPage || doc.lock_start_page || doc.forcePage || doc.force_page,
+        forcePage: doc.forcePage || doc.force_page,
+        highlight: collectHighlightPhrases(doc.highlight, existing.highlight),
+        highlightBbox: doc.highlightBbox || existing.highlightBbox,
+        highlightRects: collectHighlightRects(doc.highlightRects).concat(collectHighlightRects(existing.highlightRects)).slice(0, 24),
+        highlightPageRects: mergeHighlightPageRects(doc.highlightPageRects, existing.highlightPageRects),
+      }))
+      return
+    }
+
     var pages = arrayify(existing.targetPages).slice()
     addUniquePage(pages, existing.startPage)
     addUniquePage(pages, doc.startPage)
@@ -1833,6 +1984,7 @@ function mergePreviewDocsByFile(docs) {
       purpose: existing.purpose || doc.purpose,
       documentType: existing.documentType || doc.documentType,
       lockStartPage: existing.lockStartPage || doc.lockStartPage,
+      forcePage: existing.forcePage || doc.forcePage,
       highlight: collectHighlightPhrases(existing.highlight, doc.highlight),
       highlightBbox: existing.highlightBbox || doc.highlightBbox,
       highlightRects: existingRects.concat(nextRects).slice(0, 24),
@@ -1926,6 +2078,12 @@ function docsReferToSameFile(a, b) {
   })
 }
 
+function isDocCoveredByTenderRefs(doc, tenderRefs) {
+  return isTenderTemplateDoc(doc) || arrayify(tenderRefs).some(function (tenderRef) {
+    return docsReferToSameFile(doc, tenderRef)
+  })
+}
+
 function getBidderBusinessDocumentCandidate(bidder) {
   var docs = bidder && bidder.documents
   if (isObject(docs)) {
@@ -1980,10 +2138,61 @@ var FORMAT_TENDER_LOCATION_FIELDS = [
   'deadline_locations',
 ]
 
-function getFormatTenderLocationFields(checkKey) {
-  if (checkKey === 'verification_check') return ['deadline_locations']
+function getFormatTenderLocationFields(checkKey, issue) {
+  if (checkKey === 'verification_check') {
+    return isVerificationMissingAttachmentIssue(issue)
+      ? ['template_locations', 'deadline_locations']
+      : ['deadline_locations']
+  }
   if (checkKey === 'itemized_pricing_check') return []
   return FORMAT_TENDER_LOCATION_FIELDS
+}
+
+function getVerificationAttachmentFieldStatus(issue, field) {
+  var evidence = (issue && issue.evidence) || {}
+  var value = evidence[field] || {}
+  return String(value.status || '').trim().toLowerCase()
+}
+
+function isVerificationAttachmentPassIssue(issue) {
+  var evidence = (issue && issue.evidence) || {}
+  if (evidence.source !== 'attachment_result') return false
+
+  var issueStatus = String(issue && issue.status || '').trim().toLowerCase()
+  if (issueStatus === 'pass') return true
+
+  var signatureStatus = getVerificationAttachmentFieldStatus(issue, 'signature_check')
+  var sealStatus = getVerificationAttachmentFieldStatus(issue, 'seal_check')
+  var dateStatus = getVerificationAttachmentFieldStatus(issue, 'date_check')
+  if (!signatureStatus && !sealStatus && !dateStatus) return false
+
+  return ['pass', 'not_required'].includes(signatureStatus) &&
+    ['pass', 'not_required'].includes(sealStatus) &&
+    ['pass', 'not_required'].includes(dateStatus)
+}
+
+function isVerificationMissingAttachmentIssue(issue) {
+  var evidence = (issue && issue.evidence) || {}
+  if (evidence.source !== 'position_check') return false
+  if (arrayify(evidence.template_locations).length === 0) return false
+  if (arrayify(evidence.locations).length > 0) return false
+  if (arrayify(evidence.pages).length > 0) return false
+  if (String(evidence.matched_bid_title || '').trim()) return false
+  return true
+}
+
+function isExplicitPassFormatIssue(checkKey, issue) {
+  var issueStatus = String(issue && issue.status || '').trim().toLowerCase()
+  if (issueStatus === 'pass') return true
+  if (checkKey === 'verification_check') return isVerificationAttachmentPassIssue(issue)
+  return false
+}
+
+function getFormatIssueMessage(checkKey, issue, fallbackMessage) {
+  if (checkKey === 'verification_check' && isVerificationAttachmentPassIssue(issue)) {
+    return '附件要求的签字、盖章、落款日期均已满足。'
+  }
+  return fallbackMessage
 }
 
 var FORMAT_BID_LOCATION_FIELDS = [
@@ -2046,7 +2255,7 @@ function uniqueLocationCandidates(locations) {
 function collectFormatEvidenceLocations(issue, checkKey) {
   var evidence = (issue && issue.evidence) || {}
   var locations = []
-  var tenderLocationFields = getFormatTenderLocationFields(checkKey)
+  var tenderLocationFields = getFormatTenderLocationFields(checkKey, issue)
 
   arrayify(evidence.locations).forEach(function (location) {
     locations.push(location)
@@ -2117,6 +2326,38 @@ function getTenderRoleLocationCandidates(values) {
   return uniqueLocationCandidates(locations)
 }
 
+function getLocationSearchText(location) {
+  return String(
+    (location && (
+      location.text ||
+      location.label ||
+      location.preview ||
+      location.title
+    )) || ''
+  ).replace(/\s+/g, '')
+}
+
+function isTemplateReferenceOnlyLocation(location) {
+  var text = getLocationSearchText(location)
+  if (!text) return false
+
+  var hasReferenceCue = /\u683c\u5f0f\u53c2\u89c1|\u53c2\u89c1.*\u9644\u4ef6|\u8be6\u89c1.*\u9644\u4ef6|\u987b\u52a0\u76d6\u516c\u7ae0/.test(text)
+  var hasTemplateBodyCue = /\u6211\u516c\u53f8|\u6211\u65b9|\u627f\u8bfa\u5982\u4e0b|\u7279\u6b64\u627f\u8bfa|\u6295\u6807\u4eba.*\u76d6\u7ae0|\u65e5\u671f/.test(text)
+  return hasReferenceCue && !hasTemplateBodyCue
+}
+
+function preferTemplateBodyLocations(locations) {
+  var candidates = uniqueLocationCandidates(locations).filter(function (location) {
+    return Boolean(location && extractFirstPage(location))
+  })
+  if (candidates.length <= 1) return candidates
+
+  var bodyLocations = candidates.filter(function (location) {
+    return !isTemplateReferenceOnlyLocation(location)
+  })
+  return bodyLocations.length > 0 ? bodyLocations : candidates
+}
+
 function collectConsistencyTemplateLocationValues(issue) {
   var evidence = (issue && issue.evidence) || {}
   var attachmentLocations = []
@@ -2124,9 +2365,7 @@ function collectConsistencyTemplateLocationValues(issue) {
   arrayify(evidence.template_attachment_locations).forEach(function (location) {
     attachmentLocations.push(withLocationDocumentRole(location, 'tender'))
   })
-  attachmentLocations = uniqueLocationCandidates(attachmentLocations).filter(function (location) {
-    return Boolean(location && extractFirstPage(location))
-  })
+  attachmentLocations = preferTemplateBodyLocations(attachmentLocations)
   if (attachmentLocations.length > 0) return attachmentLocations
 
   var locations = []
@@ -2138,9 +2377,7 @@ function collectConsistencyTemplateLocationValues(issue) {
     locations.push(withLocationDocumentRole(location, 'tender'))
   })
 
-  return uniqueLocationCandidates(locations).filter(function (location) {
-    return Boolean(location && extractFirstPage(location))
-  })
+  return preferTemplateBodyLocations(locations)
 }
 
 function getFormatTenderHighlightConfig(checkKey) {
@@ -2286,6 +2523,34 @@ function getFormatBidFallbackPage(issue, fallbackPage) {
     1
 }
 
+function hasBusinessFormatPreviewLocation(locations) {
+  return arrayify(locations).some(function (location) {
+    return getLocationDocumentRole(location) !== 'tender'
+  })
+}
+
+function narrowConsistencyBidPreviewLocations(locations, issue, fallbackPage) {
+  var businessLocations = arrayify(locations).filter(function (location) {
+    return getLocationDocumentRole(location) !== 'tender'
+  })
+  if (businessLocations.length <= 1) return businessLocations
+
+  var preferredPage = getFirstNumber(issue && issue.response_page) ||
+    getFirstNumber(fallbackPage) ||
+    extractFirstPage(businessLocations[0])
+  if (!preferredPage) return [businessLocations[0]]
+
+  var samePageLocations = businessLocations.filter(function (location) {
+    return Number(extractFirstPage(location)) === Number(preferredPage)
+  })
+  if (samePageLocations.length > 0) return samePageLocations
+
+  var firstPage = extractFirstPage(businessLocations[0])
+  return businessLocations.filter(function (location) {
+    return Number(extractFirstPage(location)) === Number(firstPage)
+  })
+}
+
 function resolveRoleDocFromLookup(role, lookup) {
   if (!role || !lookup) return null
   if (role === 'tender') return lookup['role:tender'] || lookup['type:tender']
@@ -2337,6 +2602,7 @@ function getFormatTenderFallbackPage(issue, checkKey, formatLocations, formatTen
   if (checkKey === 'verification_check') {
     return getPageForRoleFromLocations('tender', formatLocations) ||
       (formatTenderRefs && formatTenderRefs[0] && formatTenderRefs[0].startPage) ||
+      extractFirstPage(arrayify(evidence.template_locations)[0]) ||
       extractFirstPage(arrayify(evidence.deadline_locations)[0]) ||
       getFirstNumber(issue && issue.deadline_page) ||
       1
@@ -2426,11 +2692,12 @@ function buildTenderLocationDocRefs(locations, options) {
       purpose: opts.purpose,
       targetPages: [entry.page],
       lockStartPage: opts.lockStartPage,
+      forcePage: opts.forcePage,
       highlight: entry.highlights,
       highlightBbox: entry.rects[0],
       highlightRects: entry.rects,
       highlightPageRects: makeHighlightPageRects(entry.page, entry.rects),
-    }, { page: entry.page })
+    }, { page: entry.page, forcePage: opts.forcePage })
   }).filter(Boolean)
 }
 
@@ -2444,6 +2711,7 @@ function buildFormatTenderHighlightDocRefs(issue, checkKey, options) {
     labelSuffix: config.labelSuffix,
     purpose: checkKey === 'consistency_check' ? 'consistency_template' : undefined,
     lockStartPage: checkKey === 'consistency_check',
+    forcePage: checkKey === 'consistency_check',
     highlights: getFormatTenderHighlightPhrases(issue, checkKey),
   })
 }
@@ -2722,11 +2990,27 @@ function orderFormatReviewDocRefs(docRefs) {
   return tenderDocs.concat(businessDocs, otherDocs)
 }
 
+function getPersonnelResultConfirmationStatus(result) {
+  var configStatus = result && result.config && result.config.confirmation_status
+  var extractionStatus = result && result.personnel_extraction && result.personnel_extraction.confirmation_status
+  return String(configStatus || extractionStatus || '').toLowerCase()
+}
+
+function isPersonnelResultConfirmed(result) {
+  if (!result) return false
+  var status = getPersonnelResultConfirmationStatus(result)
+  if (status === 'confirmed') return true
+  if (status === 'pending' || status === 'draft') return false
+  if (result.config && result.config.confirmation_required) return false
+  return true
+}
+
 function collectPersonnelAlertsFromGroups(resultKey, result, allAlerts, options) {
   if (!result || (!result.groups && !isObject(result.combined_personnel_reuse_check))) return
   var opts = options || {}
+  var personnelConfirmed = isPersonnelResultConfirmed(result)
   var groupEntries = Object.entries(result.groups || {})
-  if (isObject(result.combined_personnel_reuse_check)) {
+  if (personnelConfirmed && isObject(result.combined_personnel_reuse_check)) {
     groupEntries = [[
       '全部投标文件',
       {
@@ -2741,10 +3025,11 @@ function collectPersonnelAlertsFromGroups(resultKey, result, allAlerts, options)
     var groupKey = entry[0]
     var groupValue = entry[1] || {}
     var check = getPersonnelCheckPayload(groupValue)
-    var items = getPersonnelIssueItems(check)
+    var items = personnelConfirmed ? getPersonnelIssueItems(check) : []
     var label = opts.resultTypeLabel || RESULT_TYPE_LABELS[resultKey] || resultKey
 
     if (items.length === 0) {
+      if (!personnelConfirmed) return
       var personnelDocuments = getPersonnelDocuments(check, groupValue)
       var allNames = collectPersonnelNamesFromCheck(check, groupValue)
       var personnelCount = firstAvailableCount(
@@ -2904,7 +3189,9 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
       issueEntries.forEach(function (issueEntry) {
         var issue = issueEntry.issue || {}
         var issueIndex = issueEntry.issueIndex
-        var isPassedItem = issueEntry.sourceStatus === 'passed'
+        var isPassedItem = issueEntry.sourceStatus === 'passed' || isExplicitPassFormatIssue(checkKey, issue)
+        var isVerificationMissingAttachment = checkKey === 'verification_check' &&
+          isVerificationMissingAttachmentIssue(issue)
         var isDeviationTableMissing = isDeviationTableMissingIssue(issue, checkKey)
         var formatLocations = collectFormatLocationValues(issue, checkKey)
         var page = extractFirstPage(issue) ||
@@ -2920,7 +3207,10 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
         sourceDocs = sourceDocs.map(function (doc) {
           return mergeDocumentCandidate(doc, bidderDocumentLookup)
         })
-        var bidFallbackPage = getFormatBidFallbackPage(issue, page)
+        var canUseConsistencyBidFallback = checkKey !== 'consistency_check' || hasBusinessFormatPreviewLocation(formatLocations)
+        var bidFallbackPage = canUseConsistencyBidFallback
+          ? getFormatBidFallbackPage(issue, page)
+          : null
         var docRefs = sourceDocs.map(function (doc, docIndex) {
           var sourceDocPage = extractFirstPage(doc)
           var locationPage = getPageForDocFromLocations(doc, formatLocations)
@@ -2939,7 +3229,11 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
             documentType: sourceDocIsTender ? 'tender' : (sourceDocIsTechnical ? 'technical_bid' : 'business_bid'),
           })
         }).filter(Boolean)
-        var formatTenderRefs = (isDeviationTableMissing || checkKey === 'verification_check' || checkKey === 'itemized_pricing_check') ? [] : buildFormatTenderHighlightDocRefs(issue, checkKey, {
+        var formatTenderRefs = (
+          isDeviationTableMissing ||
+          (checkKey === 'verification_check' && !isVerificationMissingAttachment) ||
+          checkKey === 'itemized_pricing_check'
+        ) ? [] : buildFormatTenderHighlightDocRefs(issue, checkKey, {
           documentLookup: bidderDocumentLookup,
         })
         if (checkKey === 'pricing_check' && formatTenderRefs.length === 0) {
@@ -2954,18 +3248,21 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
             docRefs = integrityMissingRefs
           } else if (formatTenderRefs.length > 0) {
             docRefs = formatTenderRefs.concat(docRefs.filter(function (doc) {
-              return !isTenderTemplateDoc(doc)
+              return !isDocCoveredByTenderRefs(doc, formatTenderRefs)
             }))
           }
         } else if (formatTenderRefs.length > 0) {
           docRefs = formatTenderRefs.concat(docRefs.filter(function (doc) {
-            return !isTenderTemplateDoc(doc)
+            return !isDocCoveredByTenderRefs(doc, formatTenderRefs)
           }))
         }
         docRefs = orderFormatReviewDocRefs(docRefs)
         var previewLocations = checkKey === 'verification_check' || checkKey === 'consistency_check'
           ? formatLocations.filter(function (location) { return getLocationDocumentRole(location) !== 'tender' })
           : formatLocations
+        if (checkKey === 'consistency_check') {
+          previewLocations = narrowConsistencyBidPreviewLocations(previewLocations, issue, bidFallbackPage)
+        }
         var issueLocationRefs = isDeviationTableMissing ? [] : buildIssueLocationDocRefs(issue, {
           locations: previewLocations,
           documentLookup: bidderDocumentLookup,
@@ -2989,7 +3286,7 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
             getFormatTenderFallbackPage(issue, checkKey, formatLocations, formatTenderRefs),
           )
         }
-        if (checkKey === 'verification_check' || checkKey === 'itemized_pricing_check') {
+        if ((checkKey === 'verification_check' && !isVerificationMissingAttachment) || checkKey === 'itemized_pricing_check') {
           docRefs = docRefs.filter(function (doc) { return !isTenderTemplateDoc(doc) })
         }
         docRefs = orderFormatReviewDocRefs(docRefs)
@@ -3001,7 +3298,7 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
         var riskLevel = issueEntry.sourceStatus === 'passed'
           ? 'none'
           : normalizeRiskLevel(issue.severity || issue.status || reviewStatus)
-        var overviewDocuments = isDeviationTableMissing
+        var overviewDocuments = (isDeviationTableMissing || isVerificationMissingAttachment)
           ? docRefs
           : buildFormatOverviewDocuments(bidder, bidderDocumentLookup, docRefs, previewPage)
         var alertTitle = checkKey === 'pricing_check' && issue.title === '报价合理性'
@@ -3009,15 +3306,17 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
           : checkLabel + '：' + (issue.title || (isPassedItem ? '已符合要求' : '待确定'))
         var alertDescription = issue.message || (check.review && check.review.summary) || (isPassedItem ? '系统审查通过，关键内容已匹配' : '发现需复核项')
 
+        alertDescription = getFormatIssueMessage(checkKey, issue, alertDescription)
+
         var alert = {
           id: makeAlertId(issueEntry.idPrefix, bidder.bidder_key || bidder.bidder_name || bidderIndex, checkKey, issue.title, issueIndex),
-          resultType: issueEntry.resultType,
+          resultType: isPassedItem ? passedResultType : issueEntry.resultType,
           sourceResultKey: sourceResultKey,
           subType: checkKey,
           formatOverviewOrder: getFormatOverviewCheckOrder(checkKey),
           formatOverviewLabel: FORMAT_OVERVIEW_CHECK_LABELS[checkKey] || checkLabel,
-          resultTypeLabel: issueEntry.resultTypeLabel,
-          sourceStatus: issueEntry.sourceStatus,
+          resultTypeLabel: isPassedItem ? (opts.passedResultTypeLabel || RESULT_TYPE_LABELS[passedResultType]) : issueEntry.resultTypeLabel,
+          sourceStatus: isPassedItem ? 'passed' : issueEntry.sourceStatus,
           bidderKey: bidder.bidder_key,
           bidderName: bidder.bidder_name,
           manualStatusPath: 'bidders[' + bidderIndex + '].checks.' + checkKey + '.review.status',
@@ -3141,10 +3440,53 @@ function scopePreviewDocsToAlert(alert, docs) {
   })
 }
 
+function patchConsistencyTemplatePreviewDocs(alert, docs) {
+  if (!alert ||
+    alert.sourceResultKey !== FORMAT_REVIEW_RESULT_KEY ||
+    alert.subType !== 'consistency_check') {
+    return docs
+  }
+
+  var issue = alert.sourceItem || (alert.evidence && alert.evidence.issue) || null
+  var templateLocations = collectConsistencyTemplateLocationValues(issue)
+  var templatePage = extractFirstPage(templateLocations[0])
+  if (!templatePage) return docs
+
+  var tenderDoc = arrayify(docs).find(isTenderTemplateDoc) ||
+    arrayify(alert.documents).find(isTenderTemplateDoc)
+  if (!tenderDoc) return docs
+
+  var pageLocations = templateLocations.filter(function (location) {
+    var locationPage = extractFirstPage(location)
+    return !locationPage || Number(locationPage) === Number(templatePage)
+  })
+  var rects = pageLocations.map(locationBboxToRect).filter(Boolean)
+  var patchedTenderDoc = normalizeDocRef(Object.assign({}, tenderDoc, {
+    page: templatePage,
+    startPage: templatePage,
+    targetPages: [templatePage],
+    lockStartPage: true,
+    forcePage: true,
+    docKey: (tenderDoc.docId || tenderDoc.fileName || tenderDoc.label || 'consistency-template') + '#template-p' + templatePage,
+    highlight: collectHighlightPhrases(tenderDoc.highlight, pageLocations.map(function (location) {
+      return location && location.text
+    })),
+    highlightBbox: rects[0] || tenderDoc.highlightBbox,
+    highlightRects: rects.length > 0 ? rects : tenderDoc.highlightRects,
+    highlightPageRects: rects.length > 0 ? makeHighlightPageRects(templatePage, rects) : tenderDoc.highlightPageRects,
+  }), { page: templatePage, forcePage: true })
+
+  if (!patchedTenderDoc) return docs
+  return [patchedTenderDoc].concat(arrayify(docs).filter(function (doc) {
+    return !isTenderTemplateDoc(doc)
+  }))
+}
+
 // Extract document list from an alert for PDF preview rendering
 function getAlertDocIds(alert) {
   if (alert && alert.documents && alert.documents.length > 0) {
-    return scopePreviewDocsToAlert(alert, mergePreviewDocsByFile(orderFormatReviewDocRefs(alert.documents)))
+    var alertDocs = mergePreviewDocsByFile(orderFormatReviewDocRefs(alert.documents))
+    return scopePreviewDocsToAlert(alert, patchConsistencyTemplatePreviewDocs(alert, alertDocs))
   }
 
   var docs = []
@@ -3746,6 +4088,12 @@ function sortAlertsForResultType(resultType, alerts) {
     : sortAlertsForDisplay(alerts)
 }
 
+function getAlertsForResultType(resultType, alerts) {
+  return arrayify(alerts).filter(function (alert) {
+    return matchesResultTypeFilter(alert, resultType)
+  })
+}
+
 function buildFormatOverviewFileGroups(alerts) {
   var groups = {}
   var order = []
@@ -3962,7 +4310,7 @@ export default function ReviewPage() {
 
   // Compute alerts for current service type
   var serviceAlerts = currentServiceType
-    ? sortAlertsForResultType(currentServiceType, allAlerts.filter(function (a) { return a.resultType === currentServiceType }))
+    ? sortAlertsForResultType(currentServiceType, getAlertsForResultType(currentServiceType, allAlerts))
     : []
 
   var currentAlert = serviceAlerts[currentAlertIndex] || null
@@ -4143,16 +4491,15 @@ export default function ReviewPage() {
     setPreviewErrors({})
   }
 
-  function openAlertFromOverview(alert) {
+  function openAlertFromOverview(alert, preferredResultType) {
     if (!alert) return
-    var sortedAlerts = sortAlertsForResultType(alert.resultType, allAlerts.filter(function (item) {
-      return item.resultType === alert.resultType
-    }))
+    var targetResultType = preferredResultType || alert.resultType
+    var sortedAlerts = sortAlertsForResultType(targetResultType, getAlertsForResultType(targetResultType, allAlerts))
     var targetIndex = sortedAlerts.findIndex(function (item) {
       return item.id === alert.id
     })
 
-    setCurrentServiceType(alert.resultType)
+    setCurrentServiceType(targetResultType)
     setCurrentAlertIndex(targetIndex >= 0 ? targetIndex : 0)
     setPreviewData({})
     setPreviewPages({})
@@ -4886,8 +5233,8 @@ export default function ReviewPage() {
     }
   })
   var resultTypeCounts = {}
-  allAlerts.forEach(function (alert) {
-    resultTypeCounts[alert.resultType] = (resultTypeCounts[alert.resultType] || 0) + 1
+  getOverviewResultKeys(results, resultTypeKeys).forEach(function (key) {
+    resultTypeCounts[key] = getAlertsForResultType(key, allAlerts).length
   })
 
   var reviewedCount = allAlerts.filter(function (alert) { return reviewStatus[alert.id] }).length
@@ -4912,7 +5259,7 @@ export default function ReviewPage() {
   var projectTitle = getProjectTitle(projectDetail, currentProject, selectedProjectId)
   var projectFiles = getProjectOverviewFiles(projectDetail)
   var overviewSections = overviewResultKeys.map(function (key) {
-    var sectionAlerts = allAlerts.filter(function (alert) { return alert.resultType === key })
+    var sectionAlerts = getAlertsForResultType(key, allAlerts)
     return {
       key: key,
       label: RESULT_TYPE_LABELS[key] || key,
@@ -4998,7 +5345,7 @@ export default function ReviewPage() {
     setOverviewFormatFilePage(sectionKey, targetIndex, fileGroups.length)
   }
 
-  function renderOverviewRows(alerts, emptyText) {
+  function renderOverviewRows(alerts, emptyText, preferredResultType) {
     return arrayify(alerts).length === 0 ? (
       <tr>
         <td colSpan={6} className="overview-empty-cell">{emptyText}</td>
@@ -5041,7 +5388,7 @@ export default function ReviewPage() {
             <button
               type="button"
               className="ghost-button overview-open-button"
-              onClick={function () { openAlertFromOverview(alert) }}
+              onClick={function () { openAlertFromOverview(alert, preferredResultType) }}
             >
               查看
             </button>
@@ -5051,7 +5398,7 @@ export default function ReviewPage() {
     })
   }
 
-  function renderOverviewTable(alerts, emptyText) {
+  function renderOverviewTable(alerts, emptyText, preferredResultType) {
     return (
       <div className="overview-table-wrap">
         <table className="overview-table">
@@ -5066,7 +5413,7 @@ export default function ReviewPage() {
             </tr>
           </thead>
           <tbody>
-            {renderOverviewRows(alerts, emptyText)}
+            {renderOverviewRows(alerts, emptyText, preferredResultType)}
           </tbody>
         </table>
       </div>
@@ -5075,10 +5422,10 @@ export default function ReviewPage() {
 
   function renderFormatOverviewFileGroups(section) {
     var fallbackEmptyText = section.key === FORMAT_REVIEW_PASSED_RESULT_KEY ? '暂无形式审查通过项' : '未发现该类问题'
-    if (section.alerts.length === 0) return renderOverviewTable([], fallbackEmptyText)
+    if (section.alerts.length === 0) return renderOverviewTable([], fallbackEmptyText, section.key)
 
     var fileGroups = buildFormatOverviewFileGroups(section.alerts)
-    if (fileGroups.length === 0) return renderOverviewTable([], fallbackEmptyText)
+    if (fileGroups.length === 0) return renderOverviewTable([], fallbackEmptyText, section.key)
 
     var rawFileIndex = Number(overviewFilePages[section.key] || 0)
     var activeFileIndex = Number.isFinite(rawFileIndex) ? rawFileIndex : 0
@@ -5182,7 +5529,7 @@ export default function ReviewPage() {
               </div>
             </div>
           </div>
-          {renderOverviewTable(filteredAlerts, emptyText)}
+          {renderOverviewTable(filteredAlerts, emptyText, section.key)}
         </div>
       </>
     )
@@ -5199,7 +5546,11 @@ export default function ReviewPage() {
     var errorMessage = activeDocInfo ? previewErrors[activeDocKey] : ''
     var personnelResult = results && results.personnel_reuse_check
     var combinedCheck = personnelResult && personnelResult.combined_personnel_reuse_check
-    var duplicateIssues = arrayify(combinedCheck && combinedCheck.issues)
+    var personnelConfirmed = isPersonnelResultConfirmed(personnelResult)
+    var duplicateIssues = personnelConfirmed ? arrayify(combinedCheck && combinedCheck.issues) : []
+    var duplicateEmptyTitle = personnelConfirmed
+      ? '确认后未发现跨文件重名'
+      : '尚未确认名单，未执行重名检查'
 
     return (
       <div className="personnel-review-workspace">
@@ -5420,7 +5771,7 @@ export default function ReviewPage() {
             <span>{duplicateIssues.length} 项</span>
           </div>
           {duplicateIssues.length === 0 ? (
-            <EmptyBlock title="确认后未发现跨文件重名，或尚未确认名单" />
+            <EmptyBlock title={duplicateEmptyTitle} />
           ) : (
             <div className="personnel-duplicate-list">
               {duplicateIssues.map(function (issue, index) {
@@ -5712,7 +6063,7 @@ export default function ReviewPage() {
                                         <button
                                           type="button"
                                           className="ghost-button overview-open-button"
-                                          onClick={function () { openAlertFromOverview(alert) }}
+                                          onClick={function () { openAlertFromOverview(alert, section.key) }}
                                         >
                                           查看
                                         </button>
