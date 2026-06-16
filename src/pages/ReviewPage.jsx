@@ -4400,6 +4400,11 @@ export default function ReviewPage() {
       return alert.sourceStatus === 'passed'
     }))
   var currentAlertIsPassedItem = currentAlert && currentAlert.sourceStatus === 'passed'
+  // 「保留当前问题项目」的目标：通过项列表里是全部；普通列表里只取问题项（不通过），
+  // 已被人为改判为有误（已选中）的符合项保持原有选择，不在此被排除。
+  var selectAllTargetAlerts = currentServiceIsPassedList
+    ? serviceAlerts
+    : serviceAlerts.filter(function (alert) { return alert.sourceStatus !== 'passed' })
 
   useEffect(function () {
     if (!currentServiceType || serviceAlerts.length === 0) {
@@ -4848,21 +4853,22 @@ export default function ReviewPage() {
   // Select/deselect all alerts in current service type
   function toggleSelectAllCurrent() {
     if (!currentServiceType) return
-    var allSelected = serviceAlerts.length > 0 && serviceAlerts.every(function (a) { return selectedAlerts.has(a.id) })
+    var targetAlerts = selectAllTargetAlerts
+    var allSelected = targetAlerts.length > 0 && targetAlerts.every(function (a) { return selectedAlerts.has(a.id) })
     setSelectedAlerts(function (prev) {
       if (allSelected) {
         var deselected = new Set(prev)
-        serviceAlerts.forEach(function (a) { deselected.delete(a.id) })
+        targetAlerts.forEach(function (a) { deselected.delete(a.id) })
         return deselected
       }
       var selected = new Set(prev)
-      serviceAlerts.forEach(function (a) { selected.add(a.id) })
+      targetAlerts.forEach(function (a) { selected.add(a.id) })
       return selected
     })
     setReviewStatus(function (current) {
       var statusMap = {}
       for (var key in current) { statusMap[key] = current[key] }
-      serviceAlerts.forEach(function (alert) {
+      targetAlerts.forEach(function (alert) {
         statusMap[alert.id] = {
           status: allSelected ? 'passed' : 'flagged',
           reviewedAt: new Date().toISOString(),
@@ -5997,10 +6003,10 @@ export default function ReviewPage() {
                 <label className="checkbox-label">
                   <input
                     type="checkbox"
-                    checked={serviceAlerts.length > 0 && serviceAlerts.every(function (a) { return selectedAlerts.has(a.id) })}
+                    checked={selectAllTargetAlerts.length > 0 && selectAllTargetAlerts.every(function (a) { return selectedAlerts.has(a.id) })}
                     onChange={toggleSelectAllCurrent}
                   />
-                  <span>{currentServiceIsPassedList ? '当前全部归为有错误项' : '保留当前全部'}</span>
+                  <span>{currentServiceIsPassedList ? '当前全部归为有错误项' : '保留当前问题项目'}</span>
                 </label>
               </div>
             ) : null}

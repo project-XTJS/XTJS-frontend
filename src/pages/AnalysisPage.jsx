@@ -72,9 +72,9 @@ const ANALYSIS_TYPES = [
     key: 'businessBidDuplicateCheck',
     label: '\u5546\u52a1\u6807\u67e5\u91cd',
     icon: '\uD83D\uDCC4',
-    description: '\u53ea\u67e5\u5546\u52a1\u6807\u8303\u56f4\uff0c\u5305\u62ec\u5546\u52a1\u5206\u9879\u62a5\u4ef7\u548c\u5546\u52a1\u504f\u79bb/\u54cd\u5e94\u5185\u5bb9',
+    description: '\u67e5\u5546\u52a1\u5206\u9879\u62a5\u4ef7\u548c\u5546\u52a1/\u6280\u672f\u504f\u79bb\uff1b\u6280\u672f\u504f\u79bb\u8868\u5728\u5546\u52a1\u6807\u672a\u627e\u5230\u65f6\u4f1a\u56de\u9000\u5230\u6280\u672f\u6807\u67e5\u627e',
     services: ['business_bid_duplicate_check'],
-    requiredParsingStatus: PARSING_STATUS_BUSINESS_READY,
+    requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
     stage: 'duplicate',
   },
   {
@@ -1166,7 +1166,7 @@ export default function AnalysisPage() {
                 <span className="analysis-card-icon">{analysisType.icon}</span>
                 <div>
                   <strong>{analysisType.label}</strong>
-                  {getAnalysisStatusIcon(status, suspiciousCount) ? (
+                  {!disabled && getAnalysisStatusIcon(status, suspiciousCount) ? (
                     <span
                       className={`analysis-status-icon ${status === 'success' && suspiciousCount > 0 ? 'analysis-status-warning' : ''}`}
                     >
@@ -1182,7 +1182,7 @@ export default function AnalysisPage() {
                 <span className="analysis-card-hint">{disabledHint}</span>
               ) : null}
 
-              {status === 'success' && result ? (
+              {!disabled && status === 'success' && result ? (
                 <div className="analysis-card-result">
                   <span>
                     共检查 {result.summary?.document_count ?? '--'} 份文档
@@ -1204,7 +1204,7 @@ export default function AnalysisPage() {
                 </div>
               ) : null}
 
-              {status === 'success' && selectedProjectId ? (
+              {!disabled && status === 'success' && selectedProjectId ? (
                 <div className="analysis-card-actions">
                   <a
                     href={`#/review?projectId=${selectedProjectId}`}
