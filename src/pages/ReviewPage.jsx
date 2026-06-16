@@ -52,14 +52,12 @@ var OVERVIEW_RESULT_ORDER = [
   'business_bid_format_review',
   'deviation_check',
   'business_bid_duplicate_check',
-  'business_itemized_duplicate_check',
   'technical_bid_duplicate_check',
   'personnel_reuse_check',
 ]
 
 var FORMAT_REVIEW_RESULT_KEY = 'business_bid_format_review'
 var FORMAT_REVIEW_PASSED_RESULT_KEY = 'business_bid_format_review_passed'
-var BUSINESS_ITEMIZED_DUPLICATE_RESULT_KEY = 'business_itemized_duplicate_check'
 var ISSUE_SNIPPET_LIMIT = 200
 
 var FORMAT_CHECK_LABELS = {
@@ -576,117 +574,10 @@ function isDuplicateIssueVisible(item) {
   return Boolean(item) && riskLevel !== '' && riskLevel !== 'none'
 }
 
-function normalizeDuplicateSubtypeText(value) {
-  return String(value || '')
-    .toLowerCase()
-    .replace(/\s+/g, '')
-    .replace(/\[/g, '')
-    .replace(/]/g, '')
-    .replace(/[()（）【】<>《》:：\-—_、,，。；;|/\\]/g, '')
-}
-
-function isItemizedDuplicateTitle(text) {
-  var compact = normalizeDuplicateSubtypeText(text)
-  if (!compact) return false
-  return compact.indexOf('分项报价表') >= 0 ||
-    compact.indexOf('分项报价') >= 0 ||
-    compact.indexOf('报价明细表') >= 0 ||
-    compact.indexOf('已标价工程量清单') >= 0 ||
-    compact.indexOf('工程量清单') >= 0
-}
-
-function isItemizedDuplicateRows(rows) {
-  var compact = normalizeDuplicateSubtypeText(arrayify(rows).join(' '))
-  if (!compact) return false
-
-  var headerTokens = [
-    '单位工程名称',
-    '项目名称',
-    '规格型号',
-    '数量',
-    '单位',
-    '单价',
-    '总价',
-    '合计',
-    '金额',
-    '税率',
-    '下浮率',
-  ]
-  var hits = headerTokens.filter(function (token) {
-    return compact.indexOf(normalizeDuplicateSubtypeText(token)) >= 0
-  }).length
-  var hasPriceAxis = ['单价', '总价', '合计', '金额', '税率', '下浮率'].some(function (token) {
-    return compact.indexOf(normalizeDuplicateSubtypeText(token)) >= 0
-  })
-  var hasQuantityAxis = ['数量', '单位'].some(function (token) {
-    return compact.indexOf(normalizeDuplicateSubtypeText(token)) >= 0
-  })
-  return hits >= 3 && hasPriceAxis && hasQuantityAxis
-}
-
-function duplicateItemLooksItemized(value) {
-  var found = false
-
-  function collect(node) {
-    if (found || !node) return
-    if (Array.isArray(node)) {
-      node.forEach(collect)
-      return
-    }
-    if (!isObject(node)) {
-      if (isItemizedDuplicateTitle(node)) found = true
-      return
-    }
-
-    var nodeSource = normalizeDuplicateSubtypeText(
-      node.source ||
-      node.kind ||
-      node.type
-    )
-    if (nodeSource.indexOf('itemizedpricing') >= 0) {
-      found = true
-      return
-    }
-
-    if (
-      isItemizedDuplicateTitle(node.left_title) ||
-      isItemizedDuplicateTitle(node.right_title) ||
-      isItemizedDuplicateTitle(node.title)
-    ) {
-      found = true
-      return
-    }
-
-    if (
-      isItemizedDuplicateRows(node.left_rows) ||
-      isItemizedDuplicateRows(node.right_rows) ||
-      isItemizedDuplicateRows(node.sample_rows) ||
-      isItemizedDuplicateRows(node.left_sample_rows) ||
-      isItemizedDuplicateRows(node.right_sample_rows)
-    ) {
-      found = true
-      return
-    }
-
-    Object.keys(node).forEach(function (key) {
-      if (found) return
-      if (['left_title', 'right_title', 'title', 'left_rows', 'right_rows', 'sample_rows', 'left_sample_rows', 'right_sample_rows'].indexOf(key) >= 0) {
-        return
-      }
-      collect(node[key])
-    })
-  }
-
-  collect(value)
-  return found
-}
-
-function getDuplicateAlertResultType(resultKey, item) {
-  if (
-    resultKey === 'business_bid_duplicate_check' &&
-    duplicateItemLooksItemized(item)
-  ) {
-    return BUSINESS_ITEMIZED_DUPLICATE_RESULT_KEY
+function getDuplicateAlertResultType(resultKey) {
+  // 分项报价表查重并入「商务标查重」，不再单独成类
+  if (resultKey === 'business_itemized_duplicate_check') {
+    return 'business_bid_duplicate_check'
   }
   return resultKey
 }
@@ -829,6 +720,43 @@ function getDuplicateClusterRangeStarts(cluster, fileName) {
   return pages.sort(function (a, b) { return Number(a) - Number(b) })
 }
 
+function getDuplicateRangeBounds(range) {
+  if (!range) return { start: null, end: null }
+  if (Array.isArray(range)) {
+    var first = getFirstNumber(range[0])
+    var last = getFirstNumber(range[range.length - 1])
+    return { start: first || null, end: last || first || null }
+  }
+  var start = getFirstNumber(range.start_page) ||
+    getFirstNumber(range.startPage) ||
+    getFirstNumber(range.page) ||
+    getFirstNumber(range.pages)
+  var end = getFirstNumber(range.end_page) || getFirstNumber(range.endPage)
+  if (start && (!end || Number(end) < Number(start))) end = start
+  return { start: start || null, end: end || null }
+}
+
+function formatDuplicateRangeLabel(bounds) {
+  if (!bounds || !bounds.start) return ''
+  if (!bounds.end || Number(bounds.end) === Number(bounds.start)) return '第 ' + bounds.start + ' 页'
+  return '第 ' + bounds.start + '–' + bounds.end + ' 页'
+}
+
+function getDuplicateClusterRangePages(cluster, fileName) {
+  var ranges = cluster.doc_ranges_by_file && cluster.doc_ranges_by_file[fileName]
+  var pages = []
+
+  arrayify(ranges).forEach(function (range) {
+    var bounds = getDuplicateRangeBounds(range)
+    if (!bounds.start) return
+    for (var page = Number(bounds.start); page <= Number(bounds.end); page += 1) {
+      if (pages.indexOf(page) < 0) pages.push(page)
+    }
+  })
+
+  return pages.sort(function (a, b) { return Number(a) - Number(b) })
+}
+
 function chooseDuplicateClusterPage(cluster, group) {
   var scored = group.locations.map(function (location) {
     return {
@@ -934,11 +862,22 @@ function buildDuplicateClusterDocs(cluster) {
     var docId = locationWithId && (locationWithId.document_identifier_id || locationWithId.identifier_id)
     var previews = cluster.doc_previews_by_file && cluster.doc_previews_by_file[fileName]
 
+    // 定位覆盖整段：range 全部页码 ∪ 各 location 页码 ∪ 首屏起始页
+    var locationPages = group.locations.map(function (location) {
+      return getFirstNumber(extractFirstPage(location))
+    }).filter(Boolean)
+    var targetPages = [Number(page)]
+      .concat(getDuplicateClusterRangePages(cluster, fileName), locationPages)
+      .filter(Boolean)
+      .filter(function (value, valueIndex, list) { return list.indexOf(value) === valueIndex })
+      .sort(function (a, b) { return Number(a) - Number(b) })
+
     return normalizeDocRef({
       identifier_id: docId,
       file_name: fileName,
       file_url: getDuplicateClusterFileUrl(cluster, fileName),
       page: page,
+      target_pages: targetPages,
       docKey: (docId || fileName || 'duplicate-cluster-doc') + '#cluster-' + index + '-' + page,
       highlight: collectHighlightPhrases(cluster.tokens, cluster.title, previews, locations),
       highlightBbox: rects[0],
@@ -1012,15 +951,31 @@ function buildDuplicateEvidenceRows(cluster) {
   arrayify(cluster && cluster.occurrences).forEach(function (occurrence, index) {
     if (!isObject(occurrence)) return
     var entries = getDuplicateOccurrenceDocEntries(cluster, occurrence)
+    // 收集该 occurrence 涉及的全部文件（不止前两份）
+    var docs = entries.map(function (entry, entryIndex) {
+      var side = entryIndex === 0 ? 'left' : entryIndex === 1 ? 'right' : ''
+      return {
+        file_name: entry.fileName,
+        page: getDuplicateOccurrenceSidePage(occurrence, entry, side),
+        text: getDuplicateOccurrenceSideText(occurrence, entry, side),
+      }
+    }).filter(function (doc) {
+      return doc.file_name || doc.text
+    })
+
     var leftEntry = entries[0] || {}
     var rightEntry = entries[1] || {}
     var leftText = getDuplicateOccurrenceSideText(occurrence, leftEntry, 'left')
     var rightText = getDuplicateOccurrenceSideText(occurrence, rightEntry, 'right')
     var primaryText = firstTextValue(leftText, rightText)
-    if (!primaryText && !rightText) return
+    var hasText = Boolean(primaryText) || Boolean(rightText) || docs.some(function (doc) {
+      return Boolean(doc.text)
+    })
+    if (!hasText) return
 
     rows.push({
       kind: duplicateOccurrenceIsSimilar(occurrence, cluster) ? 'similar' : 'duplicate',
+      docs: docs,
       left_file_name: leftEntry.fileName,
       right_file_name: rightEntry.fileName,
       left_page: getDuplicateOccurrenceSidePage(occurrence, leftEntry, 'left'),
@@ -1080,7 +1035,64 @@ function getAlertDuplicateEvidenceRows(alert) {
   }))
 }
 
+function getDuplicateTypoIssues(alert) {
+  var evidence = (alert && alert.evidence) || {}
+  var fromAlert = arrayify(evidence.shortDuplicateTypoIssues)
+  if (fromAlert.length > 0) return fromAlert
+  var cluster = evidence.cluster
+  return arrayify(cluster && cluster.short_duplicate_typo_issues)
+}
+
+function getTypoTermsFromIssues(issues) {
+  var terms = []
+  arrayify(issues).forEach(function (issue) {
+    var term = String((issue && (issue.highlight_text || issue.matched_text)) || '').trim()
+    if (term && terms.indexOf(term) < 0) terms.push(term)
+  })
+  // 长词优先，避免短词先匹配把长词截断
+  return terms.sort(function (a, b) { return b.length - a.length })
+}
+
+function renderTypoText(text, terms, keyPrefix) {
+  var str = String(text === undefined || text === null ? '' : text)
+  if (!str) return str
+  var valid = arrayify(terms).filter(Boolean)
+  if (valid.length === 0) return str
+  var escaped = valid.map(function (term) { return String(term).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') })
+  var pattern = new RegExp('(' + escaped.join('|') + ')')
+  return str.split(pattern).map(function (segment, index) {
+    if (segment && valid.indexOf(segment) >= 0) {
+      return <span className="typo-highlight" key={(keyPrefix || 'typo') + '-' + index}>{segment}</span>
+    }
+    return <span key={(keyPrefix || 'seg') + '-' + index}>{segment}</span>
+  })
+}
+
+function renderDuplicateTypoSummary(issues) {
+  var list = arrayify(issues).filter(function (issue) {
+    return issue && (issue.matched_text || issue.highlight_text)
+  })
+  if (list.length === 0) return null
+  return (
+    <div className="duplicate-typo-summary">
+      <strong>疑似错别字（{list.length}）：</strong>
+      {list.map(function (issue, index) {
+        var wrong = String(issue.highlight_text || issue.matched_text || '').trim()
+        var suggestion = String(issue.suggestion || '').trim()
+        return (
+          <span className="duplicate-typo-chip" key={'typo-chip-' + index}>
+            <span className="typo-highlight">{wrong}</span>
+            {suggestion ? ' → ' + suggestion : ''}
+          </span>
+        )
+      })}
+    </div>
+  )
+}
+
 function renderDuplicateEvidenceRows(alert) {
+  var typoIssues = getDuplicateTypoIssues(alert)
+  var typoTerms = getTypoTermsFromIssues(typoIssues)
   var cluster = alert && alert.evidence && alert.evidence.cluster
   if (isObject(cluster) && isObject(cluster.doc_previews_by_file)) {
     var files = arrayify(cluster.files)
@@ -1089,22 +1101,40 @@ function renderDuplicateEvidenceRows(alert) {
     })
     return (
       <div className="duplicate-evidence-list duplicate-cluster-evidence-list">
+        {renderDuplicateTypoSummary(typoIssues)}
         {files.map(function (fileName, fileIndex) {
           var previews = arrayify(cluster.doc_previews_by_file[fileName])
           var ranges = arrayify(cluster.doc_ranges_by_file && cluster.doc_ranges_by_file[fileName])
+          var rangeBounds = ranges.map(getDuplicateRangeBounds).filter(function (bounds) { return bounds.start })
+          var totalPages = getDuplicateClusterRangePages(cluster, fileName).length
+          var rangeText = rangeBounds.map(formatDuplicateRangeLabel).join('、')
+          var canSegment = ranges.length > 1 && previews.length === ranges.length
           return (
             <div key={'dup-cluster-file-' + fileName} className="diff-block">
               <span className="diff-block-page">
-                {fileIndex + 1}. {fileName}{ranges.length > 0 ? ' / ' + ranges.map(function (range) {
-                  var start = range.start_page || range.startPage || range.page
-                  var end = range.end_page || range.endPage
-                  return start && end && start !== end ? 'P' + start + '-P' + end : (start ? 'P' + start : '')
-                }).filter(Boolean).join('、') : ''}
+                {fileIndex + 1}. {fileName}
+                {rangeText ? ' / ' + rangeText + (totalPages > 1 ? '（共 ' + totalPages + ' 页）' : '') : ''}
               </span>
-              {previews.length > 0 ? previews.map(function (preview, previewIndex) {
-                return <IssueSnippet as="p" text={preview} key={'dup-preview-' + previewIndex} threshold={600} defaultExpanded />
-              }) : (
+              {previews.length === 0 ? (
                 <span className="overview-muted">暂无聚合文本</span>
+              ) : canSegment ? (
+                previews.map(function (preview, previewIndex) {
+                  var segLabel = formatDuplicateRangeLabel(getDuplicateRangeBounds(ranges[previewIndex])) || ('第 ' + (previewIndex + 1) + ' 段')
+                  return (
+                    <div className="duplicate-segment" key={'dup-seg-' + previewIndex}>
+                      <span className="duplicate-segment-label">{segLabel}</span>
+                      <p className="duplicate-preview-text">{renderTypoText(preview, typoTerms, 'seg-' + fileIndex + '-' + previewIndex)}</p>
+                    </div>
+                  )
+                })
+              ) : (
+                previews.map(function (preview, previewIndex) {
+                  return (
+                    <p className="duplicate-preview-text" key={'dup-preview-' + previewIndex}>
+                      {renderTypoText(preview, typoTerms, 'prev-' + fileIndex + '-' + previewIndex)}
+                    </p>
+                  )
+                })
               )}
             </div>
           )
@@ -1118,8 +1148,29 @@ function renderDuplicateEvidenceRows(alert) {
 
   return (
     <div className="duplicate-evidence-list">
+      {renderDuplicateTypoSummary(typoIssues)}
       {rows.map(function (row, index) {
         var isSimilar = row.kind === 'similar'
+        var rowDocs = arrayify(row.docs)
+        if (rowDocs.length > 2) {
+          return (
+            <div key={'dup-row-' + index} className={isSimilar ? 'diff-block diff-block-similar' : 'diff-block'}>
+              <span className="diff-block-page">
+                问题 {index + 1} / 共 {rowDocs.length} 份文件
+              </span>
+              {rowDocs.map(function (doc, docIndex) {
+                return (
+                  <div className="duplicate-doc-line" key={'dup-doc-' + docIndex}>
+                    <span className="diff-block-page">
+                      {docIndex + 1}. {doc.file_name || '关联文件'} / 第 {doc.page || '--'} 页
+                    </span>
+                    <p className="duplicate-preview-text">{renderTypoText(doc.text || '', typoTerms, 'rowdoc-' + index + '-' + docIndex)}</p>
+                  </div>
+                )
+              })}
+            </div>
+          )
+        }
         return (
           <div key={'dup-row-' + index} className={isSimilar ? 'diff-block diff-block-similar' : 'diff-block'}>
             <span className="diff-block-page">
@@ -1127,11 +1178,11 @@ function renderDuplicateEvidenceRows(alert) {
             </span>
             {isSimilar ? (
               <>
-                <IssueSnippet as="p" text={'L: ' + (row.left_text || row.text || '')} />
-                <IssueSnippet as="p" text={'R: ' + (row.right_text || '')} />
+                <p className="duplicate-preview-text">{renderTypoText('L: ' + (row.left_text || row.text || ''), typoTerms, 'rowL-' + index)}</p>
+                <p className="duplicate-preview-text">{renderTypoText('R: ' + (row.right_text || ''), typoTerms, 'rowR-' + index)}</p>
               </>
             ) : (
-              <IssueSnippet as="p" text={row.text || row.left_text || row.right_text} />
+              <p className="duplicate-preview-text">{renderTypoText(row.text || row.left_text || row.right_text, typoTerms, 'row-' + index)}</p>
             )}
           </div>
         )
@@ -1143,6 +1194,8 @@ function renderDuplicateEvidenceRows(alert) {
 function collectDuplicateAlerts(results, allAlerts) {
   var duplicateKeys = []
   if (results.business_bid_duplicate_check) duplicateKeys.push('business_bid_duplicate_check')
+  // 后端若把分项报价表查重作为独立结果键返回，也一并读取并归入「商务标查重」
+  if (results.business_itemized_duplicate_check) duplicateKeys.push('business_itemized_duplicate_check')
   if (results.technical_bid_duplicate_check) duplicateKeys.push('technical_bid_duplicate_check')
 
   duplicateKeys.forEach(function (resultKey) {
@@ -1184,7 +1237,7 @@ function collectDuplicateAlerts(results, allAlerts) {
           '相似表格': item.metrics && item.metrics.similar_table_count,
           '重复字数': item.duplicate_text_length || item.metrics && item.metrics.duplicate_text_length,
           '上报规则': formatDuplicateReportReason(item.duplicate_report_reason),
-          '短文本错字': arrayify(item.short_duplicate_typo_issues).length || '',
+          '错别字': arrayify(item.short_duplicate_typo_issues).length || '',
         },
         evidence: {
           cluster: item,
@@ -4130,6 +4183,9 @@ export default function ReviewPage() {
   var [allAlerts, setAllAlerts] = useState([])
   var [currentServiceType, setCurrentServiceType] = useState(null)
   var [currentAlertIndex, setCurrentAlertIndex] = useState(0)
+  var [detailResultFilter, setDetailResultFilter] = useState('all')
+  var [detailFileFilter, setDetailFileFilter] = useState('all')
+  var [detailCheckFilter, setDetailCheckFilter] = useState('all')
   var [alertJumpInput, setAlertJumpInput] = useState('')
   var [reviewStatus, setReviewStatus] = useState({})
   var [reviewNotes, setReviewNotes] = useState({})
@@ -4309,9 +4365,26 @@ export default function ReviewPage() {
   }
 
   // Compute alerts for current service type
-  var serviceAlerts = currentServiceType
+  var baseServiceAlerts = currentServiceType
     ? sortAlertsForResultType(currentServiceType, getAlertsForResultType(currentServiceType, allAlerts))
     : []
+  var isFormatDetailService = isFormatReviewResultType(currentServiceType)
+  // 文件筛选（仅商务标形式审查等格式审查类型按文件分组）
+  var detailFileGroups = isFormatDetailService ? buildFormatOverviewFileGroups(baseServiceAlerts) : []
+  var fileFilteredAlerts = (isFormatDetailService && detailFileFilter !== 'all')
+    ? baseServiceAlerts.filter(function (alert) {
+        return getFormatOverviewSortInfo(alert).fileKey === detailFileFilter
+      })
+    : baseServiceAlerts
+  // 检查项筛选（完整性/一致性/报价合理性/分项报价表/签字盖章）
+  var detailCheckCounts = getReviewCheckFilterCounts(fileFilteredAlerts)
+  var checkFilteredAlerts = isFormatDetailService
+    ? filterReviewAlertsByCheck(fileFilteredAlerts, detailCheckFilter)
+    : fileFilteredAlerts
+  // 结果筛选（全部/通过/不通过）
+  var detailResultCounts = getReviewResultFilterCounts(checkFilteredAlerts)
+  var serviceAlerts = filterReviewAlertsByResult(checkFilteredAlerts, detailResultFilter)
+  var hasActiveDetailFilter = detailResultFilter !== 'all' || detailFileFilter !== 'all' || detailCheckFilter !== 'all'
 
   var currentAlert = serviceAlerts[currentAlertIndex] || null
   var personnelCompanyGroups = getPersonnelDraftCompanyGroups(personnelDraftDocuments)
@@ -4323,7 +4396,7 @@ export default function ReviewPage() {
     return String(getPersonnelDraftDocKey(doc) || '') === String(personnelActiveDocKey || '')
   }) || getDefaultPersonnelCompanyDocument(personnelActiveCompany)
   var currentServiceIsPassedList = currentServiceType === FORMAT_REVIEW_PASSED_RESULT_KEY ||
-    (serviceAlerts.length > 0 && serviceAlerts.every(function (alert) {
+    (baseServiceAlerts.length > 0 && baseServiceAlerts.every(function (alert) {
       return alert.sourceStatus === 'passed'
     }))
   var currentAlertIsPassedItem = currentAlert && currentAlert.sourceStatus === 'passed'
@@ -4478,6 +4551,9 @@ export default function ReviewPage() {
   function selectServiceType(key) {
     setCurrentServiceType(key)
     setCurrentAlertIndex(0)
+    setDetailResultFilter('all')
+    setDetailFileFilter('all')
+    setDetailCheckFilter('all')
     if (key === 'personnel_reuse_check' && personnelActiveCompany) {
       setPersonnelActiveBidderKey(personnelActiveCompany.key || '')
       var nextPersonnelDoc = personnelActiveDocument || getDefaultPersonnelCompanyDocument(personnelActiveCompany)
@@ -4501,11 +4577,41 @@ export default function ReviewPage() {
 
     setCurrentServiceType(targetResultType)
     setCurrentAlertIndex(targetIndex >= 0 ? targetIndex : 0)
+    setDetailResultFilter('all')
+    setDetailFileFilter('all')
+    setDetailCheckFilter('all')
     setPreviewData({})
     setPreviewPages({})
     setPreviewPageInputs({})
     setPreviewBusy({})
     setPreviewErrors({})
+  }
+
+  function resetDetailCursorAndPreview() {
+    setCurrentAlertIndex(0)
+    setPreviewData({})
+    setPreviewPages({})
+    setPreviewPageInputs({})
+    setPreviewBusy({})
+    setPreviewErrors({})
+  }
+
+  function selectDetailResultFilter(value) {
+    setDetailResultFilter(value)
+    resetDetailCursorAndPreview()
+  }
+
+  function selectDetailFileFilter(value) {
+    setDetailFileFilter(value)
+    setDetailCheckFilter('all')
+    setDetailResultFilter('all')
+    resetDetailCursorAndPreview()
+  }
+
+  function selectDetailCheckFilter(value) {
+    setDetailCheckFilter(value)
+    setDetailResultFilter('all')
+    resetDetailCursorAndPreview()
   }
 
   function goToPrev() {
@@ -4660,6 +4766,22 @@ export default function ReviewPage() {
       })
       return
     }
+
+    await handleDocPageChange(docInfo, nextPage - currentPage)
+  }
+
+  async function handleDocPageGoto(docInfo, targetPage) {
+    var docKey = docInfo.docKey || docInfo.docId || docInfo.fileName || docInfo.label
+    if (getPreviewTargets(docInfo).length === 0) return
+
+    var requested = Number(targetPage)
+    if (!requested || requested < 1) return
+
+    var existing = previewData[docKey]
+    var pageCount = getPreviewPageCount(existing, docInfo)
+    var nextPage = pageCount ? Math.min(requested, pageCount) : requested
+    var currentPage = previewPages[docKey] || getPreviewStartPage(docInfo, currentAlert)
+    if (nextPage === currentPage) return
 
     await handleDocPageChange(docInfo, nextPage - currentPage)
   }
@@ -5883,6 +6005,72 @@ export default function ReviewPage() {
               </div>
             ) : null}
 
+            {isFormatDetailService && detailFileGroups.length > 1 ? (
+              <div className="detail-filter-field">
+                <span className="detail-filter-label">按文件</span>
+                <select
+                  className="detail-filter-select"
+                  value={detailFileFilter}
+                  onChange={function (event) { selectDetailFileFilter(event.target.value) }}
+                >
+                  <option value="all">全部文件（{baseServiceAlerts.length}）</option>
+                  {detailFileGroups.map(function (group) {
+                    return (
+                      <option value={group.key} key={group.key}>
+                        {group.label}（{group.alerts.length}）
+                      </option>
+                    )
+                  })}
+                </select>
+              </div>
+            ) : null}
+
+            {isFormatDetailService && fileFilteredAlerts.length > 0 ? (
+              <div className="detail-check-filter" role="group" aria-label="按检查项筛选">
+                {FORMAT_FILE_CHECK_FILTER_OPTIONS.filter(function (option) {
+                  return option[0] === 'all' || (detailCheckCounts[option[0]] || 0) > 0
+                }).map(function (option) {
+                  var value = option[0]
+                  var label = option[1]
+                  var count = value === 'all' ? detailCheckCounts.all : (detailCheckCounts[value] || 0)
+                  return (
+                    <button
+                      type="button"
+                      key={value}
+                      className={detailCheckFilter === value ? 'detail-check-filter-btn active' : 'detail-check-filter-btn'}
+                      onClick={function () { selectDetailCheckFilter(value) }}
+                    >
+                      {label} {count}
+                    </button>
+                  )
+                })}
+              </div>
+            ) : null}
+
+            {currentServiceType && currentServiceType !== 'personnel_reuse_check' && !currentServiceIsPassedList && baseServiceAlerts.length > 0 ? (
+              <div className="detail-result-filter" role="group" aria-label="按结果筛选">
+                {[
+                  ['all', '全部', detailResultCounts.all],
+                  ['pass', '通过', detailResultCounts.pass],
+                  ['fail', '不通过', detailResultCounts.fail],
+                ].map(function (option) {
+                  var value = option[0]
+                  var label = option[1]
+                  var count = option[2]
+                  return (
+                    <button
+                      type="button"
+                      key={value}
+                      className={detailResultFilter === value ? 'detail-result-filter-btn active' : 'detail-result-filter-btn'}
+                      onClick={function () { selectDetailResultFilter(value) }}
+                    >
+                      {label} {count}
+                    </button>
+                  )
+                })}
+              </div>
+            ) : null}
+
             <div className="filter-card-list">
               <button
                 type="button"
@@ -6090,7 +6278,10 @@ export default function ReviewPage() {
             ) : currentServiceType === 'personnel_reuse_check' ? (
               renderPersonnelDraftWorkspace()
             ) : serviceAlerts.length === 0 ? (
-              <EmptyBlock title={currentServiceIsPassedList ? '该类型下暂无通过项' : '该类型下未发现可疑项'} />
+              <EmptyBlock title={
+                hasActiveDetailFilter ? '当前筛选条件下暂无条目'
+                  : currentServiceIsPassedList ? '该类型下暂无通过项' : '该类型下未发现可疑项'
+              } />
             ) : currentAlert ? (
               <div className="detail-container">
                 {/* ── Navigation bar ── */}
@@ -6230,6 +6421,10 @@ export default function ReviewPage() {
                           var isBusy = Boolean(previewBusy[docKey])
                           var errorMessage = previewErrors[docKey]
                           var pageInputValue = previewPageInputs[docKey] === undefined ? String(currentPage) : previewPageInputs[docKey]
+                          var docTargetPages = arrayify(docInfo.targetPages).map(Number).filter(Boolean).sort(function (a, b) { return a - b })
+                          var rangeStart = docTargetPages[0]
+                          var rangeEnd = docTargetPages[docTargetPages.length - 1]
+                          var hasPageRange = docTargetPages.length > 1 && rangeEnd > rangeStart
 
                           return (
                             <div className="panel detail-pdf-panel" key={docKey}>
@@ -6333,6 +6528,27 @@ export default function ReviewPage() {
                                   </div>
                                   {errorMessage && preview ? (
                                     <p className="preview-error">{errorMessage}</p>
+                                  ) : null}
+                                  {hasPageRange ? (
+                                    <div className="pdf-range-nav">
+                                      <span className="pdf-range-info">命中范围 第 {rangeStart}–{rangeEnd} 页</span>
+                                      <button
+                                        type="button"
+                                        className="pdf-page-btn"
+                                        disabled={isBusy || currentPage === rangeStart}
+                                        onClick={function () { handleDocPageGoto(docInfo, rangeStart) }}
+                                      >
+                                        跳到起始页
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="pdf-page-btn"
+                                        disabled={isBusy || currentPage === rangeEnd}
+                                        onClick={function () { handleDocPageGoto(docInfo, rangeEnd) }}
+                                      >
+                                        跳到结束页
+                                      </button>
+                                    </div>
                                   ) : null}
                                   <div className="pdf-page-nav">
                                     <button
