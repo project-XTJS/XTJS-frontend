@@ -29,6 +29,47 @@ function resolveApiBaseUrl() {
 
 export const API_BASE_URL = resolveApiBaseUrl()
 
+// ─── Auth token 管理 ─────────────────────────────────
+const AUTH_TOKEN_KEY = 'xtjs-auth-token'
+// 当请求遭遇 401 时派发此事件，由 AuthContext 监听并执行登出/跳转登录。
+export const AUTH_UNAUTHORIZED_EVENT = 'xtjs:unauthorized'
+
+function canUseLocalStorage() {
+  return typeof window !== 'undefined' && window.localStorage
+}
+
+export function getToken() {
+  if (!canUseLocalStorage()) return null
+  try {
+    return window.localStorage.getItem(AUTH_TOKEN_KEY)
+  } catch {
+    return null
+  }
+}
+
+export function setToken(token) {
+  if (!canUseLocalStorage()) return
+  try {
+    if (token) {
+      window.localStorage.setItem(AUTH_TOKEN_KEY, token)
+    } else {
+      window.localStorage.removeItem(AUTH_TOKEN_KEY)
+    }
+  } catch {
+    // 忽略存储异常（隐私模式等）。
+  }
+}
+
+export function clearToken() {
+  setToken(null)
+}
+
+function emitUnauthorized() {
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(new CustomEvent(AUTH_UNAUTHORIZED_EVENT))
+  }
+}
+
 function buildRequestUrl(path, query = {}) {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`
   const fullUrl = API_BASE_URL
@@ -99,12 +140,24 @@ function unwrapUnifiedPayload(payload, response) {
   return payload
 }
 
-async function request(path, { method = 'GET', query, body, headers } = {}) {
+export async function request(path, { method = 'GET', query, body, headers } = {}) {
+  // 自动携带 Bearer 令牌（已登录时）。
+  const token = getToken()
+  const finalHeaders = token
+    ? { ...(headers || {}), Authorization: `Bearer ${token}` }
+    : headers
+
   const response = await fetch(buildRequestUrl(path, query), {
     method,
     body,
-    headers,
+    headers: finalHeaders,
   })
+
+  // 会话失效：清除令牌并通知上层跳转登录，避免无效请求继续。
+  if (response.status === 401) {
+    clearToken()
+    emitUnauthorized()
+  }
 
   const payload = await parseResponseBody(response)
   return unwrapUnifiedPayload(payload, response)

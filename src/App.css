@@ -3245,3 +3245,171 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* ─── 认证：登录页 ─────────────────────────────── */
+.app-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  color: var(--muted);
+}
+
+.login-shell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 380px;
+  padding: 32px 28px;
+  display: grid;
+  gap: 16px;
+}
+
+.login-head {
+  text-align: center;
+  margin-bottom: 4px;
+}
+
+.login-head h1 {
+  font-size: 1.3rem;
+  color: var(--title);
+  margin: 0 0 6px;
+}
+
+.login-head p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.login-submit {
+  width: 100%;
+  justify-content: center;
+}
+
+.login-error {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(220, 38, 38, 0.08);
+  color: #b91c1c;
+  font-size: 0.85rem;
+}
+
+.login-hint {
+  margin: 0;
+  text-align: center;
+  color: var(--light-text);
+  font-size: 0.78rem;
+}
+
+/* ─── 顶栏：用户区 ─────────────────────────────── */
+.user-menu {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.user-role {
+  font-style: normal;
+  font-size: 0.72rem;
+  color: var(--primary);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+/* ─── 用户管理页 ───────────────────────────────── */
+.users-create-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.users-notice {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(47, 111, 236, 0.08);
+  color: var(--primary);
+  font-size: 0.85rem;
+}
+
+.users-empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 24px 0;
+}
+
+.users-table-wrap {
+  overflow-x: auto;
+}
+
+.users-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+.users-table th,
+.users-table td {
+  text-align: left;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: middle;
+}
+
+.users-table th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.users-table select {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 4px 8px;
+  background: var(--card);
+  color: var(--text);
+}
+
+.users-self-tag {
+  color: var(--light-text);
+  font-size: 0.75rem;
+}
+
+.users-status.active {
+  color: #15803d;
+}
+
+.users-status.inactive {
+  color: #b91c1c;
+}
+
+.users-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.users-actions .ghost-button {
+  padding: 4px 10px;
+  font-size: 0.8rem;
+}
+
+.users-danger {
+  color: #b91c1c;
+  border-color: rgba(220, 38, 38, 0.4);
+}
