@@ -4544,7 +4544,9 @@ export default function ReviewPage() {
     })
   }, [])
 
-  var loadData = useCallback(function (projectId) {
+  var loadData = useCallback(function (projectId, isActive) {
+    // 加载是否仍然“当前有效”（避免陈旧/重复加载在用户已操作后回写、把选择重置回去）
+    var active = function () { return !isActive || isActive() }
     if (!projectId) {
       setIsLoading(false)
       setProjectDetail(null)
@@ -4565,6 +4567,7 @@ export default function ReviewPage() {
       getProjectDetail(projectId).catch(function () { return null }),
       getBusinessBidFormatReviewEditable(projectId).catch(function () { return null }),
     ]).then(function (responses) {
+      if (!active()) return // 已切走/重复加载：丢弃陈旧结果，不回写、不重置选择
       var data = responses[0]
       var loadedProjectDetail = responses[1]
       var editablePayload = responses[2]
@@ -4595,6 +4598,7 @@ export default function ReviewPage() {
       setCurrentServiceType(null)
       setCurrentAlertIndex(0)
     }).catch(function () {
+      if (!active()) return
       setProjectDetail(null)
       setFormatEditableItems([])
       setFormatManualDrafts({})
@@ -4604,6 +4608,7 @@ export default function ReviewPage() {
       setPersonnelActiveDocKey('')
       setNotice({ type: 'error', message: '加载项目结果失败' })
     }).finally(function () {
+      if (!active()) return
       setIsLoading(false)
       setFormatManualLoading(false)
     })
@@ -4614,7 +4619,10 @@ export default function ReviewPage() {
   }, [loadProjects])
 
   useEffect(function () {
-    loadData(selectedProjectId)
+    var active = true
+    loadData(selectedProjectId, function () { return active })
+    // 卸载/切项目/StrictMode 重跑时标记失效：陈旧加载完成后不再回写、不重置已选审查项
+    return function () { active = false }
   }, [selectedProjectId, loadData])
 
   useEffect(function () {
