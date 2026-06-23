@@ -3,6 +3,7 @@ import {
   continueTechnicalOcr,
   deleteProject,
   getProjectDetail,
+  getProjectOcrStatus,
   getProjectResults,
   getProjectWorkflowState,
   ingestProjectDocuments,
@@ -48,6 +49,15 @@ const PARSING_STATUS_BUSINESS_READY = 2
 const PARSING_STATUS_TECHNICAL_READY = 3
 const PROJECT_STAGE_POLL_INTERVAL_MS = 5000
 const PROJECT_STAGE_POLL_ATTEMPTS = 360
+// OCR 进行中时拉取细粒度进度（按文件 + 当前文件页数）的轮询间隔
+const OCR_STATUS_POLL_INTERVAL_MS = 2500
+
+// OCR 阶段标签（与后端 ocr-status 的 stage 对齐）
+const OCR_STAGE_LABELS = {
+  tender: '招标文件',
+  business: '商务标',
+  technical: '技术标',
+}
 
 function createBidGroupDraft() {
   return {
@@ -214,6 +224,7 @@ export default function ProjectsPage() {
   const [busyToken, setBusyToken] = useState('')
   const [deleteConfirm, setDeleteConfirm] = useState('')
   const [technicalOcrExcludedIdsByProject, setTechnicalOcrExcludedIdsByProject] = useState({})
+  const [ocrStatus, setOcrStatus] = useState(null)
 
   const loadProjects = useCallback(async () => {
     setIsLoadingProjects(true)
@@ -316,8 +327,46 @@ export default function ProjectsPage() {
     }
   }, [activeProject?.identifierId])
 
+  // OCR 细粒度进度：拉取各阶段文件完成情况 + 当前文件逐页进度，OCR 进行中时轮询。
+  useEffect(() => {
+    const projectId = activeProject?.identifierId
+    if (!projectId) {
+      setOcrStatus(null)
+      return undefined
+    }
+    const parsingStatus = Number(activeProject?.parsingStatus || 0)
+    // OCR 全部完成且当前无进行中操作时不必持续轮询。
+    const shouldPoll = Boolean(busyToken) || parsingStatus < PARSING_STATUS_TECHNICAL_READY
+
+    let cancelled = false
+    let timer = null
+    const tick = async () => {
+      try {
+        const status = await getProjectOcrStatus(projectId)
+        if (!cancelled) setOcrStatus(status)
+      } catch {
+        if (!cancelled) setOcrStatus(null)
+      }
+    }
+    tick()
+    if (shouldPoll) {
+      timer = window.setInterval(tick, OCR_STATUS_POLL_INTERVAL_MS)
+    }
+    return () => {
+      cancelled = true
+      if (timer) window.clearInterval(timer)
+    }
+  }, [activeProject?.identifierId, activeProject?.parsingStatus, busyToken])
+
   const activeProjectHasBusinessResults = hasBusinessAnalysisResults(activeProject)
   const activeProjectParsingStatus = Number(activeProject?.parsingStatus || 0)
+  const ocrProgress = ocrStatus?.ocr_progress ?? null
+  // active 为"正在进行中的文件"列表(多卡并发时可能多个);兼容旧的单对象形态。
+  const ocrActiveList = Array.isArray(ocrProgress?.active)
+    ? ocrProgress.active
+    : (ocrProgress?.active ? [ocrProgress.active] : [])
+  const ocrActiveById = new Map(ocrActiveList.map((item) => [String(item.document_id), item]))
+  const ocrStages = (ocrProgress?.stages ?? []).filter((stage) => Number(stage?.total_count || 0) > 0)
   const technicalOcrCandidates = getTechnicalOcrCandidates(activeProject)
   const technicalOcrExcludedIds = technicalOcrExcludedIdsByProject[activeProject?.identifierId] ?? []
   const technicalOcrExcludedSet = new Set(technicalOcrExcludedIds)
@@ -969,6 +1018,80 @@ export default function ProjectsPage() {
                   </div>
                   <span>{getParsingProgress(activeProject.parsingStatus).label}</span>
                 </div>
+
+                {ocrStages.length > 0 ? (
+                  <div className="ocr-progress-panel">
+                    <div className="ocr-progress-panel-head">
+                      <strong>OCR 进度</strong>
+                      {ocrActiveList.length === 1 ? (
+                        <span className="ocr-progress-active-hint">
+                          正在处理：{ocrActiveList[0].file_name || '当前文件'}
+                          {Number(ocrActiveList[0].total_pages) > 0
+                            ? `（第 ${ocrActiveList[0].current_page}/${ocrActiveList[0].total_pages} 页 · ${ocrActiveList[0].percent}%）`
+                            : `（${ocrActiveList[0].percent}%）`}
+                        </span>
+                      ) : ocrActiveList.length > 1 ? (
+                        <span className="ocr-progress-active-hint">
+                          正在并行处理 {ocrActiveList.length} 个文件
+                        </span>
+                      ) : (
+                        <span className="ocr-progress-idle-hint">当前无进行中的文件</span>
+                      )}
+                    </div>
+
+                    {ocrStages.map((stage) => {
+                      const completedDocs = (stage.completed_documents ?? []).map((doc) => ({ doc, state: 'done' }))
+                      const pendingDocs = (stage.pending_documents ?? []).map((doc) => ({ doc, state: 'pending' }))
+                      const files = [...completedDocs, ...pendingDocs]
+                      if (files.length === 0) return null
+                      return (
+                        <div className="ocr-stage" key={stage.stage}>
+                          <div className="ocr-stage-head">
+                            <span>{stage.label || OCR_STAGE_LABELS[stage.stage] || stage.stage}</span>
+                            <span className="ocr-stage-count">
+                              {stage.completed_count}/{stage.total_count} 已完成
+                            </span>
+                          </div>
+                          <ul className="ocr-file-list">
+                            {files.map(({ doc, state }) => {
+                              const activeRec = ocrActiveById.get(String(doc.identifier_id))
+                              const isActive = Boolean(activeRec)
+                              const itemState = isActive ? 'active' : state
+                              const hasPages = isActive && Number(activeRec.total_pages) > 0
+                              return (
+                                <li className={`ocr-file ocr-file-${itemState}`} key={doc.identifier_id}>
+                                  <span className="ocr-file-icon">
+                                    {itemState === 'done' ? '✓' : itemState === 'active' ? '⏳' : '…'}
+                                  </span>
+                                  <span className="ocr-file-name">{doc.file_name || doc.identifier_id}</span>
+                                  {isActive ? (
+                                    <span className="ocr-file-pages">
+                                      {hasPages
+                                        ? `第 ${activeRec.current_page}/${activeRec.total_pages} 页 · ${activeRec.percent}%`
+                                        : `${activeRec.percent}%`}
+                                    </span>
+                                  ) : (
+                                    <span className="ocr-file-tag">
+                                      {itemState === 'done' ? '已完成' : '待处理'}
+                                    </span>
+                                  )}
+                                  {hasPages ? (
+                                    <div className="ocr-file-bar">
+                                      <div
+                                        className="ocr-file-bar-fill"
+                                        style={{ width: `${Math.max(0, Math.min(100, Number(activeRec.percent) || 0))}%` }}
+                                      />
+                                    </div>
+                                  ) : null}
+                                </li>
+                              )
+                            })}
+                          </ul>
+                        </div>
+                      )
+                    })}
+                  </div>
+                ) : null}
 
                 {needsPreAnalysisOcr ? (
                   <div className="project-stage-callout">

@@ -1092,6 +1092,133 @@
   white-space: nowrap;
 }
 
+/* ─── OCR 细粒度进度面板 ───────────────────────── */
+
+.ocr-progress-panel {
+  margin-top: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--card);
+  display: grid;
+  gap: 12px;
+}
+
+.ocr-progress-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ocr-progress-panel-head strong {
+  font-size: 0.9rem;
+  color: var(--title);
+}
+
+.ocr-progress-active-hint {
+  font-size: 0.8rem;
+  color: var(--primary);
+}
+
+.ocr-progress-idle-hint {
+  font-size: 0.8rem;
+  color: var(--light-text);
+}
+
+.ocr-stage {
+  display: grid;
+  gap: 6px;
+}
+
+.ocr-stage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.ocr-stage-count {
+  color: var(--light-text);
+}
+
+.ocr-file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.ocr-file {
+  display: grid;
+  grid-template-columns: 18px 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  font-size: 0.82rem;
+}
+
+.ocr-file-icon {
+  text-align: center;
+  font-size: 0.85rem;
+}
+
+.ocr-file-name {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ocr-file-tag,
+.ocr-file-pages {
+  font-size: 0.76rem;
+  white-space: nowrap;
+}
+
+.ocr-file-tag {
+  color: var(--light-text);
+}
+
+.ocr-file-pages {
+  color: var(--primary);
+  font-weight: 600;
+}
+
+.ocr-file-done .ocr-file-icon {
+  color: #15803d;
+}
+
+.ocr-file-active {
+  border-color: rgba(47, 111, 236, 0.45);
+  background: rgba(47, 111, 236, 0.06);
+}
+
+.ocr-file-active .ocr-file-icon {
+  color: var(--primary);
+}
+
+.ocr-file-bar {
+  grid-column: 1 / -1;
+  height: 5px;
+  border-radius: 999px;
+  background: #e2e8f0;
+  overflow: hidden;
+}
+
+.ocr-file-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--primary);
+  transition: width 0.3s ease;
+}
+
 /* ─── Analysis Grouping ─────────────────────────── */
 
 .project-stage-callout {

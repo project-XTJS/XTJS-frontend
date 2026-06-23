@@ -3177,6 +3177,64 @@ function collectPersonnelAlertsFromGroups(resultKey, result, allAlerts, options)
   })
 }
 
+function deviationMarkerTag(meta) {
+  if (!meta) return ''
+  var parts = []
+  if (meta.requirement_kind === 'bonus' || meta.marker_type === 'triangle') parts.push('△加分项')
+  else parts.push('★必须项')
+  if (meta.semantic_status) {
+    var hasScore = meta.semantic_score !== null && meta.semantic_score !== undefined
+    parts.push('语义:' + meta.semantic_status + (hasScore ? '(' + meta.semantic_score + ')' : ''))
+  } else if (meta.needs_manual) {
+    parts.push('语义:待人工')
+  }
+  return parts.join(' · ')
+}
+
+function buildDeviationMarkerIssue(meta) {
+  var tag = deviationMarkerTag(meta)
+  var evidenceText = meta && meta.response_evidence ? ' · 响应：' + meta.response_evidence : ''
+  var evidence = Object.assign({}, meta)
+  // 招标侧：定位到该 ★/△ 要求条款所在页并高亮（让左栏跳到具体要求项，而不是停在封面）。
+  if (!evidence.tender_star_locations && meta && meta.requirement_page) {
+    evidence.tender_star_locations = [{
+      document_role: 'tender',
+      document: 'tender',
+      coordinate_system: 'pdf_point',
+      page: meta.requirement_page,
+      bbox: meta.requirement_bbox || null,
+      text: meta.requirement,
+    }]
+  }
+  // 投标侧：定位到响应所在页。
+  if (!evidence.response_locations && meta && meta.response_page) {
+    evidence.response_locations = [{
+      document_role: meta.response_document_role || 'business_bid',
+      coordinate_system: 'pdf_point',
+      page: meta.response_page,
+      bbox: meta.response_bbox || null,
+      text: meta.response_evidence || meta.requirement,
+    }]
+  }
+  return {
+    title: (meta && meta.requirement) || '标记项响应',
+    status: 'pass',
+    severity: 'info',
+    message: tag + evidenceText,
+    evidence: evidence,
+  }
+}
+
+function enrichDeviationIssue(issue) {
+  if (!issue) return issue
+  var tag = deviationMarkerTag(issue.evidence || issue)
+  if (!tag) return issue
+  var prefix = '[' + tag + '] '
+  var message = issue.message || ''
+  if (message.indexOf(prefix) === 0) return issue
+  return Object.assign({}, issue, { message: prefix + message })
+}
+
 function collectFormatReviewAlerts(results, allAlerts, options) {
   var opts = options || {}
   var sourceResultKey = opts.resultKey || FORMAT_REVIEW_RESULT_KEY
@@ -3200,8 +3258,23 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
       var failedIssues = arrayify(check.issues && check.issues.failed)
       var missingIssues = arrayify(check.issues && check.issues.missing)
       var unclearIssues = arrayify(check.issues && check.issues.unclear)
+      var bonusIssues = arrayify(check.issues && check.issues.bonus)
       var passedIssues = arrayify(check.issues && check.issues.passed)
-      var issueEntries = failedIssues.concat(missingIssues, unclearIssues).map(function (issue, issueIndex) {
+      var warningIssues = failedIssues.concat(missingIssues, unclearIssues, bonusIssues)
+      if (checkKey === 'deviation_check') {
+        // 偏离检查：失败/缺失/加分项标注 ★/△ 与语义判定；
+        // 已响应(无问题)项优先用后端逐条"通过"项(带完整两栏证据)，缺省时再用 marker_items 兜底。
+        warningIssues = warningIssues.map(enrichDeviationIssue)
+        if (passedIssues.length === 0) {
+          passedIssues = arrayify(check.marker_items)
+            .filter(function (m) {
+              return m && m.responded &&
+                ['positive_deviation', 'no_deviation', 'listed_response'].indexOf(m.response_status) !== -1
+            })
+            .map(buildDeviationMarkerIssue)
+        }
+      }
+      var issueEntries = warningIssues.map(function (issue, issueIndex) {
         return {
           issue: issue,
           issueIndex: issueIndex,
@@ -3283,7 +3356,6 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
           })
         }).filter(Boolean)
         var formatTenderRefs = (
-          isDeviationTableMissing ||
           (checkKey === 'verification_check' && !isVerificationMissingAttachment) ||
           checkKey === 'itemized_pricing_check'
         ) ? [] : buildFormatTenderHighlightDocRefs(issue, checkKey, {
@@ -3294,7 +3366,12 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
           if (pricingTenderFallbackRef) formatTenderRefs = [pricingTenderFallbackRef]
         }
         if (isDeviationTableMissing) {
-          docRefs = buildDeviationTableMissingDocRefs(issue, docRefs)
+          // 缺少偏离表：左栏展示招标文件的 ★/△ 要求条款，右栏展示投标目录页，
+          // 直观呈现"招标要求响应、投标却未提供偏离表/未响应"。
+          var deviationBidRefs = buildDeviationTableMissingDocRefs(issue, docRefs)
+          docRefs = formatTenderRefs.concat(deviationBidRefs.filter(function (doc) {
+            return !isDocCoveredByTenderRefs(doc, formatTenderRefs)
+          }))
         } else if (checkKey === 'integrity_check') {
           var integrityMissingRefs = buildIntegrityMissingDocRefs(issue, docRefs, sourceDocs, bidderDocumentLookup)
           if (integrityMissingRefs.length > 0) {
@@ -3331,6 +3408,35 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
             return !issueLocationKeys[(doc.docId || '') + '|' + (doc.fileName || '') + '|' + doc.startPage]
           }))
         }
+        if (checkKey === 'deviation_check' && !isDeviationTableMissing) {
+          // 偏离预览只保留：招标★/△条款文档 + “本投标人自己”的响应文档。
+          // 该项目可能有多家投标人，响应定位只标了“商务标第X页”而未指明具体文件，
+          // 跨投标人文档表会把响应同时落到多家同名“商务标”，这里按本投标人的文档收敛，避免串档。
+          var devDocIdentity = function (doc) {
+            return String((doc && (doc.docId || doc.identifier_id || doc.document_identifier_id)) || '').trim() ||
+              String((doc && (doc.fileName || doc.file_name)) || '').trim().toLowerCase()
+          }
+          var bidderOwnDocIds = {}
+          arrayify(sourceDocs).concat(documentCandidatesFromValue(bidder.documents)).forEach(function (doc) {
+            var idy = devDocIdentity(doc)
+            if (idy) bidderOwnDocIds[idy] = true
+          })
+          var deviationKeepKeys = {}
+          formatTenderRefs.forEach(function (doc) {
+            var idy = devDocIdentity(doc)
+            if (idy) deviationKeepKeys[idy] = true
+          })
+          // 响应文档只保留属于本投标人的
+          issueLocationRefs.forEach(function (doc) {
+            var idy = devDocIdentity(doc)
+            if (idy && bidderOwnDocIds[idy]) deviationKeepKeys[idy] = true
+          })
+          var deviationScoped = docRefs.filter(function (doc) {
+            var idy = devDocIdentity(doc)
+            return isTenderTemplateDoc(doc) || (idy && deviationKeepKeys[idy])
+          })
+          if (deviationScoped.length > 0) docRefs = deviationScoped
+        }
         if (isPassedItem && checkKey !== 'verification_check' && checkKey !== 'itemized_pricing_check') {
           docRefs = ensureFormatTenderDocRef(
             docRefs,
@@ -3351,7 +3457,7 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
         var riskLevel = issueEntry.sourceStatus === 'passed'
           ? 'none'
           : normalizeRiskLevel(issue.severity || issue.status || reviewStatus)
-        var overviewDocuments = (isDeviationTableMissing || isVerificationMissingAttachment)
+        var overviewDocuments = (isDeviationTableMissing || isVerificationMissingAttachment || checkKey === 'deviation_check')
           ? docRefs
           : buildFormatOverviewDocuments(bidder, bidderDocumentLookup, docRefs, previewPage)
         var alertTitle = checkKey === 'pricing_check' && issue.title === '报价合理性'
@@ -3414,13 +3520,197 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
   })
 }
 
+// 读取偏离条目的 ★/△ 标记（在 alert.evidence.issue.evidence 里）
+function getDeviationItemMarker(alert) {
+  var issue = alert && alert.evidence && alert.evidence.issue
+  var ev = (issue && issue.evidence) || (alert && alert.evidence) || {}
+  if (ev.marker_type === 'triangle' || ev.requirement_kind === 'bonus') return 'triangle'
+  return 'star'
+}
+
+// 把同一投标人的多条偏离告警聚合成一张卡：1招标预览+1投标预览，缺失/未响应项以文字列出。
+function consolidateDeviationAlertsByBidder(alerts, techDocsByBidder) {
+  var groups = {}
+  var order = []
+  arrayify(alerts).forEach(function (alert) {
+    var key = String(alert.bidderKey || alert.bidderName || alert.groupKey || '默认投标人')
+    if (!groups[key]) { groups[key] = []; order.push(key) }
+    groups[key].push(alert)
+  })
+
+  return order.map(function (key, gi) {
+    var groupAlerts = groups[key]
+    var first = groupAlerts[0]
+    var bidderName = first.bidderName || first.bidderKey || ('投标人 ' + (gi + 1))
+    // 缺失/未响应的条目（非"已响应/通过"）
+    var missing = groupAlerts.filter(function (a) {
+      return a.sourceStatus !== 'passed' && !isPassReviewResult(a)
+    })
+    var missingLines = missing.map(function (a) {
+      var issue = a.evidence && a.evidence.issue
+      var ev = (issue && issue.evidence) || {}
+      var marker = getDeviationItemMarker(a) === 'triangle' ? '△' : '★'
+      var status = String(ev.response_status || (issue && issue.status) || '')
+      var statusLabel = /missing/.test(status) ? '未响应/缺失'
+        : (/negative/.test(status) ? '负偏离'
+          : (/unclear/.test(status) ? '响应不明确' : '需复核'))
+      var reqText = (issue && issue.title) || ev.requirement || '要求条款'
+      var reqPage = ev.requirement_page ? ('招标P' + ev.requirement_page) : ''
+      return marker + ' ' + reqText + (reqPage ? '（' + reqPage + '）' : '') + ' — ' + statusLabel
+    })
+    // ===== 构造该投标人聚合卡的预览：招标(高亮全部要求) + 商务标 + 技术标(对应材料) =====
+    var consolidatedDocs = []
+    var bidTemplateDoc = null
+    var distinctRp = []   // 每条★在商务标偏离表里的"具体响应页"（去重）
+    var maxRpEnd = 0      // 整张偏离表结束页（塌缩兜底用）
+    var techMatPages = [] // "对应材料"指向技术标的页码
+    var bizMatPages = []  // "对应材料"指向商务标的页码
+    var materialRefLines = []
+    groupAlerts.forEach(function (a) {
+      var issue = a.evidence && a.evidence.issue
+      var ev = (issue && issue.evidence) || {}
+      var rp = Number(ev.response_page)
+      var rpEnd = Number(ev.response_page_end) || rp
+      if (rp > 0) {
+        if (distinctRp.indexOf(rp) < 0) distinctRp.push(rp)
+        if (rpEnd > maxRpEnd) maxRpEnd = rpEnd
+      }
+      // "对应材料投标文件所在页"：区分技术标/商务标 + 具体页，作为"真正响应位置"的跳转目标
+      var matLocs = arrayify(ev.material_locations)
+      matLocs.forEach(function (ml) {
+        var mp = Number(ml && ml.page)
+        if (!(mp > 0)) return
+        if (String((ml && ml.document_role) || '').indexOf('technical') >= 0) {
+          if (techMatPages.indexOf(mp) < 0) techMatPages.push(mp)
+        } else if (bizMatPages.indexOf(mp) < 0) {
+          bizMatPages.push(mp)
+        }
+      })
+      if (ev.material_text || matLocs.length > 0) {
+        var mk = getDeviationItemMarker(a) === 'triangle' ? '△' : '★'
+        var reqT = (issue && issue.title) || ev.requirement || '要求条款'
+        var refStr = ev.material_text || matLocs.map(function (m) {
+          return (m.book ? ('《' + m.book + '》') : '') + 'P' + m.page
+        }).join('、')
+        if (refStr) materialRefLines.push(mk + ' ' + reqT + ' → ' + refStr)
+      }
+      arrayify(a.documents).forEach(function (doc) {
+        if (!doc) return
+        if (isTenderTemplateDoc(doc)) {
+          // 招标侧同时带"要求文本短语 + OCR rect"：后端按每条 rect 区域做 PDF 文本检索，
+          // 贴到 pymupdf 精确 PDF 文本行（高亮用 PDF bbox 而非 OCR bbox）。
+          consolidatedDocs.push(doc)
+        } else if (String((doc.role || doc.documentType || doc.document_type) || '').toLowerCase().indexOf('technical') >= 0) {
+          // 技术标 docRef 收在 techDoc 解析里，这里跳过避免误当商务标
+        } else if (!bidTemplateDoc) {
+          bidTemplateDoc = doc // 该投标人商务标（偏离表/响应文档）模板
+        }
+      })
+    })
+    distinctRp.sort(function (a, b) { return a - b })
+    techMatPages.sort(function (a, b) { return a - b })
+    bizMatPages.sort(function (a, b) { return a - b })
+    // 商务标偏离表响应页：精定位生效→用具体页；全塌缩→用 response_page_end 扩成整张偏离表跨度兜底。
+    var responsePages = []
+    if (distinctRp.length >= 2) {
+      responsePages = distinctRp.slice()
+    } else if (distinctRp.length === 1) {
+      var s = distinctRp[0]
+      var e = Math.min(maxRpEnd || s, s + 40)
+      for (var p = s; p <= e; p++) responsePages.push(p)
+    }
+    // 商务标面板页 = 偏离表响应页 ∪ "对应材料"指向商务标的页
+    var bidPages = responsePages.slice()
+    bizMatPages.forEach(function (pg) { if (bidPages.indexOf(pg) < 0) bidPages.push(pg) })
+    bidPages.sort(function (a, b) { return a - b })
+    // 各文档按页各生成一份（同文件、不同页、不高亮），交给 mergePreviewDocsByFile 合并成一份多页。
+    var cleanBidDoc = function (doc, pg) {
+      return Object.assign({}, doc, {
+        page: pg || doc.page,
+        startPage: pg || doc.startPage,
+        targetPages: pg ? [pg] : doc.targetPages,
+        highlight: [],
+        highlightRects: undefined,
+        highlightPageRects: undefined,
+        highlightBbox: undefined,
+        lockStartPage: undefined,
+        forcePage: undefined,
+      })
+    }
+    if (bidTemplateDoc && bidPages.length > 0) {
+      bidPages.forEach(function (pg) { consolidatedDocs.push(cleanBidDoc(bidTemplateDoc, pg)) })
+    } else if (bidTemplateDoc) {
+      consolidatedDocs.push(cleanBidDoc(bidTemplateDoc, null))
+    }
+    // 技术标（对应材料）面板：从 dataset 取该投标人技术标文档，跳到"对应材料"指明的技术标具体页。
+    var techRaw = techDocsByBidder && (techDocsByBidder[String(first.bidderKey)] || techDocsByBidder[String(key)])
+    if (techRaw && techMatPages.length > 0) {
+      var techDoc = normalizeDocRef({
+        document_identifier_id: techRaw.identifier_id,
+        file_name: techRaw.file_name,
+        file_url: techRaw.file_url,
+        document_type: 'technical_bid',
+        role: 'technical_bid',
+        page: techMatPages[0],
+        pageCount: techRaw.page_count,
+        label: techRaw.file_name || '技术标文件',
+      }, { page: techMatPages[0] })
+      techMatPages.forEach(function (pg) { consolidatedDocs.push(cleanBidDoc(techDoc, pg)) })
+    }
+    if (consolidatedDocs.length === 0) consolidatedDocs = first.documents
+
+    var total = groupAlerts.length
+    var missingCount = missing.length
+    var hasMandatoryMiss = missing.some(function (a) { return getDeviationItemMarker(a) === 'star' })
+    var conclusion = missingCount === 0 ? '通过' : (hasMandatoryMiss ? '不通过' : '提示')
+    var description = missingCount === 0
+      ? (bidderName + ' — 共 ' + total + ' 条 ★/△ 要求，均已响应。')
+      : (bidderName + ' — 共 ' + total + ' 条 ★/△ 要求，其中 ' + missingCount + ' 条缺失/未响应：' + missingLines.join('；'))
+    if (materialRefLines.length > 0) {
+      description += '｜对应材料(响应所在文件+页)：' + materialRefLines.join('；')
+    }
+
+    return Object.assign({}, first, {
+      id: 'deviation-bidder-' + gi + '-' + stablePreviewHash(key),
+      title: bidderName + '：偏离表检查（★/△ ' + total + ' 条，缺失 ' + missingCount + '）',
+      description: description,
+      sourceStatus: missingCount === 0 ? 'passed' : (first.sourceStatus || 'fail'),
+      riskLevel: missingCount === 0 ? 'none' : (hasMandatoryMiss ? 'high' : 'medium'),
+      metrics: {
+        '投标人': bidderName,
+        '审查项': '偏离表检查',
+        '系统结论': conclusion,
+        '★/△ 条数': total,
+        '缺失/未响应': missingCount,
+        '招标要求页': (first.evidence && first.evidence.issue && first.evidence.issue.evidence && first.evidence.issue.evidence.requirement_page) || first.page || '--',
+        '商务标响应页': responsePages.length === 0
+          ? '--'
+          : (responsePages.length === 1
+            ? String(responsePages[0])
+            : (responsePages[0] + '–' + responsePages[responsePages.length - 1] + ' 页')),
+        '技术标对应材料页': techMatPages.length === 0 ? '--' : techMatPages.join('、'),
+      },
+      // 预览默认页落到第一个响应页（偏离表起始），避免落到范围外
+      page: responsePages.length > 0 ? responsePages[0] : first.page,
+      // 招标侧=高亮全部要求+全部页码；投标侧=不高亮+全部页码（各一份）
+      documents: consolidatedDocs,
+      overviewDocuments: consolidatedDocs,
+      deviationMissingItems: missingLines,
+      deviationHasMissingStar: missing.some(function (a) { return getDeviationItemMarker(a) === 'star' }),
+      deviationHasMissingTriangle: missing.some(function (a) { return getDeviationItemMarker(a) === 'triangle' }),
+    })
+  })
+}
+
 function collectAllAlerts(results) {
   if (!results) return []
 
   var allAlerts = []
 
   collectFormatReviewAlerts(results, allAlerts)
-  collectFormatReviewAlerts(results, allAlerts, {
+  // 偏离项目审查：按投标人聚合成"每人一张卡"(1招标预览+1投标预览)，缺失的★/△以文字+页码列出。
+  var deviationRawAlerts = []
+  collectFormatReviewAlerts(results, deviationRawAlerts, {
     resultKey: 'deviation_check',
     resultType: 'deviation_check',
     passedResultType: 'deviation_check',
@@ -3428,6 +3718,15 @@ function collectAllAlerts(results) {
     passedResultTypeLabel: RESULT_TYPE_LABELS.deviation_check,
     groupKey: 'deviation_check',
     groupLabel: '偏离表',
+  })
+  // 投标人 → 技术标文档：用于偏离卡"对应材料"跳转到技术标具体页。
+  var deviationTechDocs = {}
+  arrayify(results.deviation_check && results.deviation_check.bidders).forEach(function (b) {
+    var t = b && b.documents && b.documents.technical
+    if (b && b.bidder_key && t) deviationTechDocs[String(b.bidder_key)] = t
+  })
+  consolidateDeviationAlertsByBidder(deviationRawAlerts, deviationTechDocs).forEach(function (alert) {
+    allAlerts.push(alert)
   })
   collectPersonnelAlertsFromGroups('personnel_reuse_check', results.personnel_reuse_check, allAlerts)
   collectDuplicateAlerts(results, allAlerts)
@@ -3759,13 +4058,23 @@ function getPreviewStartPage(docInfo, alert) {
 
 async function fetchDocumentPreviewForDoc(docInfo, page) {
   var targets = getPreviewTargets(docInfo)
-  var lastError = null
+  // 已知页数时把请求页夹到有效范围：缺失项会用招标模板页码(如第36页)去定位较短的投标文件,
+  // 直接请求会越界(后端 400)。这里先夹到页数,并在失败时退回第 1 页,保证预览始终可用。
+  var pageCount = getPreviewPageCount(null, docInfo)
+  var requestPage = page || 1
+  if (pageCount && requestPage > pageCount) requestPage = pageCount
+  if (requestPage < 1) requestPage = 1
 
-  for (var i = 0; i < targets.length; i++) {
-    try {
-      return await getDocumentPreview(targets[i], page, getPreviewOptions(docInfo, page))
-    } catch (error) {
-      lastError = error
+  var pagesToTry = requestPage === 1 ? [1] : [requestPage, 1]
+  var lastError = null
+  for (var p = 0; p < pagesToTry.length; p++) {
+    var tryPage = pagesToTry[p]
+    for (var i = 0; i < targets.length; i++) {
+      try {
+        return await getDocumentPreview(targets[i], tryPage, getPreviewOptions(docInfo, tryPage))
+      } catch (error) {
+        lastError = error
+      }
     }
   }
 
@@ -4384,7 +4693,8 @@ export default function ReviewPage() {
   // 结果筛选（全部/通过/不通过）
   var detailResultCounts = getReviewResultFilterCounts(checkFilteredAlerts)
   var serviceAlerts = filterReviewAlertsByResult(checkFilteredAlerts, detailResultFilter)
-  var hasActiveDetailFilter = detailResultFilter !== 'all' || detailFileFilter !== 'all' || detailCheckFilter !== 'all'
+  var hasActiveDetailFilter = detailResultFilter !== 'all' || detailFileFilter !== 'all' ||
+    detailCheckFilter !== 'all'
 
   var currentAlert = serviceAlerts[currentAlertIndex] || null
   var personnelCompanyGroups = getPersonnelDraftCompanyGroups(personnelDraftDocuments)
@@ -6431,6 +6741,7 @@ export default function ReviewPage() {
                           var rangeStart = docTargetPages[0]
                           var rangeEnd = docTargetPages[docTargetPages.length - 1]
                           var hasPageRange = docTargetPages.length > 1 && rangeEnd > rangeStart
+                          var isTechMaterialDoc = String((docInfo.role || docInfo.documentType || docInfo.document_type) || '').toLowerCase().indexOf('technical') >= 0
 
                           return (
                             <div className="panel detail-pdf-panel" key={docKey}>
@@ -6554,6 +6865,25 @@ export default function ReviewPage() {
                                       >
                                         跳到结束页
                                       </button>
+                                    </div>
+                                  ) : null}
+                                  {/* 仅技术标"对应材料"：逐个具体响应页可点跳转（商务标偏离表那排已去掉） */}
+                                  {isTechMaterialDoc && docTargetPages.length > 1 ? (
+                                    <div className="pdf-range-nav">
+                                      <span className="pdf-range-info">技术标·对应材料页（点击跳转）</span>
+                                      {docTargetPages.map(function (pg) {
+                                        return (
+                                          <button
+                                            type="button"
+                                            key={'resp-pg-' + pg}
+                                            className="pdf-page-btn"
+                                            disabled={isBusy || currentPage === pg}
+                                            onClick={function () { handleDocPageGoto(docInfo, pg) }}
+                                          >
+                                            第{pg}页
+                                          </button>
+                                        )
+                                      })}
                                     </div>
                                   ) : null}
                                   <div className="pdf-page-nav">

@@ -299,6 +299,12 @@ export async function getProjectDetail(identifierId, { forceRefresh = false } = 
   })
 }
 
+// 查询项目 OCR 实时状态（各阶段文件完成/待处理 + 当前文件逐页进度）。
+// 不走缓存，保证 OCR 进行中拿到最新进度。
+export async function getProjectOcrStatus(identifierId) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/ocr-status`)
+}
+
 export async function createProject(projectName) {
   const payload = await request('/api/postgresql/projects', {
     method: 'POST',
@@ -677,13 +683,22 @@ export async function getDocumentPreview(fileNameOrId, page, { highlight, highli
   if (highlightRects) body.highlight_rects = highlightRects
   if (highlightCoordinateSpace) body.highlight_coordinate_space = highlightCoordinateSpace
 
+  // 该接口用裸 fetch（返回结构特殊），需手动带上 Bearer 令牌，否则会被登录守卫拦成 401。
+  const token = getToken()
+  const headers = { 'Content-Type': 'application/json' }
+  if (token) headers.Authorization = `Bearer ${token}`
+
   const response = await fetch(url, {
     method: 'POST',
     cache: 'no-store',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
   })
 
+  if (response.status === 401) {
+    clearToken()
+    emitUnauthorized()
+  }
   if (!response.ok) {
     throw createApiError(`Preview failed with status ${response.status}`, { status: response.status })
   }

@@ -54,10 +54,10 @@ const ANALYSIS_TYPES = [
     key: 'deviationCheck',
     label: '偏离项目审查',
     icon: '📋',
-    description: '在商务标和技术标中查找商务/技术偏离表',
+    description: '商务标 OCR 完成即可检查商务标偏离表 ★/△ 响应；技术标就绪后重跑自动并入',
     services: ['deviation_check'],
-    requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
-    stage: 'technical',
+    requiredParsingStatus: PARSING_STATUS_BUSINESS_READY,
+    stage: 'business',
   },
   {
     key: 'personnelReuseCheck',
@@ -74,8 +74,8 @@ const ANALYSIS_TYPES = [
     icon: '\uD83D\uDCC4',
     description: '\u67e5\u5546\u52a1\u5206\u9879\u62a5\u4ef7\u548c\u5546\u52a1/\u6280\u672f\u504f\u79bb\uff1b\u6280\u672f\u504f\u79bb\u8868\u5728\u5546\u52a1\u6807\u672a\u627e\u5230\u65f6\u4f1a\u56de\u9000\u5230\u6280\u672f\u6807\u67e5\u627e',
     services: ['business_bid_duplicate_check'],
-    requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
-    stage: 'duplicate',
+    requiredParsingStatus: PARSING_STATUS_BUSINESS_READY,
+    stage: 'business',
   },
   {
     key: 'technicalBidDuplicateCheck',
@@ -84,14 +84,13 @@ const ANALYSIS_TYPES = [
     description: '仅对技术标文档之间进行内容查重',
     services: ['technical_bid_duplicate_check'],
     requiredParsingStatus: PARSING_STATUS_TECHNICAL_READY,
-    stage: 'duplicate',
+    stage: 'technical',
   },
 ]
 
 const ANALYSIS_STAGE_GROUPS = [
   { key: 'business', title: '商务标审查' },
   { key: 'technical', title: '技术标 OCR 后检查' },
-  { key: 'duplicate', title: '查重' },
 ]
 
 function arrayify(value) {
