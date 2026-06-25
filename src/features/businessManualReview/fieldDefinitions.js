@@ -170,6 +170,7 @@ export function buildManualReviewDisplayFields(item, currentValue) {
   if (item.field_group === 'opening_amount') {
     addField({ path: ['small_amount_yuan'], label: '小写报价（元）', valueType: 'amount', sourceKeys: ['small_amount_yuan', 'small_amount', 'amount_yuan', 'amount', 'declared_total'], amountFallback: true })
     addField({ path: ['capital_amount_yuan'], label: '大写报价（元）', valueType: 'amount', sourceKeys: ['capital_amount_yuan', 'capital_amount', 'capital_price'] })
+    addField({ path: ['capital_raw_amount'], label: '大写金额原文（OCR）', valueType: 'text', sourceKeys: ['capital_raw_amount', 'capital_price_str'], readOnly: true })
     addField({ path: ['case_consistency_status'], label: '大小写是否一致', valueType: 'text', sourceKeys: ['case_consistency_status', 'case_consistency_summary'], readOnly: true })
     addField({ path: ['limit_comparison_status'], label: '是否超过最高限价', valueType: 'text', sourceKeys: ['limit_comparison_status', 'price_limit_status', 'tender_limit_status', 'limit_comparison_summary'], readOnly: true })
     return fields

@@ -205,14 +205,10 @@ export default function BusinessManualReviewPanel({
   manualDrafts,
   manualEditing,
   loading,
-  saving,
-  rerunning,
   locating,
   onDraftChange,
   onEditingChange,
   onJumpToPage,
-  onSave,
-  onRerun,
 }) {
   var [differencePages, setDifferencePages] = useState({})
   if (!currentAlert) return null
@@ -511,14 +507,6 @@ export default function BusinessManualReviewPanel({
         <div>
           <span className="alert-tag">识别内容回填</span>
           <strong>{checkLabels[currentAlert.subType] || currentAlert.subType}</strong>
-        </div>
-        <div className="manual-review-actions">
-          <button type="button" className="ghost-button" disabled={saving || rerunning} onClick={onSave}>
-            {saving ? '保存中...' : '保存本模块'}
-          </button>
-          <button type="button" className="primary-button" disabled={saving || rerunning} onClick={onRerun}>
-            {rerunning ? '复审中...' : '保存并二次审查'}
-          </button>
         </div>
       </div>
       <div className="manual-review-side-list">
