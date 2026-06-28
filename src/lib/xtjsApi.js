@@ -370,6 +370,28 @@ export async function ingestProjectDocuments({
   return payload
 }
 
+// 文件夹上传：一个项目文件夹（招标 PDF + 各公司商务/技术子文件夹）一次性建项目并自动绑定。
+// files 为浏览器选中的全部 File，relativePaths 为对应的 webkitRelativePath 数组（顺序一致）。
+export async function uploadProjectFolder({ files, relativePaths }) {
+  const formData = new FormData()
+  files.forEach((file) => {
+    formData.append('files', file)
+  })
+  formData.append('paths', JSON.stringify(relativePaths))
+
+  const payload = await request('/api/postgresql/projects/upload-folder', {
+    method: 'POST',
+    body: formData,
+  })
+  invalidateApiCache('/api/postgresql/projects')
+  return payload
+}
+
+// 作者查重预警：OCR 前检测不同公司投标 PDF 是否同一作者/创建人。
+export async function getProjectAuthorCheck(projectIdentifier) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/author-check`)
+}
+
 // ─── Project Results ─────────────────────────────────
 
 export async function getProjectResults(projectName, { forceRefresh = false } = {}) {

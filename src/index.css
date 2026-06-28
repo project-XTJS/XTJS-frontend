@@ -1,23 +1,31 @@
 :root {
+  /* 全局基准字号上调约 6%，让正文与各处小字整体更易读（rem 等比放大）。 */
+  font-size: 106.25%;
   font-family: 'Times New Roman', SimSun, '宋体', serif;
-  line-height: 1.5;
+  line-height: 1.6;
   font-weight: 400;
-  color: #334155;
-  background: #f5f8fc;
+  color: #1e293b;
+  background: #eef4fc;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 
-  --bg: #f5f8fc;
+  /* 配色整体调亮、提升对比：背景更通透，主色更鲜明，文字更深更清晰。 */
+  --bg: #eef4fc;
   --panel: #ffffff;
   --card: #ffffff;
-  --line: #dbe5f0;
-  --title: #0f172a;
-  --text: #334155;
-  --muted: #64748b;
-  --light-text: #94a3b8;
-  --primary: #2f6fec;
+  --line: #c8d6ea;
+  --title: #0b1220;
+  --text: #1e293b;
+  --muted: #475569;
+  --light-text: #64748b;
+  --primary: #2563eb;
+  --primary-strong: #1d4ed8;
+  --primary-soft: #e3edff;
+  --accent: #0ea5e9;
+  --warning: #d97706;
+  --danger: #dc2626;
   --font-main: 'Times New Roman', SimSun, '宋体', serif;
 }
 
@@ -35,8 +43,10 @@ body {
   margin: 0;
   color: var(--text);
   background:
-    radial-gradient(circle at top left, rgba(59, 130, 246, 0.08), transparent 24%),
-    linear-gradient(180deg, #f8fbff 0%, #f3f7fc 100%);
+    radial-gradient(circle at top left, rgba(37, 99, 235, 0.14), transparent 28%),
+    radial-gradient(circle at top right, rgba(14, 165, 233, 0.12), transparent 30%),
+    linear-gradient(180deg, #f3f8ff 0%, #e9f1fb 100%);
+  background-attachment: fixed;
 }
 
 body,

@@ -2,6 +2,7 @@ import { startTransition, useCallback, useEffect, useState } from 'react'
 import {
   continueTechnicalOcr,
   deleteProject,
+  getProjectAuthorCheck,
   getProjectDetail,
   getProjectOcrStatus,
   getProjectResults,
@@ -12,6 +13,7 @@ import {
   runBusinessOcr,
   runTenderOcr,
   saveProjectWorkflowScope,
+  uploadProjectFolder,
 } from '../lib/xtjsApi'
 import {
   DOCUMENT_LABELS,
@@ -225,6 +227,8 @@ export default function ProjectsPage() {
   const [deleteConfirm, setDeleteConfirm] = useState('')
   const [technicalOcrExcludedIdsByProject, setTechnicalOcrExcludedIdsByProject] = useState({})
   const [ocrStatus, setOcrStatus] = useState(null)
+  // 作者查重预警弹窗：{ report, onProceed?, proceedLabel }；onProceed 存在时显示“仍然继续”。
+  const [authorModal, setAuthorModal] = useState(null)
 
   const loadProjects = useCallback(async () => {
     setIsLoadingProjects(true)
@@ -564,6 +568,87 @@ export default function ProjectsPage() {
     })
   }
 
+  // 作者查重预警：拉取报告，有冲突则弹窗（warn-only）；无冲突时直接执行 onProceed。
+  async function runAuthorPrecheck(projectId, { onProceed = null, proceedLabel = '知道了' } = {}) {
+    let report = null
+    try {
+      report = await getProjectAuthorCheck(projectId)
+    } catch {
+      report = null
+    }
+    if (report && report.has_conflict) {
+      setAuthorModal({ report, onProceed, proceedLabel })
+      return false
+    }
+    if (onProceed) await onProceed()
+    return true
+  }
+
+  // 文件夹上传：一次性建项目并自动绑定，随后做作者查重预警。
+  async function handleUploadFolder(event) {
+    const input = event.target
+    const allFiles = Array.from(input.files || [])
+    input.value = '' // 重置，便于再次选择同一文件夹时仍触发 change
+    const files = allFiles.filter((file) => /\.pdf$/i.test(file.name) && file.webkitRelativePath)
+    if (files.length === 0) {
+      setNotice({ type: 'error', message: '未在所选文件夹中找到 PDF 文件，请检查文件夹结构。' })
+      return
+    }
+    const relativePaths = files.map((file) => file.webkitRelativePath)
+
+    setBusyToken('upload-folder')
+    setNotice({ type: 'info', message: '正在上传项目文件夹并自动绑定...' })
+    try {
+      const payload = await uploadProjectFolder({ files, relativePaths })
+      const projectId = getProjectIdentifier(payload.project)
+      const projectName = getProjectName(payload.project) || payload.project_name
+
+      let nextProject
+      try {
+        nextProject = normalizeProject(await getProjectDetail(projectId))
+      } catch {
+        nextProject = {
+          id: projectId,
+          identifierId: projectId,
+          projectName,
+          title: projectName || projectId,
+          createdAt: payload.project?.create_time ?? new Date().toISOString(),
+          updatedAt: payload.project?.update_time ?? new Date().toISOString(),
+          relations: [],
+          results: {},
+        }
+      }
+
+      startTransition(() => {
+        setProjects((current) => [
+          nextProject,
+          ...current.filter((item) => item.id !== nextProject.id),
+        ])
+        setSelectedProjectId(nextProject.id)
+        setIsComposerOpen(false)
+      })
+
+      const okCount = payload?.companies?.success ?? 0
+      const failCount = payload?.companies?.failed ?? 0
+      setNotice({
+        type: failCount > 0 ? 'warning' : 'success',
+        message: `项目「${projectName}」已创建，绑定 ${okCount} 家公司${failCount > 0 ? `（${failCount} 家失败）` : ''}，正在进行作者查重预警...`,
+      })
+
+      await runAuthorPrecheck(projectId, { proceedLabel: '知道了' })
+    } catch (error) {
+      const detail = error?.payload?.detail
+      let message = error.message || '文件夹上传失败。'
+      if (detail && typeof detail === 'object' && Array.isArray(detail.issues)) {
+        const issueText = detail.issues.map((issue) => issue.message).filter(Boolean).join('；')
+        message = `${detail.message || '文件夹结构校验未通过'}：${issueText}`
+      }
+      setNotice({ type: 'error', message })
+    } finally {
+      setBusyToken('')
+    }
+  }
+
   async function handleCreateProject() {
     if (!canSubmitComposer) return
 
@@ -660,8 +745,14 @@ export default function ProjectsPage() {
 
   async function handleRunTenderOcr() {
     if (!activeProject || !needsTenderOcr) return
+    // OCR 前先做作者查重预警：有冲突弹窗，确认后再继续；无冲突直接执行。
+    await runAuthorPrecheck(activeProject.identifierId, {
+      onProceed: () => actuallyRunTenderOcr(activeProject.identifierId),
+      proceedLabel: '仍然继续 OCR',
+    })
+  }
 
-    const projectId = activeProject.identifierId
+  async function actuallyRunTenderOcr(projectId) {
     setBusyToken('tender-ocr')
     setNotice({
       type: 'info',
@@ -799,6 +890,67 @@ export default function ProjectsPage() {
         </div>
       ) : null}
 
+      {authorModal ? (
+        <div className="modal-overlay" onClick={() => setAuthorModal(null)}>
+          <div
+            className="modal-card author-warning"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>⚠️ 作者查重预警</h3>
+            <p className="author-warning-lead">
+              检测到<strong>不同公司</strong>的投标文件由相同的作者/创建人生成，存在围标/串标嫌疑，
+              请人工核实后再继续。
+            </p>
+            <ul className="author-conflict-list">
+              {(authorModal.report?.conflicts ?? []).map((conflict, index) => (
+                <li key={index} className="author-conflict-item">
+                  <div className="author-conflict-head">
+                    <span className="author-conflict-field">
+                      {conflict.field === 'author' ? '作者' : '创建人'}
+                    </span>
+                    <code>{conflict.value}</code>
+                  </div>
+                  <div className="author-conflict-companies">
+                    {(conflict.companies ?? []).map((company, companyIndex) => (
+                      <div key={companyIndex} className="author-conflict-company">
+                        <strong>{company.company}</strong>
+                        <span>
+                          {(company.documents ?? [])
+                            .map((doc) => `${doc.role}·${doc.file_name}`)
+                            .join('、')}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={() => setAuthorModal(null)}
+              >
+                关闭
+              </button>
+              {authorModal.onProceed ? (
+                <button
+                  type="button"
+                  className="primary-button"
+                  onClick={async () => {
+                    const proceed = authorModal.onProceed
+                    setAuthorModal(null)
+                    if (proceed) await proceed()
+                  }}
+                >
+                  {authorModal.proceedLabel || '仍然继续'}
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {isComposerOpen ? (
         <section className="panel create-panel">
           <div className="panel-header">
@@ -811,6 +963,30 @@ export default function ProjectsPage() {
               收起
             </button>
           </div>
+
+          <div className="folder-upload-banner">
+            <div className="folder-upload-banner-text">
+              <strong>一键上传整个项目文件夹</strong>
+              <small>
+                选择一个项目文件夹：文件夹名即项目名，顶层 PDF 为招标文件，每个子文件夹为一家公司
+                （内含含“商务”“技术”关键字的两个 PDF）。系统自动建项目、绑定关系并做作者查重预警。
+              </small>
+            </div>
+            <label className="primary-button folder-upload-button">
+              {busyToken === 'upload-folder' ? '上传中...' : '选择项目文件夹'}
+              <input
+                type="file"
+                webkitdirectory=""
+                directory=""
+                multiple
+                hidden
+                disabled={busyToken === 'upload-folder'}
+                onChange={handleUploadFolder}
+              />
+            </label>
+          </div>
+
+          <div className="composer-divider"><span>或手动逐个上传</span></div>
 
           <div className="create-grid">
             <label className="field">
