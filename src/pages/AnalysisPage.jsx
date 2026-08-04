@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
+  checkTenderCompliance,
   getProjectDetail,
   getProjectResults,
   listProjects,
@@ -9,6 +10,7 @@ import {
 import { formatDateTime } from '../utils/formatters'
 import { normalizeProjectResultsPayload } from '../utils/results'
 import EmptyBlock from '../components/EmptyBlock'
+import FileUpload from '../components/FileUpload'
 import ProjectDropdown from '../components/ProjectDropdown'
 
 const PARSING_STATUS_BUSINESS_READY = 2
@@ -798,6 +800,112 @@ function getAnalysisStatusIcon(status, suspiciousCount = 0) {
   }
 }
 
+function getTenderComplianceStatusMeta(status) {
+  switch (String(status || '').toLowerCase()) {
+    case 'pass':
+    case 'passed':
+      return { label: '通过', className: 'pass' }
+    case 'fail':
+    case 'failed':
+      return { label: '异常', className: 'fail' }
+    case 'unclear':
+      return { label: '待复核', className: 'unclear' }
+    default:
+      return { label: '未检查', className: 'pending' }
+  }
+}
+
+function getTenderComplianceSummaryLabel(summary) {
+  const status = String(summary?.overall_status || '').toLowerCase()
+  if (status === 'failed') return '发现异常'
+  if (status === 'unclear') return '存在待复核项'
+  if (status === 'passed') return '全部通过'
+  return '等待检查'
+}
+
+function formatTenderComplianceKey(key) {
+  const labels = {
+    amount_yuan: '金额',
+    budget: '项目预算',
+    highest_limit: '最高限价',
+    bid_security: '投标保证金',
+    ratio_percent: '占比',
+    percent: '比例',
+    raw_value: '原文',
+    schedule: '前附表',
+    technical: '技术需求',
+    contract: '合同',
+    total_score: '总分',
+    category_scores: '大类分值',
+    category_sums: '细项满分合计',
+    category_detail_sums: '细项合计',
+    scoring_items: '评分项',
+    anomalies: '评分异常',
+    range_anomalies: '区间异常',
+  }
+  return labels[key] || key
+}
+
+function formatTenderComplianceValue(value) {
+  if (value === null || value === undefined || value === '') return '--'
+  if (typeof value === 'number') return Number.isInteger(value) ? `${value}` : `${Number(value.toFixed(4))}`
+  if (typeof value === 'string') return value.length > 80 ? `${value.slice(0, 80)}...` : value
+  if (Array.isArray(value)) {
+    if (value.length === 0) return '--'
+    const primitive = value.every((item) => item === null || ['string', 'number', 'boolean'].includes(typeof item))
+    return primitive ? value.map(formatTenderComplianceValue).join('、') : `${value.length} 项`
+  }
+  if (isPlainObject(value)) {
+    if (value.raw_amount || value.amount_yuan) {
+      const amount = value.raw_amount || value.amount_yuan
+      return value.page ? `${amount}（第 ${value.page} 页）` : `${amount}`
+    }
+    if (value.raw_value || value.percent !== undefined) {
+      return value.raw_value || `${value.percent}%`
+    }
+    if (Array.isArray(value.percentages) && value.percentages.length > 0) {
+      return value.percentages.map((item) => `${item}%`).join('、')
+    }
+    if (value.canonical) return formatTenderComplianceValue(value.canonical)
+    const text = JSON.stringify(value)
+    return text.length > 90 ? `${text.slice(0, 90)}...` : text
+  }
+  return String(value)
+}
+
+function getTenderScoreTypeLabel(scoreType) {
+  const labels = {
+    fixed: '固定分',
+    interval: '区间分',
+    deduction: '扣分项',
+    unknown: '待识别',
+  }
+  return labels[scoreType] || '待识别'
+}
+
+function formatTenderScoreRule(item) {
+  if (item?.score_type === 'interval') {
+    const ranges = arrayify(item.ranges)
+      .map((range) => `${range.start}-${range.end} 分`)
+      .join('；')
+    if (ranges) return ranges
+  }
+  if (item?.score_type === 'deduction' && item?.deduction_rule) {
+    return item.deduction_rule.text || (
+      item.deduction_rule.max_deduction !== null && item.deduction_rule.max_deduction !== undefined
+        ? `最多扣 ${item.deduction_rule.max_deduction} 分`
+        : '扣分上限待复核'
+    )
+  }
+  return item?.criteria || '--'
+}
+
+function formatTenderScorePages(item) {
+  const pages = arrayify(item?.evidence?.pages)
+  if (pages.length > 0) return pages.map((page) => `第 ${page} 页`).join('、')
+  return item?.evidence?.page ? `第 ${item.evidence.page} 页` : '--'
+}
+
 function canUseAnalysisType(analysisType, parsingStatus) {
   return Number(parsingStatus || 0) >= (analysisType.requiredParsingStatus ?? Infinity)
 }
@@ -837,6 +945,10 @@ export default function AnalysisPage() {
   const [checkedServices, setCheckedServices] = useState(new Set())
   const [selectedProjectParsingStatus, setSelectedProjectParsingStatus] = useState(0)
   const [selectedProjectMeta, setSelectedProjectMeta] = useState(null)
+  const [tenderComplianceFile, setTenderComplianceFile] = useState(null)
+  const [tenderComplianceStatus, setTenderComplianceStatus] = useState('idle')
+  const [tenderComplianceResult, setTenderComplianceResult] = useState(null)
+  const [tenderComplianceError, setTenderComplianceError] = useState('')
   const selectedProjectIdRef = useRef(selectedProjectId)
 
   const currentProjectMeta = useMemo(() => {
@@ -850,6 +962,11 @@ export default function AnalysisPage() {
   const overviewCards = useMemo(() => (
     buildOverviewCards(currentProjectMeta, results, selectedProjectParsingStatus)
   ), [currentProjectMeta, results, selectedProjectParsingStatus])
+  const tenderComplianceChecks = useMemo(
+    () => arrayify(tenderComplianceResult?.checks),
+    [tenderComplianceResult],
+  )
+  const tenderComplianceSummary = tenderComplianceResult?.summary || null
 
   useEffect(() => {
     selectedProjectIdRef.current = selectedProjectId
@@ -968,6 +1085,43 @@ export default function AnalysisPage() {
     setCheckedServices(new Set())
     setSelectedProjectParsingStatus(0)
     setSelectedProjectMeta(null)
+  }
+
+  function handleTenderComplianceFileChange(file) {
+    if (!file) return
+    setTenderComplianceFile(file)
+    setTenderComplianceResult(null)
+    setTenderComplianceError('')
+    setTenderComplianceStatus('idle')
+  }
+
+  async function handleRunTenderComplianceCheck() {
+    if (!tenderComplianceFile || tenderComplianceStatus === 'running') return
+    if (!/\.pdf$/i.test(tenderComplianceFile.name || '')) {
+      const message = '招标文件规范检查仅支持 PDF 文件'
+      setTenderComplianceStatus('error')
+      setTenderComplianceError(message)
+      setNotice({ type: 'error', message })
+      return
+    }
+
+    setTenderComplianceStatus('running')
+    setTenderComplianceError('')
+    setTenderComplianceResult(null)
+
+    try {
+      const result = await checkTenderCompliance(tenderComplianceFile)
+      setTenderComplianceResult(result)
+      setTenderComplianceStatus('success')
+      setNotice({
+        type: result?.summary?.failed > 0 ? 'warning' : 'success',
+        message: `招标文件规范检查完成：${getTenderComplianceSummaryLabel(result?.summary)}`,
+      })
+    } catch (error) {
+      setTenderComplianceStatus('error')
+      setTenderComplianceError(error.message)
+      setNotice({ type: 'error', message: `招标文件规范检查失败: ${error.message}` })
+    }
   }
 
   function isServiceDisabled(analysisType) {
@@ -1094,6 +1248,12 @@ export default function AnalysisPage() {
     )
   }
 
+  const tenderCompliancePanelMeta = tenderComplianceStatus === 'running'
+    ? { label: '检查中', className: 'running' }
+    : tenderComplianceStatus === 'error'
+      ? { label: '执行失败', className: 'fail' }
+      : getTenderComplianceStatusMeta(tenderComplianceSummary?.overall_status)
+
   return (
     <>
       {notice ? (
@@ -1101,6 +1261,142 @@ export default function AnalysisPage() {
           <p>{notice.message}</p>
         </div>
       ) : null}
+
+      <section className="panel tender-compliance-panel">
+        <div className="panel-header tender-compliance-head">
+          <div>
+            <h2>招标文件规范检查</h2>
+            <p>上传单份招标 PDF，检查预算、限价、保证金、付款方式和评标办法是否规范</p>
+          </div>
+          <span className={`tender-compliance-state tender-compliance-state-${tenderCompliancePanelMeta.className}`}>
+            {tenderCompliancePanelMeta.label}
+          </span>
+        </div>
+
+        <div className="tender-compliance-controls">
+          <FileUpload
+            accept=".pdf,application/pdf"
+            label="拖拽或点击上传招标 PDF"
+            fileName={tenderComplianceFile?.name}
+            onChange={handleTenderComplianceFileChange}
+          />
+          <button
+            type="button"
+            className="primary-button"
+            onClick={handleRunTenderComplianceCheck}
+            disabled={!tenderComplianceFile || tenderComplianceStatus === 'running'}
+          >
+            {tenderComplianceStatus === 'running' ? '检查中...' : '开始检查'}
+          </button>
+        </div>
+
+        {tenderComplianceError ? (
+          <div className="tender-compliance-error">{tenderComplianceError}</div>
+        ) : null}
+
+        {tenderComplianceSummary ? (
+          <div className="tender-compliance-summary">
+            <div>
+              <span>总体状态</span>
+              <strong>{getTenderComplianceSummaryLabel(tenderComplianceSummary)}</strong>
+            </div>
+            <div>
+              <span>通过</span>
+              <strong>{tenderComplianceSummary.passed ?? 0}</strong>
+            </div>
+            <div>
+              <span>异常</span>
+              <strong>{tenderComplianceSummary.failed ?? 0}</strong>
+            </div>
+            <div>
+              <span>待复核</span>
+              <strong>{tenderComplianceSummary.unclear ?? 0}</strong>
+            </div>
+          </div>
+        ) : null}
+
+        {tenderComplianceChecks.length > 0 ? (
+          <div className="tender-compliance-check-list">
+            {tenderComplianceChecks.map((check) => {
+              const statusMeta = getTenderComplianceStatusMeta(check.status)
+              const valueEntries = Object.entries(check.values || {}).filter(([key, value]) => (
+                key !== 'scoring_items' && value !== null && value !== undefined && value !== ''
+              ))
+              const contexts = arrayify(check.evidence?.contexts).slice(0, 2)
+              const scoringItems = arrayify(check.values?.scoring_items)
+
+              return (
+                <article
+                  className={`tender-compliance-check tender-compliance-check-${statusMeta.className} ${scoringItems.length > 0 ? 'tender-compliance-check-evaluation' : ''}`}
+                  key={check.code}
+                >
+                  <div className="tender-compliance-check-head">
+                    <strong>{check.title}</strong>
+                    <span>{statusMeta.label}</span>
+                  </div>
+                  <p>{check.message}</p>
+                  {valueEntries.length > 0 ? (
+                    <div className="tender-compliance-values">
+                      {valueEntries.slice(0, 6).map(([key, value]) => (
+                        <span key={key}>
+                          {formatTenderComplianceKey(key)}：{formatTenderComplianceValue(value)}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                  {scoringItems.length > 0 ? (
+                    <div className="tender-evaluation-table-wrap">
+                      <table className="tender-evaluation-table">
+                        <thead>
+                          <tr>
+                            <th>大类</th>
+                            <th>评分项</th>
+                            <th>类型</th>
+                            <th>单项满分</th>
+                            <th>评分/扣分规则</th>
+                            <th>结果</th>
+                            <th>位置</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {scoringItems.map((item, index) => {
+                            const itemStatus = getTenderComplianceStatusMeta(item.status)
+                            return (
+                              <tr key={`${item.category || 'unknown'}-${item.item_name || index}-${index}`}>
+                                <td>{item.category_label || '--'}</td>
+                                <td>{item.item_name || '--'}</td>
+                                <td>{getTenderScoreTypeLabel(item.score_type)}</td>
+                                <td>{item.item_max_score ?? '--'}</td>
+                                <td className="tender-evaluation-rule">{formatTenderScoreRule(item)}</td>
+                                <td>
+                                  <span className={`tender-evaluation-status tender-evaluation-status-${itemStatus.className}`}>
+                                    {itemStatus.label}
+                                  </span>
+                                </td>
+                                <td>{formatTenderScorePages(item)}</td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : null}
+                  {contexts.length > 0 ? (
+                    <div className="tender-compliance-evidence">
+                      {contexts.map((item, index) => (
+                        <small key={`${check.code}-${index}`}>
+                          {item.page ? `第 ${item.page} 页：` : ''}
+                          {formatTenderComplianceValue(item.text)}
+                        </small>
+                      ))}
+                    </div>
+                  ) : null}
+                </article>
+              )
+            })}
+          </div>
+        ) : null}
+      </section>
 
       <section className="analysis-header">
         <h2>分析中心</h2>

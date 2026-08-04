@@ -535,6 +535,15 @@ export async function runAnalysis({
   return payload
 }
 
+export async function checkTenderCompliance(file) {
+  const formData = new FormData()
+  formData.append('file', file)
+  return request('/api/analysis/tender-compliance-check', {
+    method: 'POST',
+    body: formData,
+  })
+}
+
 export async function updatePersonnelReuseDraft(projectIdentifier, documents) {
   const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/personnel-reuse-draft`, {
     method: 'PUT',
