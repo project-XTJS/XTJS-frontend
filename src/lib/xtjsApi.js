@@ -535,12 +535,36 @@ export async function runAnalysis({
   return payload
 }
 
-export async function checkTenderCompliance(file) {
+// ─── 独立招标文件审查 ────────────────────────────────
+
+export async function createTenderReview(file) {
   const formData = new FormData()
   formData.append('file', file)
-  return request('/api/analysis/tender-compliance-check', {
+  return request('/api/analysis/tender-reviews', {
     method: 'POST',
     body: formData,
+  })
+}
+
+export async function listTenderReviews({ page = 1, pageSize = 50 } = {}) {
+  return request('/api/analysis/tender-reviews', {
+    query: { page, page_size: pageSize },
+  })
+}
+
+export async function getTenderReview(reviewId) {
+  return request(`/api/analysis/tender-reviews/${encodeURIComponent(reviewId)}`)
+}
+
+export async function rerunTenderReview(reviewId) {
+  return request(`/api/analysis/tender-reviews/${encodeURIComponent(reviewId)}/rerun`, {
+    method: 'POST',
+  })
+}
+
+export async function deleteTenderReview(reviewId) {
+  return request(`/api/analysis/tender-reviews/${encodeURIComponent(reviewId)}`, {
+    method: 'DELETE',
   })
 }
 

@@ -12,6 +12,7 @@ import { probeBackend } from './lib/xtjsApi'
 import { AuthProvider } from './contexts/AuthContext'
 import { ROLE_LEVEL, useAuth } from './contexts/auth-context'
 import ProjectsPage from './pages/ProjectsPage'
+import TenderReviewPage from './pages/TenderReviewPage'
 import AnalysisPage from './pages/AnalysisPage'
 import ReviewPage from './pages/ReviewPage'
 import LoginPage from './pages/LoginPage'
@@ -19,6 +20,7 @@ import UsersPage from './pages/UsersPage'
 
 const NAV_TABS = [
   { path: '/projects', label: '项目管理' },
+  { path: '/tender-review', label: '招标文件审查' },
   { path: '/analysis', label: '分析中心' },
   { path: '/review', label: '结果审核' },
   { path: '/users', label: '用户管理', minLevel: ROLE_LEVEL.ADMIN },
@@ -126,6 +128,7 @@ function AppShell() {
       <Routes>
         <Route path="/" element={<Navigate to="/projects" replace />} />
         <Route path="/projects" element={<ProjectsPage />} />
+        <Route path="/tender-review" element={<TenderReviewPage />} />
         <Route path="/analysis" element={<AnalysisPage />} />
         <Route path="/review" element={<ReviewPage />} />
         <Route
