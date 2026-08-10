@@ -725,6 +725,10 @@ export function getDocumentSourceUrl(fileNameOrId, page) {
   return url
 }
 
+export async function getObjectPresignedUrl(objectName) {
+  return request(`/api/file/objects/${encodeURIComponent(objectName)}/presigned-url`)
+}
+
 export async function getDocumentPreview(fileNameOrId, page, { highlight, highlightBbox, highlightRects, highlightCoordinateSpace } = {}) {
   const url = `${API_BASE_URL}/api/postgresql/documents/${encodeURIComponent(fileNameOrId)}/preview/pages/${page}`
   const body = {}
@@ -809,4 +813,3 @@ export async function deleteResult(projectIdentifierId) {
 }
 
 // ─── Export Report ──────────────────────────────────
-

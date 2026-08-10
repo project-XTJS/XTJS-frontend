@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom'
 import {
   getDocumentSourceUrl,
   getDocumentPreview,
+  getObjectPresignedUrl,
   getProjectDetail,
   getProjectResults,
   listProjects,
@@ -4189,11 +4190,22 @@ function downloadUrl(url, fileName) {
   document.body.removeChild(a)
 }
 
-function getReportDownloadUrl(response) {
-  return response?.report_upload?.presigned_url ||
+async function getReportDownloadUrl(response) {
+  var candidate = response?.report_upload?.presigned_url ||
     response?.report_upload?.file_url ||
     response?.report_url ||
     ''
+  // 兜底：minio:// 内部协议不能在浏览器直接打开，转调后端换取公网预签名地址。
+  if (candidate && candidate.indexOf('minio://') === 0) {
+    var objectPath = candidate.replace(/^minio:\/\/[^/]+\//, '')
+    try {
+      var presigned = await getObjectPresignedUrl(objectPath)
+      if (presigned && presigned.presigned_url) return presigned.presigned_url
+    } catch (e) {
+      // 换取失败时保持原值返回，由上层提示
+    }
+  }
+  return candidate
 }
 
 function getProjectIdentifierValue(project) {
@@ -4520,6 +4532,9 @@ export default function ReviewPage() {
   var [personnelActiveBidderKey, setPersonnelActiveBidderKey] = useState('')
   var [personnelActiveDocKey, setPersonnelActiveDocKey] = useState('')
   var [personnelActivePage, setPersonnelActivePage] = useState(1)
+  var [personnelEntryPage, setPersonnelEntryPage] = useState(1)
+  var [personnelEntryPageSize, setPersonnelEntryPageSize] = useState(8)
+  var [personnelDuplicatePage, setPersonnelDuplicatePage] = useState(1)
   var [personnelDraftDirty, setPersonnelDraftDirty] = useState(false)
   var [personnelDraftSaving, setPersonnelDraftSaving] = useState(false)
   var [personnelConfirming, setPersonnelConfirming] = useState(false)
@@ -4533,8 +4548,42 @@ export default function ReviewPage() {
   var [deviationManualSaving, setDeviationManualSaving] = useState(false)
   var resultsRef = useRef(results)
   var projectDetailRef = useRef(projectDetail)
+  var personnelEntryListRef = useRef(null)
+  var personnelPreviewPageRef = useRef(null)
   var savePersonnelDraftRef = useRef(null)
   var exportModalRef = useRef(null)
+
+  useEffect(function () {
+    // 页面对齐：以左侧 PDF 页面（.diff-page-preview）为基准，
+    // 右侧人名表区域高度 = 页面高度 - 右侧自身头部（公司选择/页签/表头），
+    // 每页条数随该高度自动计算，保证右侧内容与页面等长，超出部分翻页。
+    var pageEl = personnelPreviewPageRef.current
+    var listEl = personnelEntryListRef.current
+    var measure = function () {
+      var pageHeight = pageEl ? pageEl.clientHeight : 620
+      var tableHeight = pageHeight
+      if (pageEl && listEl) {
+        var pageRect = pageEl.getBoundingClientRect()
+        var listRect = listEl.getBoundingClientRect()
+        var chromeDiff = listRect.top - pageRect.top
+        tableHeight = Math.max(140, pageHeight - chromeDiff)
+      }
+      if (listEl) listEl.style.height = tableHeight + 'px'
+      var rowHeight = 42
+      if (listEl && listEl.clientHeight > 0) {
+        setPersonnelEntryPageSize(Math.max(1, Math.floor(listEl.clientHeight / rowHeight)))
+      }
+    }
+    measure()
+    var targets = [pageEl, listEl].filter(Boolean)
+    if (typeof ResizeObserver !== 'undefined' && targets.length > 0) {
+      var observer = new ResizeObserver(measure)
+      targets.forEach(function (el) { observer.observe(el) })
+      return function () { observer.disconnect() }
+    }
+    window.addEventListener('resize', measure)
+    return function () { window.removeEventListener('resize', measure) }
+  }, [personnelActiveDocKey, personnelActiveDocument])
 
   var loadProjects = useCallback(function () {
     listProjects({ pageSize: 100 }).then(function (listing) {
@@ -5623,6 +5672,7 @@ export default function ReviewPage() {
     if (bidderKey) setPersonnelActiveBidderKey(bidderKey)
     setPersonnelActiveDocKey(docKey)
     setPersonnelActivePage(Number(page || 1) || 1)
+    setPersonnelEntryPage(1)
     setCurrentAlertIndex(0)
     setPreviewData({})
     setPreviewPages({})
@@ -5655,7 +5705,7 @@ export default function ReviewPage() {
     try {
       var payload = buildFilteredResultJson(allAlerts, selectedAlerts, overviewResultKeys, reviewStatus)
       var response = await exportWordReport(payload)
-      var reportUrl = getReportDownloadUrl(response)
+      var reportUrl = await getReportDownloadUrl(response)
       var reportName = response?.report_name || ('review-report-' + selectedProjectId + '.docx')
 
       if (reportUrl) {
@@ -6052,7 +6102,7 @@ export default function ReviewPage() {
                     </form>
                   </div>
                 </div>
-                <div className="diff-page-preview" style={{ '--preview-zoom': previewZoom / 100 }}>
+                <div className="diff-page-preview" ref={personnelPreviewPageRef} style={{ '--preview-zoom': previewZoom / 100 }}>
                   {preview && preview.image_data_url ? (
                     <button
                       type="button"
@@ -6140,6 +6190,12 @@ export default function ReviewPage() {
               var activeEditorDocKey = getPersonnelDraftDocKey(personnelActiveDocument)
               var isActive = String(docKey || '') === String(activeEditorDocKey || '')
               if (!isActive) return null
+              var allEntries = arrayify(doc.personnel_entries)
+              var entryPageSize = Math.max(1, personnelEntryPageSize || 1)
+              var entryTotalPages = Math.max(1, Math.ceil(allEntries.length / entryPageSize))
+              var entrySafePage = Math.min(personnelEntryPage || 1, entryTotalPages)
+              var entryStart = (entrySafePage - 1) * entryPageSize
+              var visibleEntries = allEntries.slice(entryStart, entryStart + entryPageSize)
               return (
                 <div className="personnel-entry-editor" key={'editor-' + docKey}>
                   <div className="personnel-entry-head">
@@ -6148,63 +6204,85 @@ export default function ReviewPage() {
                       添加人员
                     </button>
                   </div>
-                  <table className="personnel-entry-table">
-                    <thead>
-                      <tr>
-                        <th>姓名</th>
-                        <th>页码</th>
-                        <th>备注</th>
-                        <th>操作</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {arrayify(doc.personnel_entries).length === 0 ? (
+                  <div className="personnel-entry-table-scroll" ref={personnelEntryListRef}>
+                    <table className="personnel-entry-table">
+                      <thead>
                         <tr>
-                          <td colSpan={4} className="overview-empty-cell">暂无人员，可手动添加</td>
+                          <th>姓名</th>
+                          <th>页码</th>
+                          <th>备注</th>
+                          <th>操作</th>
                         </tr>
-                      ) : arrayify(doc.personnel_entries).map(function (entry, entryIndex) {
-                        var entryPages = collectPersonnelDraftEntryPages(entry)
-                        var entryKey = entry._draft_id || entry.draft_id || ('fallback-' + entryIndex)
-                        return (
-                          <tr key={'personnel-entry-' + entryKey}>
-                            <td>
-                              <input value={entry.name || ''} onChange={function (event) { handlePersonnelEntryChange(docKey, entryIndex, 'name', event.target.value) }} />
-                            </td>
-                            <td>
-                              <div className="personnel-page-links">
-                                {entryPages.length > 0 ? entryPages.map(function (page) {
-                                  return (
-                                    <button
-                                      type="button"
-                                      className="personnel-page-link"
-                                      key={'personnel-entry-page-' + entryIndex + '-' + page}
-                                      onClick={function () { handlePersonnelDocSelect(doc, page) }}
-                                      title={'跳转到第 ' + page + ' 页'}
-                                    >
-                                      P{page}
-                                    </button>
-                                  )
-                                }) : <span className="overview-muted">页码待补充</span>}
-                              </div>
-                              <input
-                                value={entry.page || ''}
-                                inputMode="numeric"
-                                onChange={function (event) { handlePersonnelEntryChange(docKey, entryIndex, 'page', event.target.value.replace(/[^\d]/g, '')) }}
-                              />
-                            </td>
-                            <td>
-                              <input value={entry.note || ''} onChange={function (event) { handlePersonnelEntryChange(docKey, entryIndex, 'note', event.target.value) }} />
-                            </td>
-                            <td>
-                              <button type="button" className="ghost-button" onClick={function () { handleRemovePersonnelEntry(docKey, entryIndex) }}>
-                                删除
-                              </button>
-                            </td>
+                      </thead>
+                      <tbody>
+                        {allEntries.length === 0 ? (
+                          <tr>
+                            <td colSpan={4} className="overview-empty-cell">暂无人员，可手动添加</td>
                           </tr>
-                        )
-                      })}
-                    </tbody>
-                  </table>
+                        ) : visibleEntries.map(function (entry, offset) {
+                          var entryIndex = entryStart + offset
+                          var entryPages = collectPersonnelDraftEntryPages(entry)
+                          var entryKey = entry._draft_id || entry.draft_id || ('fallback-' + entryIndex)
+                          return (
+                            <tr key={'personnel-entry-' + entryKey}>
+                              <td>
+                                <input value={entry.name || ''} onChange={function (event) { handlePersonnelEntryChange(docKey, entryIndex, 'name', event.target.value) }} />
+                              </td>
+                              <td>
+                                <div className="personnel-page-links">
+                                  {entryPages.length > 0 ? entryPages.map(function (page) {
+                                    return (
+                                      <button
+                                        type="button"
+                                        className="personnel-page-link"
+                                        key={'personnel-entry-page-' + entryIndex + '-' + page}
+                                        onClick={function () { handlePersonnelDocSelect(doc, page) }}
+                                        title={'跳转到第 ' + page + ' 页'}
+                                      >
+                                        P{page}
+                                      </button>
+                                    )
+                                  }) : <span className="overview-muted">页码待补充</span>}
+                                </div>
+                                <input
+                                  value={entry.page || ''}
+                                  inputMode="numeric"
+                                  onChange={function (event) { handlePersonnelEntryChange(docKey, entryIndex, 'page', event.target.value.replace(/[^\d]/g, '')) }}
+                                />
+                              </td>
+                              <td>
+                                <input value={entry.note || ''} onChange={function (event) { handlePersonnelEntryChange(docKey, entryIndex, 'note', event.target.value) }} />
+                              </td>
+                              <td>
+                                <button type="button" className="ghost-button" onClick={function () { handleRemovePersonnelEntry(docKey, entryIndex) }}>
+                                  删除
+                                </button>
+                              </td>
+                            </tr>
+                          )
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="personnel-pagination">
+                    <button
+                      type="button"
+                      className="pdf-page-btn"
+                      disabled={entrySafePage <= 1}
+                      onClick={function () { setPersonnelEntryPage(entrySafePage - 1) }}
+                    >
+                      ◀ 上一页
+                    </button>
+                    <span className="pdf-page-info">第 {entrySafePage} / {entryTotalPages} 页 · 共 {allEntries.length} 人</span>
+                    <button
+                      type="button"
+                      className="pdf-page-btn"
+                      disabled={entrySafePage >= entryTotalPages}
+                      onClick={function () { setPersonnelEntryPage(entrySafePage + 1) }}
+                    >
+                      下一页 ▶
+                    </button>
+                  </div>
                 </div>
               )
             })}
@@ -6219,37 +6297,69 @@ export default function ReviewPage() {
           {duplicateIssues.length === 0 ? (
             <EmptyBlock title={duplicateEmptyTitle} />
           ) : (
-            <div className="personnel-duplicate-list">
-              {duplicateIssues.map(function (issue, index) {
-                return (
-                  <div className="diff-block personnel-doc-block" key={'personnel-dup-' + index}>
-                    <span className="diff-block-page">{formatPagesByFile(issue.pages_by_file)}</span>
-                    <p><span className="personnel-name-duplicate">{issue.name}</span> / 出现 {issue.occurrence_count || '--'} 次</p>
-                    <div className="personnel-name-list">
-                      {arrayify(issue.occurrences).map(function (entry, entryIndex) {
-                        var fileName = entry.file_name || '投标文件'
-                        var page = extractFirstPage(entry)
-                        return (
-                          <button
-                            type="button"
-                            className="personnel-page-chip"
-                            key={'dup-location-' + entryIndex}
-                            onClick={function () {
-                              var targetDoc = personnelDraftDocuments.find(function (doc) {
-                                return getLookupKey(doc.document_identifier_id || doc.identifier_id || doc.file_name) === getLookupKey(entry.document_identifier_id || entry.identifier_id || entry.file_name)
-                              })
-                              if (targetDoc) handlePersonnelDocSelect(targetDoc, page || 1)
-                            }}
-                          >
-                            {fileName}{page ? ' / P' + page : ''}
-                          </button>
-                        )
-                      })}
-                    </div>
+            (function () {
+              var duplicateTotalPages = Math.max(1, Math.ceil(duplicateIssues.length / 5))
+              var safeDuplicatePage = Math.min(personnelDuplicatePage || 1, duplicateTotalPages)
+              var duplicateStart = (safeDuplicatePage - 1) * 5
+              var visibleIssues = duplicateIssues.slice(duplicateStart, duplicateStart + 5)
+              return (
+                <div>
+                  <div className="personnel-duplicate-list">
+                    {visibleIssues.map(function (issue, index) {
+                      var issueIndex = duplicateStart + index
+                      return (
+                        <div className="diff-block personnel-doc-block" key={'personnel-dup-' + issueIndex}>
+                          <span className="diff-block-page">{formatPagesByFile(issue.pages_by_file)}</span>
+                          <p><span className="personnel-name-duplicate">{issue.name}</span> / 出现 {issue.occurrence_count || '--'} 次</p>
+                          <div className="personnel-name-list">
+                            {arrayify(issue.occurrences).map(function (entry, entryIndex) {
+                              var fileName = entry.file_name || '投标文件'
+                              var page = extractFirstPage(entry)
+                              return (
+                                <button
+                                  type="button"
+                                  className="personnel-page-chip"
+                                  key={'dup-location-' + issueIndex + '-' + entryIndex}
+                                  onClick={function () {
+                                    var targetDoc = personnelDraftDocuments.find(function (doc) {
+                                      return getLookupKey(doc.document_identifier_id || doc.identifier_id || doc.file_name) === getLookupKey(entry.document_identifier_id || entry.identifier_id || entry.file_name)
+                                    })
+                                    if (targetDoc) handlePersonnelDocSelect(targetDoc, page || 1)
+                                  }}
+                                >
+                                  {fileName}{page ? ' / P' + page : ''}
+                                </button>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )
+                    })}
                   </div>
-                )
-              })}
-            </div>
+                  {duplicateIssues.length > 5 ? (
+                    <div className="personnel-pagination">
+                      <button
+                        type="button"
+                        className="pdf-page-btn"
+                        disabled={safeDuplicatePage <= 1}
+                        onClick={function () { setPersonnelDuplicatePage(safeDuplicatePage - 1) }}
+                      >
+                        ◀ 上一页
+                      </button>
+                      <span className="pdf-page-info">第 {safeDuplicatePage} / {duplicateTotalPages} 页</span>
+                      <button
+                        type="button"
+                        className="pdf-page-btn"
+                        disabled={safeDuplicatePage >= duplicateTotalPages}
+                        onClick={function () { setPersonnelDuplicatePage(safeDuplicatePage + 1) }}
+                      >
+                        下一页 ▶
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              )
+            })()
           )}
         </section>
       </div>

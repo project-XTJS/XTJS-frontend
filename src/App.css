@@ -3742,6 +3742,7 @@
   padding: 16px !important;
 }
 
+
 .personnel-doc-tabs {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -3780,6 +3781,19 @@
 .personnel-entry-editor {
   display: grid;
   gap: 10px;
+}
+
+.personnel-entry-table-scroll {
+  /* 高度由 JS 按左侧页面高度动态设置 */
+  overflow: hidden;
+}
+
+.personnel-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 10px;
 }
 
 .personnel-entry-head {
