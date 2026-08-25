@@ -1203,10 +1203,13 @@ function collectDuplicateAlerts(results, allAlerts) {
     var result = results[resultKey]
     if (!result) return
 
-    getDuplicateResultIssueEntries(result).forEach(function (entry) {
+    var visibleEntries = getDuplicateResultIssueEntries(result).filter(function (entry) {
+      return isDuplicateIssueVisible(entry.item)
+    })
+
+    visibleEntries.forEach(function (entry) {
       var item = entry.item
       var index = entry.index
-      if (!isDuplicateIssueVisible(item)) return
 
       var alertResultType = getDuplicateAlertResultType(resultKey, item)
       var docs = buildDuplicateClusterDocs(item)
@@ -1255,6 +1258,38 @@ function collectDuplicateAlerts(results, allAlerts) {
       alert.exportPayload = buildExportPayload(alert, item)
       allAlerts.push(alert)
     })
+
+    // 查重结果存在但未发现可见问题：一句话总结没有问题（绿色通过项）。
+    if (visibleEntries.length === 0 && resultKey !== 'business_itemized_duplicate_check') {
+      var cleanResultType = getDuplicateAlertResultType(resultKey, {})
+      var cleanTypeLabel = RESULT_TYPE_LABELS[cleanResultType] || RESULT_TYPE_LABELS[resultKey] || '查重'
+      var cleanAlert = {
+        id: makeAlertId('duplicate-clean', cleanResultType, 'clean'),
+        resultType: cleanResultType,
+        parentResultType: cleanResultType !== resultKey ? resultKey : '',
+        sourceResultKey: resultKey,
+        resultTypeLabel: cleanTypeLabel,
+        groupKey: 'clean',
+        groupLabel: cleanTypeLabel,
+        riskLevel: 'none',
+        sourceStatus: 'passed',
+        title: '未发现重复内容',
+        description: '未发现重复内容，没有问题',
+        metrics: { '检查结果': '未发现重复内容' },
+        evidence: {},
+        page: null,
+        sourceItem: {
+          title: '未发现重复内容',
+          summary: '未发现重复内容，没有问题',
+          status: 'passed',
+        },
+      }
+      cleanAlert.exportPayload = Object.assign(
+        buildExportPayload(cleanAlert, cleanAlert.sourceItem),
+        { title: '未发现重复内容', summary: '未发现重复内容，没有问题', source_status: 'passed' }
+      )
+      allAlerts.push(cleanAlert)
+    }
   })
 }
 
@@ -3125,7 +3160,14 @@ function collectPersonnelAlertsFromGroups(resultKey, result, allAlerts, options)
           page: summaryDocs[0] && summaryDocs[0].startPage,
           sourceItem: check,
         }
-        summaryAlert.exportPayload = buildExportPayload(summaryAlert, check)
+        summaryAlert.exportPayload = Object.assign(
+          buildExportPayload(summaryAlert, check),
+          {
+            title: '未发现人员复用',
+            summary: '未发现人员复用，没有问题',
+            source_status: 'passed',
+          }
+        )
         allAlerts.push(summaryAlert)
       }
       return
@@ -4130,6 +4172,7 @@ function buildManualDeadlineLocator(item) {
 function buildSelectedExportPayload(alert, reviewStatusMap) {
   var payload = cloneForExport(alert.exportPayload || buildExportPayload(alert, alert.sourceItem))
   var status = reviewStatusMap && reviewStatusMap[alert.id]
+  var manuallyFlagged = Boolean(status && status.status === 'flagged')
 
   if (status) {
     payload.frontend_review_status = status.status
@@ -4138,17 +4181,23 @@ function buildSelectedExportPayload(alert, reviewStatusMap) {
 
   if (alert.sourceStatus === 'passed') {
     payload.original_source_status = payload.source_status || 'passed'
-    payload.frontend_review_status = 'flagged'
-    payload.manual_reason = '人工复核从通过项归为有错误项'
-    if (isObject(payload.issue)) {
-      var originalStatus = payload.issue.status
-      payload.issue = Object.assign({}, payload.issue, {
-        original_status: originalStatus || 'pass',
-        status: 'fail',
-        severity: 'error',
-        manually_flagged: true,
-        message: (payload.issue.message || alert.description || '') + '（人工复核归为有错误项）',
-      })
+    if (manuallyFlagged) {
+      payload.frontend_review_status = 'flagged'
+      payload.manual_reason = '人工复核从通过项归为有错误项'
+      if (isObject(payload.issue)) {
+        var originalStatus = payload.issue.status
+        payload.issue = Object.assign({}, payload.issue, {
+          original_status: originalStatus || 'pass',
+          status: 'fail',
+          severity: 'error',
+          manually_flagged: true,
+          message: (payload.issue.message || alert.description || '') + '（人工复核归为有错误项）',
+        })
+      }
+    } else {
+      // 未人工改判的通过项：导出为“正确无误”。
+      payload.frontend_review_status = payload.frontend_review_status || 'passed'
+      payload.export_marked_correct = true
     }
   }
 
@@ -4156,9 +4205,8 @@ function buildSelectedExportPayload(alert, reviewStatusMap) {
 }
 
 function buildFilteredResultJson(alerts, selectedAlertIds, resultTypeOrder, reviewStatusMap) {
-  var selected = sortAlertsForExport(alerts.filter(function (alert) {
-    return selectedAlertIds.has(alert.id)
-  }), resultTypeOrder)
+  // 导出全部审查项：选中的问题项 + 未选中的内容 + 正确无误项（通过项由后端标注“具体内容正确无误”）。
+  var selected = sortAlertsForExport(alerts, resultTypeOrder)
 
   return {
     result: selected.map(function (alert) {
@@ -5682,7 +5730,7 @@ export default function ReviewPage() {
   }
 
   async function handleExportJson() {
-    if (!selectedProjectId || selectedAlerts.size === 0) return
+    if (!selectedProjectId) return
 
     setExportLoading(true)
     try {
@@ -5699,7 +5747,7 @@ export default function ReviewPage() {
   }
 
   async function handleExportWord() {
-    if (!selectedProjectId || selectedAlerts.size === 0) return
+    if (!selectedProjectId) return
 
     setExportLoading(true)
     try {
@@ -6412,7 +6460,7 @@ export default function ReviewPage() {
             type="button"
             className="primary-button"
             onClick={function () { setShowExport(!showExport) }}
-            disabled={!selectedProjectId || selectedAlerts.size === 0}
+            disabled={!selectedProjectId}
           >
             导出报告{selectedAlerts.size > 0 ? ' (' + selectedAlerts.size + ')' : ''}
           </button>
@@ -7228,7 +7276,11 @@ export default function ReviewPage() {
             <div className="modal-body">
               <div className="export-summary">
                 <div className="export-summary-item">
-                  <span className="export-summary-label">保留项</span>
+                  <span className="export-summary-label">导出项</span>
+                  <span className="export-summary-value">{allAlerts.length} 项</span>
+                </div>
+                <div className="export-summary-item">
+                  <span className="export-summary-label">已选问题</span>
                   <span className="export-summary-value">{selectedAlerts.size} 项</span>
                 </div>
                 {Object.keys(selectedByType).length > 0 ? (
@@ -7246,7 +7298,7 @@ export default function ReviewPage() {
 
               <div className="export-section">
                 <strong>导出说明</strong>
-                <p>将按问题种类、问题文件页码顺序导出已保留项，不包含已忽略项。导出使用原始完整结果内容，不受总览折叠展示影响。</p>
+                <p>将按当前分析结果导出全部审查项，按问题种类、问题文件页码顺序排列。手动选择“忽略此项”的条目按正确无误/通过导出（绿色），选择“确认保留”的继续按不通过导出（红色），未处理项按分析状态导出。导出使用原始完整结果内容，不受总览折叠展示影响。</p>
               </div>
             </div>
 
