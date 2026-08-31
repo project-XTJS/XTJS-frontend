@@ -3500,9 +3500,14 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
         var riskLevel = issueEntry.sourceStatus === 'passed'
           ? 'none'
           : normalizeRiskLevel(issue.severity || issue.status || reviewStatus)
-        var overviewDocuments = (isDeviationTableMissing || isVerificationMissingAttachment || checkKey === 'deviation_check')
-          ? docRefs
-          : buildFormatOverviewDocuments(bidder, bidderDocumentLookup, docRefs, previewPage)
+        // 签字盖章附件缺失时，docRefs 只有招标文件的“要求位置”。
+        // 该文档仅是证据来源，不应被当成问题归属文件出现在“按文件”筛选中；
+        // 概览/筛选统一归到当前投标人的商务标，详情仍保留 docRefs 用于定位招标要求。
+        var overviewDocuments = isVerificationMissingAttachment
+          ? buildFormatOverviewDocuments(bidder, bidderDocumentLookup, docRefs, 1)
+          : ((isDeviationTableMissing || checkKey === 'deviation_check')
+              ? docRefs
+              : buildFormatOverviewDocuments(bidder, bidderDocumentLookup, docRefs, previewPage))
         var alertTitle = checkKey === 'pricing_check' && issue.title === '报价合理性'
           ? '报价合理性（直接报价大小写一致、是否超过最高限价）'
           : checkLabel + '：' + (issue.title || (isPassedItem ? '已符合要求' : '待确定'))
