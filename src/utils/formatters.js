@@ -63,10 +63,15 @@ export function getParsingProgress(parsingStatus) {
 }
 
 export function getProjectStatus(project) {
-  const hasRelations = project.relations.length > 0
+  const hasRelations = (project.relationCount ?? project.relations.length) > 0
   const results = project.results ?? {}
-  const resultKeys = Object.keys(results).filter((k) => results[k])
+  const resultKeys = project.resultsLoaded === false
+    ? (project.availableResultKeys ?? [])
+    : Object.keys(results).filter((k) => results[k])
   const parsingStatus = project.parsingStatus ?? 0
+  const summary = project.resultsLoaded === false && project.resultSummary?.version === 1
+    ? project.resultSummary : null
+  const resultCount = summary ? summary.result_count : resultKeys.length
 
   if (!hasRelations) {
     return { label: '待绑定', className: 'status-pending' }
@@ -78,11 +83,15 @@ export function getProjectStatus(project) {
   }
 
   // 解析完成但无分析结果：显示"待分析"
-  if (parsingStatus === 3 && resultKeys.length === 0) {
+  if (parsingStatus === 3 && resultCount === 0) {
     return { label: '待分析', className: 'status-ready' }
   }
 
-  const hasSuspicious = resultKeys.some((key) => {
+  if (project.resultsLoaded === false && !summary && resultCount > 0) {
+    return { label: '状态待更新', className: 'status-ready' }
+  }
+
+  const hasSuspicious = summary ? summary.has_suspicious : resultKeys.some((key) => {
     const r = results[key]
     return Number(r?.summary?.suspicious) > 0
   })
@@ -91,11 +100,11 @@ export function getProjectStatus(project) {
     return { label: '需复核', className: 'status-risk' }
   }
 
-  if (resultKeys.length >= 2) {
+  if (resultCount >= 2) {
     return { label: '已完成', className: 'status-success' }
   }
 
-  if (resultKeys.length > 0) {
+  if (resultCount > 0) {
     return { label: '处理中', className: 'status-running' }
   }
 
@@ -104,6 +113,7 @@ export function getProjectStatus(project) {
 
 export function getProjectSummary(project) {
   const status = getProjectStatus(project)
+  if (status.label === '状态待更新') return '进入分析中心查看审查结果'
 
   switch (status.className) {
     case 'status-pending':

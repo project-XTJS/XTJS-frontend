@@ -140,27 +140,37 @@ function unwrapUnifiedPayload(payload, response) {
   return payload
 }
 
-export async function request(path, { method = 'GET', query, body, headers } = {}) {
+export async function request(path, { method = 'GET', query, body, headers, timeoutMs = 0 } = {}) {
   // 自动携带 Bearer 令牌（已登录时）。
   const token = getToken()
   const finalHeaders = token
     ? { ...(headers || {}), Authorization: `Bearer ${token}` }
     : headers
 
-  const response = await fetch(buildRequestUrl(path, query), {
-    method,
-    body,
-    headers: finalHeaders,
-  })
+  const controller = timeoutMs > 0 ? new AbortController() : null
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+  try {
+    const response = await fetch(buildRequestUrl(path, query), {
+      method,
+      body,
+      headers: finalHeaders,
+      ...(controller ? { signal: controller.signal } : {}),
+    })
 
-  // 会话失效：清除令牌并通知上层跳转登录，避免无效请求继续。
-  if (response.status === 401) {
-    clearToken()
-    emitUnauthorized()
+    // 会话失效：清除令牌并通知上层跳转登录，避免无效请求继续。
+    if (response.status === 401) {
+      clearToken()
+      emitUnauthorized()
+    }
+
+    const payload = await parseResponseBody(response)
+    return unwrapUnifiedPayload(payload, response)
+  } catch (error) {
+    if (controller?.signal.aborted) throw createApiError('加载超时，请稍后重试。', { status: 408 })
+    throw error
+  } finally {
+    if (timer !== null) clearTimeout(timer)
   }
-
-  const payload = await parseResponseBody(response)
-  return unwrapUnifiedPayload(payload, response)
 }
 
 function canUseSessionStorage() {
@@ -250,8 +260,8 @@ function invalidateProjectResultsCache(identifierId) {
   invalidateApiCache((key) => key.includes(`/api/postgresql/projects/${encodedIdentifier}/results`))
 }
 
-function cachedRequest(path, { query, ttl, forceRefresh = false } = {}) {
-  const cacheKey = buildRequestUrl(path, query).href
+function cachedRequest(path, { query, ttl, forceRefresh = false, timeoutMs, cacheVersion = '' } = {}) {
+  const cacheKey = buildRequestUrl(path, query).href + (cacheVersion ? `#${cacheVersion}` : '')
 
   if (!forceRefresh) {
     const cached = readCachedPayload(cacheKey)
@@ -261,7 +271,7 @@ function cachedRequest(path, { query, ttl, forceRefresh = false } = {}) {
   }
 
   const requestEpoch = apiCacheEpoch
-  const requestPromise = request(path, { query })
+  const requestPromise = request(path, { query, timeoutMs })
     .then((payload) => {
       if (requestEpoch === apiCacheEpoch) {
         writeCachedPayload(cacheKey, payload, ttl)
@@ -288,6 +298,8 @@ export async function listProjects({ page = 1, pageSize = 24, keyword, forceRefr
   return cachedRequest('/api/postgresql/projects', {
     query: { page, page_size: pageSize, keyword },
     ttl: API_CACHE_TTL.projectList,
+    cacheVersion: 'result-summary-v1',
+    timeoutMs: 20000,
     forceRefresh,
   })
 }
@@ -295,6 +307,7 @@ export async function listProjects({ page = 1, pageSize = 24, keyword, forceRefr
 export async function getProjectDetail(identifierId, { forceRefresh = false } = {}) {
   return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`, {
     ttl: API_CACHE_TTL.projectDetail,
+    timeoutMs: 20000,
     forceRefresh,
   })
 }
@@ -302,7 +315,7 @@ export async function getProjectDetail(identifierId, { forceRefresh = false } = 
 // 查询项目 OCR 实时状态（各阶段文件完成/待处理 + 当前文件逐页进度）。
 // 不走缓存，保证 OCR 进行中拿到最新进度。
 export async function getProjectOcrStatus(identifierId) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/ocr-status`)
+  return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/ocr-status`, { timeoutMs: 20000 })
 }
 
 export async function createProject(projectName) {
@@ -420,6 +433,7 @@ export async function getProjectVisualizationData(projectName) {
 export async function getProjectWorkflowState(projectIdentifier, { forceRefresh = false } = {}) {
   return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/workflow-state`, {
     ttl: API_CACHE_TTL.projectDetail,
+    timeoutMs: 60000,
     forceRefresh,
   })
 }

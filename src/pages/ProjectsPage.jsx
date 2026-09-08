@@ -86,6 +86,9 @@ function delay(ms) {
 }
 
 function hasBusinessAnalysisResults(project) {
+  if (project?.resultsLoaded === false) {
+    return BUSINESS_ANALYSIS_SERVICES.every((service) => project.availableResultKeys?.includes(service))
+  }
   const results = project?.results ?? {}
   return BUSINESS_ANALYSIS_SERVICES.every((service) => Boolean(results[service]))
 }
@@ -194,6 +197,8 @@ function normalizeProject(detail) {
     updatedAt: detail.project.update_time,
     parsingStatus: detail.project.parsing_status ?? 0,
     relations,
+    relationCount: relations.length,
+    detailLoaded: true,
     results: {},
   }
 }
@@ -211,6 +216,11 @@ function normalizeProjectFromListItem(item) {
     updatedAt: item.update_time,
     parsingStatus: item.parsing_status ?? 0,
     relations: [],
+    relationCount: Number(item.relation_count || 0),
+    availableResultKeys: item.result_summary?.result_keys ?? item.available_result_keys ?? [],
+    resultSummary: item.result_summary ?? null,
+    detailLoaded: false,
+    resultsLoaded: false,
     results: {},
   }
 }
@@ -223,6 +233,9 @@ export default function ProjectsPage() {
   const [composer, setComposer] = useState(createInitialComposer)
   const [notice, setNotice] = useState(null)
   const [isLoadingProjects, setIsLoadingProjects] = useState(true)
+  const [detailLoad, setDetailLoad] = useState({ projectId: '', error: '' })
+  const [workflowLoad, setWorkflowLoad] = useState({ projectId: '', ready: false, error: '' })
+  const [loadAttempt, setLoadAttempt] = useState(0)
   const [busyToken, setBusyToken] = useState('')
   const [deleteConfirm, setDeleteConfirm] = useState('')
   const [technicalOcrExcludedIdsByProject, setTechnicalOcrExcludedIdsByProject] = useState({})
@@ -236,36 +249,8 @@ export default function ProjectsPage() {
 
     try {
       const listing = await listProjects({ pageSize: 24 })
-      const projectLoads = await Promise.allSettled(
-        (listing.items ?? []).map(async (item) => {
-          const projectId = getProjectIdentifier(item)
-          const [detailResult, resultsResult] = await Promise.allSettled([
-            getProjectDetail(projectId),
-            getProjectResults(projectId),
-          ])
-          const project = detailResult.status === 'fulfilled'
-            ? normalizeProject(detailResult.value)
-            : normalizeProjectFromListItem(item)
-          const resultsFailed = resultsResult.status === 'rejected' && Number(resultsResult.reason?.status) !== 404
-
-          return {
-            project: {
-              ...project,
-              results: resultsResult.status === 'fulfilled'
-                ? normalizeProjectResultsPayload(resultsResult.value)
-                : {},
-            },
-            detailFailed: detailResult.status === 'rejected',
-            resultsFailed,
-          }
-        }),
-      )
-
-      const nextProjects = projectLoads.map((result, index) =>
-        result.status === 'fulfilled'
-          ? result.value.project
-          : normalizeProjectFromListItem(listing.items[index]),
-      )
+      // 列表已有数量和分析项摘要，不能为展示卡片读取所有项目的完整结果。
+      const nextProjects = (listing.items ?? []).map(normalizeProjectFromListItem)
 
       startTransition(() => {
         setProjects(nextProjects)
@@ -310,11 +295,35 @@ export default function ProjectsPage() {
     projects[0] ??
     null
 
+  const activeProjectId = activeProject?.identifierId
   useEffect(() => {
-    const projectId = activeProject?.identifierId
-    if (!projectId) return undefined
+    if (!activeProjectId) return undefined
+    let cancelled = false
+    setDetailLoad({ projectId: activeProjectId, error: '' })
+    getProjectDetail(activeProjectId)
+      .then((detail) => {
+        if (cancelled) return
+        const loaded = normalizeProject(detail)
+        setProjects((current) => current.map((project) => project.id === activeProjectId
+          ? { ...project, ...loaded, results: project.results }
+          : project))
+      })
+      .catch((error) => {
+        if (!cancelled) setDetailLoad({ projectId: activeProjectId, error: error.message || '项目详情加载失败' })
+      })
+    return () => { cancelled = true }
+  }, [activeProjectId, loadAttempt])
+
+  const needsWorkflowState = Boolean(activeProject?.detailLoaded) &&
+    Number(activeProject?.parsingStatus) === PARSING_STATUS_BUSINESS_READY &&
+    hasTechnicalFileBindings(activeProject)
+
+  useEffect(() => {
+    const projectId = activeProjectId
+    if (!projectId || !needsWorkflowState) return undefined
 
     let cancelled = false
+    setWorkflowLoad({ projectId, ready: false, error: '' })
     getProjectWorkflowState(projectId, { forceRefresh: true })
       .then((workflowState) => {
         if (cancelled) return
@@ -323,13 +332,16 @@ export default function ProjectsPage() {
           ...current,
           [projectId]: excludedIds,
         }))
+        setWorkflowLoad({ projectId, ready: true, error: '' })
       })
-      .catch(() => null)
+      .catch((error) => {
+        if (!cancelled) setWorkflowLoad({ projectId, ready: false, error: error.message || '技术标剔除范围加载失败' })
+      })
 
     return () => {
       cancelled = true
     }
-  }, [activeProject?.identifierId])
+  }, [activeProjectId, needsWorkflowState, loadAttempt])
 
   // OCR 细粒度进度：拉取各阶段文件完成情况 + 当前文件逐页进度，OCR 进行中时轮询。
   useEffect(() => {
@@ -344,6 +356,7 @@ export default function ProjectsPage() {
 
     let cancelled = false
     let timer = null
+    setOcrStatus(null)
     const tick = async () => {
       try {
         const status = await getProjectOcrStatus(projectId)
@@ -352,13 +365,14 @@ export default function ProjectsPage() {
         if (!cancelled) setOcrStatus(null)
       }
     }
-    tick()
-    if (shouldPoll) {
-      timer = window.setInterval(tick, OCR_STATUS_POLL_INTERVAL_MS)
+    const poll = async () => {
+      await tick()
+      if (!cancelled && shouldPoll) timer = window.setTimeout(poll, OCR_STATUS_POLL_INTERVAL_MS)
     }
+    poll()
     return () => {
       cancelled = true
-      if (timer) window.clearInterval(timer)
+      if (timer) window.clearTimeout(timer)
     }
   }, [activeProject?.identifierId, activeProject?.parsingStatus, busyToken])
 
@@ -390,14 +404,19 @@ export default function ProjectsPage() {
     hasBusinessStageBindings(activeProject)
   const needsPreAnalysisOcr = needsTenderOcr || needsBusinessOcr
   const canRunBusinessAnalysis =
-    Boolean(activeProject) &&
+    Boolean(activeProject?.detailLoaded) &&
     activeProjectParsingStatus >= PARSING_STATUS_BUSINESS_READY
   const canContinueTechnicalOcr =
     Boolean(activeProject) &&
     activeProjectParsingStatus === PARSING_STATUS_BUSINESS_READY &&
     activeProjectHasBusinessResults &&
     hasTechnicalFileBindings(activeProject) &&
+    workflowLoad.projectId === activeProjectId && workflowLoad.ready &&
     technicalOcrSelectedCount > 0
+
+  const activeLoadError = (detailLoad.projectId === activeProjectId && detailLoad.error) ||
+    (needsWorkflowState && workflowLoad.projectId === activeProjectId && workflowLoad.error)
+  const workflowReady = workflowLoad.projectId === activeProjectId && workflowLoad.ready
 
   const canSubmitComposer =
     Boolean(composer.projectName.trim()) &&
@@ -518,6 +537,7 @@ export default function ProjectsPage() {
     const project = normalizeProject(detailResult.value)
     if (resultsResult.status === 'fulfilled') {
       project.results = normalizeProjectResultsPayload(resultsResult.value)
+      project.resultsLoaded = true
     }
     upsertProject(project)
     return project
@@ -1146,7 +1166,7 @@ export default function ProjectsPage() {
                     </div>
                     <p>{project.identifierId}</p>
                     <div className="project-card-foot">
-                      <span>{project.relations.length} 组标书</span>
+                      <span>{project.relationCount ?? project.relations.length} 组标书</span>
                       <span>{formatDateTime(project.updatedAt)}</span>
                     </div>
                     <small>{getProjectSummary(project)}</small>
@@ -1154,7 +1174,10 @@ export default function ProjectsPage() {
                 )
               })
             ) : (
-              <EmptyBlock title={isLoadingProjects ? '项目加载中...' : '暂无项目'} />
+              <>
+                <EmptyBlock title={isLoadingProjects ? '项目加载中...' : '暂无项目'} />
+                {!isLoadingProjects && <button type="button" className="text-button" onClick={loadProjects}>重新加载</button>}
+              </>
             )}
           </div>
         </aside>
@@ -1162,6 +1185,12 @@ export default function ProjectsPage() {
         <section className="content">
           {activeProject ? (
             <>
+              {activeLoadError ? (
+                <div className="notice notice-warning">
+                  <p>{activeLoadError}</p>
+                  <button type="button" className="text-button" onClick={() => setLoadAttempt((value) => value + 1)}>重试加载</button>
+                </div>
+              ) : null}
               <section className="panel summary-panel">
                 <div className="summary-head">
                   <div>
@@ -1178,7 +1207,7 @@ export default function ProjectsPage() {
                   <StatItem label="项目标识" value={activeProject.identifierId} />
                   <StatItem label="创建时间" value={formatDateTime(activeProject.createdAt)} />
                   <StatItem label="更新时间" value={formatDateTime(activeProject.updatedAt)} />
-                  <StatItem label="标书组数" value={activeProject.relations.length} />
+                  <StatItem label="标书组数" value={activeProject.relationCount ?? activeProject.relations.length} />
                   <StatItem
                     label="分析状态"
                     value={getProjectStatus(activeProject).label}
@@ -1282,7 +1311,9 @@ export default function ProjectsPage() {
                       <div>
                         <strong>技术标 OCR 范围</strong>
                         <span>
-                          已选择 {technicalOcrSelectedCount} / {technicalOcrCandidates.length} 份技术标参与 OCR
+                          {workflowReady
+                            ? `已选择 ${technicalOcrSelectedCount} / ${technicalOcrCandidates.length} 份技术标参与 OCR`
+                            : '正在加载已保存的 OCR 范围...'}
                         </span>
                       </div>
                       {technicalOcrExcludedIds.length > 0 ? (
@@ -1305,7 +1336,7 @@ export default function ProjectsPage() {
                             <input
                               type="checkbox"
                               checked={checked}
-                              disabled={Boolean(busyToken)}
+                              disabled={Boolean(busyToken) || !workflowReady}
                               onChange={() => toggleTechnicalOcrCandidate(candidate.technicalDocumentId)}
                             />
                             <div>
@@ -1435,7 +1466,7 @@ export default function ProjectsPage() {
                     ))}
                   </div>
                 ) : (
-                  <EmptyBlock title="当前项目暂无文档关系" />
+                  <EmptyBlock title={activeProject.detailLoaded ? '当前项目暂无文档关系' : activeLoadError ? '项目详情暂未加载' : '正在加载项目详情...'} />
                 )}
               </section>
             </>

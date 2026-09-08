@@ -349,6 +349,16 @@
   align-items: flex-start;
 }
 
+.status-pill {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.project-card-head strong {
+  flex: 1;
+  min-width: 0;
+}
+
 .project-card-head strong,
 .summary-head h2,
 .stat-item strong,

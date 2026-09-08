@@ -3223,7 +3223,8 @@ function collectPersonnelAlertsFromGroups(resultKey, result, allAlerts, options)
 function deviationMarkerTag(meta) {
   if (!meta) return ''
   var parts = []
-  if (meta.requirement_kind === 'bonus' || meta.marker_type === 'triangle') parts.push('△加分项')
+  if (meta.marker_type === 'self_declared') parts.push('投标人主动声明')
+  else if (meta.requirement_kind === 'bonus' || meta.marker_type === 'triangle') parts.push('△加分项')
   else parts.push('★必须项')
   if (meta.semantic_status) {
     var hasScore = meta.semantic_score !== null && meta.semantic_score !== undefined
@@ -3568,12 +3569,20 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
   })
 }
 
-// 读取偏离条目的 ★/△ 标记（在 alert.evidence.issue.evidence 里）
+// 读取偏离条目的 ★/△/投标人主动声明标记（在 alert.evidence.issue.evidence 里）
 function getDeviationItemMarker(alert) {
   var issue = alert && alert.evidence && alert.evidence.issue
   var ev = (issue && issue.evidence) || (alert && alert.evidence) || {}
+  if (ev.marker_type === 'self_declared') return 'self_declared'
   if (ev.marker_type === 'triangle' || ev.requirement_kind === 'bonus') return 'triangle'
   return 'star'
+}
+
+function getDeviationItemMarkerLabel(alert) {
+  var marker = getDeviationItemMarker(alert)
+  if (marker === 'triangle') return '△'
+  if (marker === 'self_declared') return '自报'
+  return '★'
 }
 
 // 把同一投标人的多条偏离告警聚合成一张卡：1招标预览+1投标预览，缺失/未响应项以文字列出。
@@ -3597,7 +3606,7 @@ function consolidateDeviationAlertsByBidder(alerts, techDocsByBidder) {
     var missingLines = missing.map(function (a) {
       var issue = a.evidence && a.evidence.issue
       var ev = (issue && issue.evidence) || {}
-      var marker = getDeviationItemMarker(a) === 'triangle' ? '△' : '★'
+      var marker = getDeviationItemMarkerLabel(a)
       var status = String(ev.response_status || (issue && issue.status) || '')
       var statusLabel = /missing/.test(status) ? '未响应/缺失'
         : (/negative/.test(status) ? '负偏离'
@@ -3635,7 +3644,7 @@ function consolidateDeviationAlertsByBidder(alerts, techDocsByBidder) {
         }
       })
       if (ev.material_text || matLocs.length > 0) {
-        var mk = getDeviationItemMarker(a) === 'triangle' ? '△' : '★'
+        var mk = getDeviationItemMarkerLabel(a)
         var reqT = (issue && issue.title) || ev.requirement || '要求条款'
         var refStr = ev.material_text || matLocs.map(function (m) {
           return (m.book ? ('《' + m.book + '》') : '') + 'P' + m.page
@@ -3709,18 +3718,24 @@ function consolidateDeviationAlertsByBidder(alerts, techDocsByBidder) {
 
     var total = groupAlerts.length
     var missingCount = missing.length
-    var hasMandatoryMiss = missing.some(function (a) { return getDeviationItemMarker(a) === 'star' })
+    var selfDeclaredCount = groupAlerts.filter(function (a) {
+      return getDeviationItemMarker(a) === 'self_declared'
+    }).length
+    var hasMandatoryMiss = missing.some(function (a) {
+      return getDeviationItemMarker(a) !== 'triangle'
+    })
+    var itemScope = selfDeclaredCount > 0 ? '★/△/自报偏离' : '★/△要求'
     var conclusion = missingCount === 0 ? '通过' : (hasMandatoryMiss ? '不通过' : '提示')
     var description = missingCount === 0
-      ? (bidderName + ' — 共 ' + total + ' 条 ★/△ 要求，均已响应。')
-      : (bidderName + ' — 共 ' + total + ' 条 ★/△ 要求，其中 ' + missingCount + ' 条缺失/未响应：' + missingLines.join('；'))
+      ? (bidderName + ' — 共 ' + total + ' 条' + itemScope + '，均已响应。')
+      : (bidderName + ' — 共 ' + total + ' 条' + itemScope + '，其中 ' + missingCount + ' 条存在问题：' + missingLines.join('；'))
     if (materialRefLines.length > 0) {
       description += '｜对应材料(响应所在文件+页)：' + materialRefLines.join('；')
     }
 
     return Object.assign({}, first, {
       id: 'deviation-bidder-' + gi + '-' + stablePreviewHash(key),
-      title: bidderName + '：偏离表检查（★/△ ' + total + ' 条，缺失 ' + missingCount + '）',
+      title: bidderName + '：偏离表检查（' + itemScope + ' ' + total + ' 条，问题 ' + missingCount + '）',
       description: description,
       sourceStatus: missingCount === 0 ? 'passed' : (first.sourceStatus || 'fail'),
       riskLevel: missingCount === 0 ? 'none' : (hasMandatoryMiss ? 'high' : 'medium'),
@@ -3728,8 +3743,8 @@ function consolidateDeviationAlertsByBidder(alerts, techDocsByBidder) {
         '投标人': bidderName,
         '审查项': '偏离表检查',
         '系统结论': conclusion,
-        '★/△ 条数': total,
-        '缺失/未响应': missingCount,
+        '偏离检查条数': total,
+        '问题条数': missingCount,
         '招标要求页': (first.evidence && first.evidence.issue && first.evidence.issue.evidence && first.evidence.issue.evidence.requirement_page) || first.page || '--',
         '商务标响应页': responsePages.length === 0
           ? '--'
@@ -3746,6 +3761,7 @@ function consolidateDeviationAlertsByBidder(alerts, techDocsByBidder) {
       deviationMissingItems: missingLines,
       deviationHasMissingStar: missing.some(function (a) { return getDeviationItemMarker(a) === 'star' }),
       deviationHasMissingTriangle: missing.some(function (a) { return getDeviationItemMarker(a) === 'triangle' }),
+      deviationHasSelfDeclared: missing.some(function (a) { return getDeviationItemMarker(a) === 'self_declared' }),
     })
   })
 }
