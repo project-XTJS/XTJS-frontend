@@ -237,6 +237,7 @@ export function isManualReviewFieldNotRequired(sourceValue, field) {
 
 export function formatManualReviewFieldDisplayValue(value, field, sourceValue) {
   if (field.notRequired) return '不要求'
+  if (field.path && field.path[0] === 'rule_resolution') return ({ resolved: '已确定', unresolved: '待复核' })[value] || '待复核'
   var fallbackStatus = getManualReviewFallbackStatus(sourceValue, field)
   if (String(fallbackStatus || '').trim() === 'not_required') return '不要求'
   if (isCaseConsistencyField(field)) return formatCaseConsistencyValue(value)
@@ -251,9 +252,9 @@ export function buildManualReviewValueWithField(item, field, fieldValue, manualD
   var currentValue = getManualReviewCurrentValue(item, manualDrafts)
   var nextValue = setManualReviewPathValue(currentValue, field.path, fieldValue)
   if (item.field_group === 'attachment_result') {
-    if (field.path && field.path[0] === 'date_text') {
-      var dateStatus = getManualReviewObjectValue(item.original_value, ['date_status', 'status'])
-      nextValue = setManualReviewPathValue(nextValue, ['date_status'], isManualValueBlank(fieldValue) ? (dateStatus || 'missing_date') : 'pass')
+    if (field.path && ['date_text', 'deadline_date'].includes(field.path[0])) {
+      if (field.path[0] === 'deadline_date') nextValue = setManualReviewPathValue(nextValue, ['deadline_manually_confirmed'], !isManualValueBlank(fieldValue))
+      nextValue = setManualReviewPathValue(nextValue, ['date_status'], isManualValueBlank(fieldValue) ? (field.path[0] === 'deadline_date' ? 'missing_deadline' : 'missing_date') : 'pending')
     }
     if (field.path && ['signature_text', 'signature_texts', 'signature_evidence'].includes(field.path[0])) {
       var signatureStatus = getManualReviewObjectValue(item.original_value, ['signature_status', 'status'])

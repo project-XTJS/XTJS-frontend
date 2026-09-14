@@ -14,6 +14,7 @@ import {
   runTenderOcr,
   saveProjectWorkflowScope,
   uploadProjectFolder,
+  uploadMissingProjectFile,
 } from '../lib/xtjsApi'
 import {
   DOCUMENT_LABELS,
@@ -196,6 +197,8 @@ function normalizeProject(detail) {
     createdAt: detail.project.create_time,
     updatedAt: detail.project.update_time,
     parsingStatus: detail.project.parsing_status ?? 0,
+    uploadComplete: detail.project.upload_complete !== false,
+    uploadIssues: detail.project.upload_issues ?? [],
     relations,
     relationCount: relations.length,
     detailLoaded: true,
@@ -215,6 +218,9 @@ function normalizeProjectFromListItem(item) {
     createdAt: item.create_time,
     updatedAt: item.update_time,
     parsingStatus: item.parsing_status ?? 0,
+    uploadComplete: item.upload_complete !== false,
+    resultsStale: Boolean(item.results_stale),
+    uploadIssues: item.upload_issues ?? [],
     relations: [],
     relationCount: Number(item.relation_count || 0),
     availableResultKeys: item.result_summary?.result_keys ?? item.available_result_keys ?? [],
@@ -315,6 +321,7 @@ export default function ProjectsPage() {
   }, [activeProjectId, loadAttempt])
 
   const needsWorkflowState = Boolean(activeProject?.detailLoaded) &&
+    activeProject.uploadComplete !== false &&
     Number(activeProject?.parsingStatus) === PARSING_STATUS_BUSINESS_READY &&
     hasTechnicalFileBindings(activeProject)
 
@@ -352,7 +359,7 @@ export default function ProjectsPage() {
     }
     const parsingStatus = Number(activeProject?.parsingStatus || 0)
     // OCR 全部完成且当前无进行中操作时不必持续轮询。
-    const shouldPoll = Boolean(busyToken) || parsingStatus < PARSING_STATUS_TECHNICAL_READY
+    const shouldPoll = activeProject.uploadComplete !== false && (Boolean(busyToken) || parsingStatus < PARSING_STATUS_TECHNICAL_READY)
 
     let cancelled = false
     let timer = null
@@ -374,7 +381,7 @@ export default function ProjectsPage() {
       cancelled = true
       if (timer) window.clearTimeout(timer)
     }
-  }, [activeProject?.identifierId, activeProject?.parsingStatus, busyToken])
+  }, [activeProject?.identifierId, activeProject?.parsingStatus, activeProject?.uploadComplete, busyToken])
 
   const activeProjectHasBusinessResults = hasBusinessAnalysisResults(activeProject)
   const activeProjectParsingStatus = Number(activeProject?.parsingStatus || 0)
@@ -393,21 +400,25 @@ export default function ProjectsPage() {
   )).length
   const isBeforeBusinessReady =
     Boolean(activeProject) &&
-    activeProjectParsingStatus < PARSING_STATUS_BUSINESS_READY
+    (activeProject.uploadComplete === false || activeProjectParsingStatus < PARSING_STATUS_BUSINESS_READY)
   const needsTenderOcr =
     Boolean(activeProject) &&
+    activeProject.uploadComplete !== false &&
     activeProjectParsingStatus === 0 &&
     hasTenderStageBindings(activeProject)
   const needsBusinessOcr =
     Boolean(activeProject) &&
+    activeProject.uploadComplete !== false &&
     activeProjectParsingStatus === 1 &&
     hasBusinessStageBindings(activeProject)
   const needsPreAnalysisOcr = needsTenderOcr || needsBusinessOcr
   const canRunBusinessAnalysis =
     Boolean(activeProject?.detailLoaded) &&
+    activeProject.uploadComplete !== false &&
     activeProjectParsingStatus >= PARSING_STATUS_BUSINESS_READY
   const canContinueTechnicalOcr =
     Boolean(activeProject) &&
+    activeProject.uploadComplete !== false &&
     activeProjectParsingStatus === PARSING_STATUS_BUSINESS_READY &&
     activeProjectHasBusinessResults &&
     hasTechnicalFileBindings(activeProject) &&
@@ -655,7 +666,7 @@ export default function ProjectsPage() {
         message: `项目「${projectName}」已创建，绑定 ${okCount} 家公司${failCount > 0 ? `（${failCount} 家失败）` : ''}，正在进行作者查重预警...`,
       })
 
-      await runAuthorPrecheck(projectId, { proceedLabel: '知道了' })
+      if (failCount === 0) await runAuthorPrecheck(projectId, { proceedLabel: '知道了' })
     } catch (error) {
       const detail = error?.payload?.detail
       let message = error.message || '文件夹上传失败。'
@@ -719,6 +730,10 @@ export default function ProjectsPage() {
         setIsComposerOpen(false)
       })
 
+      if (payload.status !== 'success') {
+        setNotice({ type: 'warning', message: '项目已保存，部分文件上传或关联失败。请在项目详情补齐后继续 OCR。' })
+        return
+      }
       try {
         await runPostCreateWorkflow(projectId, parallelism)
       } catch (workflowError) {
@@ -736,6 +751,21 @@ export default function ProjectsPage() {
     } finally {
       setBusyToken('')
     }
+  }
+
+  async function handleRepairUpload(issue, file) {
+    if (!activeProject || busyToken) return
+    setBusyToken('repair-upload')
+    try {
+      const detail = await uploadMissingProjectFile(activeProject.identifierId, { slot: issue?.slot, file })
+      const loaded = normalizeProject(detail)
+      setProjects((current) => current.map((p) => p.id === loaded.id ? { ...p, ...loaded, results: p.results } : p))
+      setLoadAttempt((v) => v + 1)
+      setNotice({ type: loaded.uploadComplete ? 'success' : 'warning', message: loaded.uploadComplete
+        ? '项目材料已补齐，可以手动继续 OCR。' : '已保存本次补传，仍有材料需要补齐。' })
+    } catch (error) {
+      setNotice({ type: 'error', message: error.message || '补传失败，请稍后重试。' })
+    } finally { setBusyToken('') }
   }
 
   async function handleRunBusinessAnalysis() {
@@ -1192,6 +1222,28 @@ export default function ProjectsPage() {
                 </div>
               ) : null}
               <section className="panel summary-panel">
+                {activeProject.uploadComplete === false ? (
+                  <div className="notice notice-warning">
+                    <div>
+                      <strong>上传不完整，请补齐以下材料后继续检查</strong>
+                      <ul>
+                        {(activeProject.uploadIssues ?? []).map((issue, index) => (
+                          <li key={issue.slot || index}>
+                            <span>{issue.company}：{issue.name} {issue.error ? `（${issue.error}）` : ''}</span>
+                            {issue.slot ? <input type="file" accept=".pdf" disabled={Boolean(busyToken)}
+                              aria-label={`补传 ${issue.name}`} onChange={(event) => {
+                                const file = event.target.files?.[0]
+                                event.target.value = ''
+                                if (file) handleRepairUpload(issue, file)
+                              }} /> : null}
+                          </li>
+                        ))}
+                      </ul>
+                      <button type="button" className="text-button" disabled={Boolean(busyToken)}
+                        onClick={() => handleRepairUpload()}>重试关联已上传文件</button>
+                    </div>
+                  </div>
+                ) : null}
                 <div className="summary-head">
                   <div>
                     <h2>{activeProject.title}</h2>
@@ -1221,7 +1273,7 @@ export default function ProjectsPage() {
                       style={{ width: `${getParsingProgress(activeProject.parsingStatus).percent}%` }}
                     />
                   </div>
-                  <span>{getParsingProgress(activeProject.parsingStatus).label}</span>
+                  <span>{activeProject.uploadComplete === false ? '上传不完整' : getParsingProgress(activeProject.parsingStatus).label}</span>
                 </div>
 
                 {ocrStages.length > 0 ? (

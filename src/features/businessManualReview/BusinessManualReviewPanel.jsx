@@ -532,6 +532,9 @@ export default function BusinessManualReviewPanel({
                     <div className={field.readOnly ? 'manual-review-field manual-review-field-readonly' : 'manual-review-field'} key={fieldKey}>
                       <div className="manual-review-field-head">
                         <span>{field.label}</span>
+                        {field.readOnly && field.locateTarget === 'rule' ? (
+                          <button type="button" className="manual-review-locate-btn" disabled={Boolean(locating)} onClick={function () { onJumpToPage(item, field) }}>定位招标规则</button>
+                        ) : null}
                         {!field.readOnly ? (
                           <div className="manual-review-field-actions">
                           <button

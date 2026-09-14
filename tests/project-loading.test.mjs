@@ -39,6 +39,39 @@ const detail = (project) => ({ project, relations: [{
 }] })
 const fulfill = (route, data, status = 200) => route.fulfill({ status, json: { code: status, message: status === 200 ? 'success' : '测试加载失败', data } })
 
+test('上传不完整优先显示，禁止把已完成的部分当作完整项目', async (t) => {
+  const item = { ...projects[0], upload_complete: false,
+    upload_issues: [{ slot: 'technical_bid:1', company: '测试公司', name: '技术标.pdf', status: 'failed' }] }
+  const { page, requests } = await pageWithApi(t, undefined, [item])
+  await page.getByText('上传不完整，请补齐以下材料后继续检查').waitFor()
+  assert.match(await page.locator('.project-card').first().innerText(), /上传不完整/)
+  assert.equal(await page.getByRole('link', { name: '进入分析中心 →' }).count(), 0)
+  assert.equal(await page.getByRole('button', { name: '重新生成商务审查' }).count(), 0)
+  assert.equal(await page.getByLabel('补传 技术标.pdf').count(), 1)
+  assert.ok(!requests.some((path) => path.endsWith('/workflow-state')))
+})
+
+test('补传成功后清除失败提示，保留手动继续检查流程', async (t) => {
+  const item = { ...projects[0], upload_complete: false,
+    upload_issues: [{ slot: 'technical_bid:1', company: '测试公司', name: '技术标.pdf', status: 'failed' }] }
+  let repaired = false
+  const { page } = await pageWithApi(t, async (route, path) => {
+    if (path.endsWith('/upload-missing')) {
+      repaired = true
+      await fulfill(route, detail({ ...item, upload_complete: true, upload_issues: [] }))
+      return true
+    }
+    if (repaired && path.endsWith('/project-1')) {
+      await fulfill(route, detail({ ...item, upload_complete: true, upload_issues: [] }))
+      return true
+    }
+    return false
+  }, [item])
+  await page.getByLabel('补传 技术标.pdf').setInputFiles({ name: '技术标.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-fixture') })
+  await page.getByText('项目材料已补齐，可以手动继续 OCR。', { exact: true }).waitFor()
+  assert.equal(await page.getByText('上传不完整，请补齐以下材料后继续检查').count(), 0)
+})
+
 async function pageWithApi(t, intercept = async () => false, items = projects, seedLegacyCache = false) {
   const context = await browser.newContext()
   t.after(() => context.close())
@@ -187,4 +220,55 @@ test('升级后不复用缺少状态摘要的旧版列表缓存', async (t) => {
   assert.equal(await page.getByText('旧版缓存项目', { exact: true }).count(), 0)
   assert.equal(requests.filter((path) => path === '/api/postgresql/projects').length, 1)
   assert.match(await page.locator('.project-card').first().innerText(), /已完成/)
+})
+
+const reviewFixture = { business_bid_format_review: { bidders: [{ bidder_key: 'a-company', bidder_name: '项目A公司', checks: { verification_check: { issues: { failed: [{ title: '项目A专属签章问题', status: 'fail', message: '项目A内容', severity: 'error' }] } } } }] } }
+
+test('结果审核切项目失败时清空旧结果并禁止导出，重试后恢复', async (t) => {
+  let fail = true
+  const { page } = await pageWithApi(t, async (route, path) => {
+    if (path.endsWith('/project-1/results')) { await fulfill(route, { results: reviewFixture, input_revision: 1 }); return true }
+    if (path.endsWith('/project-2/results')) { await fulfill(route, { results: {}, input_revision: 2 }, fail ? 503 : 200); return true }
+    if (path.includes('/format-review/editable')) { await fulfill(route, { items: [] }); return true }
+    return false
+  }, projects.slice(0,2))
+  await page.goto(`${origin}/#/review?projectId=project-1`)
+  await page.getByRole('heading', { name: '项目级审查总览' }).waitFor()
+  await page.locator('.project-dropdown-trigger').click()
+  await page.locator('.dropdown-item').filter({ hasText: '测试项目 2' }).click()
+  await page.getByRole('button', { name: '重试加载结果' }).waitFor()
+  assert.equal(await page.getByText('项目A专属签章问题').count(),0)
+  assert.equal(await page.getByRole('button', { name: /^导出报告/ }).isEnabled(),false)
+  fail = false
+  await page.getByRole('button', { name: '重试加载结果' }).click()
+  await page.getByRole('heading', { name: '项目级审查总览' }).waitFor()
+  assert.equal(await page.getByRole('button', { name: /^导出报告/ }).isEnabled(),true)
+})
+
+test('结果审核迟到的旧项目响应不会覆盖当前项目', async (t) => {
+  let oldRequest
+  const { page } = await pageWithApi(t, async (route,path) => {
+    if (path.endsWith('/project-1/results')) { oldRequest=route; return true }
+    if (path.endsWith('/project-2/results')) { await fulfill(route,{results:{},input_revision:2}); return true }
+    return false
+  },projects.slice(0,2))
+  await page.goto(`${origin}/#/review?projectId=project-1`)
+  await page.locator('.project-dropdown-trigger').click()
+  await page.locator('.dropdown-item').filter({hasText:'测试项目 2'}).click()
+  await page.getByRole('heading',{name:'项目级审查总览'}).waitFor()
+  assert.ok(oldRequest)
+  await fulfill(oldRequest,{results:reviewFixture,input_revision:1})
+  await page.waitForTimeout(100)
+  assert.equal(await page.getByText('项目A专属签章问题').count(),0)
+  assert.match(await page.locator('.review-main').innerText(),/测试项目 2/)
+})
+
+test('材料变更后旧结果标记过期并禁止导出', async (t) => {
+  const { page } = await pageWithApi(t,async(route,path)=>{
+    if(path.endsWith('/results')){await fulfill(route,{results:{},results_stale:true,input_revision:3});return true}
+    return false
+  },projects.slice(0,1))
+  await page.goto(`${origin}/#/review?projectId=project-1`)
+  await page.getByText('材料已变更，旧结果已过期，请到分析中心重新检查。').waitFor()
+  assert.equal(await page.getByRole('button',{name:/^导出报告/}).isEnabled(),false)
 })

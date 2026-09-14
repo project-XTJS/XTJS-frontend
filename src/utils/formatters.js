@@ -43,11 +43,6 @@ export const DOCUMENT_LABELS = {
   technical_bid: '技术标',
 }
 
-export const DOCUMENT_SCOPE_OPTIONS = [
-  { value: 'all', label: '全部标书' },
-  { value: 'business_bid', label: '仅商务标' },
-  { value: 'technical_bid', label: '仅技术标' },
-]
 
 export function getParsingProgress(parsingStatus) {
   switch (parsingStatus) {
@@ -63,6 +58,10 @@ export function getParsingProgress(parsingStatus) {
 }
 
 export function getProjectStatus(project) {
+  if (project.uploadComplete === false || project.upload_complete === false) {
+    return { label: '上传不完整', className: 'status-risk' }
+  }
+  if (project.resultsStale || project.results_stale) return { label: '需重新检查', className: 'status-ready' }
   const hasRelations = (project.relationCount ?? project.relations.length) > 0
   const results = project.results ?? {}
   const resultKeys = project.resultsLoaded === false
@@ -113,6 +112,7 @@ export function getProjectStatus(project) {
 
 export function getProjectSummary(project) {
   const status = getProjectStatus(project)
+  if (status.label === '需重新检查') return '材料已变更，旧结果已过期'
   if (status.label === '状态待更新') return '进入分析中心查看审查结果'
 
   switch (status.className) {

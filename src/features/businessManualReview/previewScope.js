@@ -31,6 +31,8 @@ function collectManualReviewPages(value, output) {
 }
 
 function getManualReviewItemPages(item) {
+  if (item && item.field_group === 'attachment_result' &&
+      item.original_value && item.original_value.bid_content_found === false) return []
   var pages = []
   collectManualReviewPages(item && item.page_refs, pages)
   if (pages.length === 0) {

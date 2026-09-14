@@ -30,14 +30,6 @@ export async function fetchMe() {
   return request('/api/auth/me')
 }
 
-// 修改本人密码。
-export async function changePassword(oldPassword, newPassword) {
-  return request('/api/auth/change-password', {
-    method: 'POST',
-    headers: JSON_HEADERS,
-    body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
-  })
-}
 
 // ─── 管理员：用户管理 ────────────────────────────────
 

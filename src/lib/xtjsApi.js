@@ -140,13 +140,21 @@ function unwrapUnifiedPayload(payload, response) {
   return payload
 }
 
+const projectInputVersions = new Map()
+const uploadAttempts = new Map()
+
 export async function request(path, { method = 'GET', query, body, headers, timeoutMs = 0 } = {}) {
   // 自动携带 Bearer 令牌（已登录时）。
   const token = getToken()
   const finalHeaders = token
     ? { ...(headers || {}), Authorization: `Bearer ${token}` }
-    : headers
+    : { ...(headers || {}) }
 
+  const projectPath = path.match(/\/projects\/([^/]+)/)
+  const projectId = projectPath ? decodeURIComponent(projectPath[1]) : null
+  if (projectId && method !== 'GET' && /\/(manual-review|business-bid-format-review|personnel|export-report)/.test(path) && projectInputVersions.has(projectId)) {
+    finalHeaders['X-XTJS-Input-Revision'] = String(projectInputVersions.get(projectId))
+  }
   const controller = timeoutMs > 0 ? new AbortController() : null
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
   try {
@@ -164,7 +172,9 @@ export async function request(path, { method = 'GET', query, body, headers, time
     }
 
     const payload = await parseResponseBody(response)
-    return unwrapUnifiedPayload(payload, response)
+    const data = unwrapUnifiedPayload(payload, response)
+    if (projectId && method === 'GET' && Number.isInteger(data?.input_revision)) projectInputVersions.set(projectId, data.input_revision)
+    return data
   } catch (error) {
     if (controller?.signal.aborted) throw createApiError('加载超时，请稍后重试。', { status: 408 })
     throw error
@@ -318,25 +328,21 @@ export async function getProjectOcrStatus(identifierId) {
   return request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}/ocr-status`, { timeoutMs: 20000 })
 }
 
-export async function createProject(projectName) {
-  const payload = await request('/api/postgresql/projects', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project_name: projectName }),
+
+export async function uploadMissingProjectFile(projectIdentifier, { slot = '', file } = {}) {
+  const body = new FormData()
+  body.append('slot', slot)
+  const attemptKey = `${projectIdentifier}:${slot}`
+  if (!uploadAttempts.has(attemptKey)) uploadAttempts.set(attemptKey, (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`))
+  body.append('attempt_id', uploadAttempts.get(attemptKey))
+  if (file) body.append('file', file)
+  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/upload-missing`, {
+    method: 'POST', body,
   })
-  invalidateProjectCache(payload?.identifier_id || payload?.project?.identifier_id || projectName)
+  invalidateProjectCache(projectIdentifier)
   return payload
 }
 
-export async function updateProjectIdentifier(identifierId, newProjectName) {
-  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project_name: newProjectName }),
-  })
-  invalidateProjectCache(identifierId)
-  return payload
-}
 
 export async function deleteProject(identifierId) {
   const payload = await request(`/api/postgresql/projects/${encodeURIComponent(identifierId)}`, {
@@ -346,15 +352,6 @@ export async function deleteProject(identifierId) {
   return payload
 }
 
-export async function batchDeleteProjects(identifierIds) {
-  const payload = await request('/api/postgresql/projects/batch-delete', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ identifier_ids: identifierIds }),
-  })
-  invalidateApiCache('/api/postgresql/projects')
-  return payload
-}
 
 export async function ingestProjectDocuments({
   projectName,
@@ -422,13 +419,7 @@ export async function getProjectResults(projectName, { forceRefresh = false } = 
   })
 }
 
-export async function getProjectSingleResult(projectName, resultKey) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/results/${encodeURIComponent(resultKey)}`)
-}
 
-export async function getProjectVisualizationData(projectName) {
-  return request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/visualization-data`)
-}
 
 export async function getProjectWorkflowState(projectIdentifier, { forceRefresh = false } = {}) {
   return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/workflow-state`, {
@@ -458,15 +449,6 @@ export async function saveProjectManualReviewResultInputs(projectIdentifier, res
   return payload
 }
 
-export async function rerunProjectManualReview(projectIdentifier, services = []) {
-  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/manual-review-rerun`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ services }),
-  })
-  invalidateProjectCache(projectIdentifier)
-  return payload
-}
 
 // ─── OCR Execution ───────────────────────────────────
 
@@ -512,18 +494,6 @@ export async function continueTechnicalOcr(projectName, { parallelism = 1, exclu
   return payload
 }
 
-export async function runFullOcr(projectName, { parallelism = 1 } = {}) {
-  const formBody = new URLSearchParams()
-  formBody.append('parallelism', `${parallelism}`)
-
-  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/run-full-ocr`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: formBody,
-  })
-  invalidateProjectCache(projectName)
-  return payload
-}
 
 // ─── Analysis Execution ──────────────────────────────
 
@@ -628,108 +598,19 @@ export async function rerunBusinessBidFormatReviewWithManualInputs(projectIdenti
   return payload
 }
 
-export async function listRelations({ page = 1, pageSize = 50, projectIdentifier } = {}) {
-  return request('/api/postgresql/relations', {
-    query: { page, page_size: pageSize, project_identifier: projectIdentifier },
-  })
-}
 
-export async function getRelationDetail(relationId) {
-  return request(`/api/postgresql/relations/${relationId}`)
-}
 
-export async function bindDocuments(projectName, {
-  tenderDocumentIdentifier,
-  businessBidDocumentIdentifier,
-  technicalBidDocumentIdentifier,
-}) {
-  const payload = await request(`/api/postgresql/projects/${encodeURIComponent(projectName)}/bind-documents`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      tender_document_identifier: tenderDocumentIdentifier,
-      business_bid_document_identifier: businessBidDocumentIdentifier,
-      technical_bid_document_identifier: technicalBidDocumentIdentifier,
-    }),
-  })
-  invalidateProjectCache(projectName)
-  return payload
-}
 
-export async function updateRelation(relationId, body) {
-  const payload = await request(`/api/postgresql/relations/${relationId}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-  invalidateApiCache('/api/postgresql/projects')
-  return payload
-}
 
-export async function deleteRelation(relationId) {
-  const payload = await request(`/api/postgresql/relations/${relationId}`, {
-    method: 'DELETE',
-  })
-  invalidateApiCache('/api/postgresql/projects')
-  return payload
-}
 
-export async function batchDeleteRelations(relationIds) {
-  const payload = await request('/api/postgresql/relations/batch-delete', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ relation_ids: relationIds }),
-  })
-  invalidateApiCache('/api/postgresql/projects')
-  return payload
-}
 
 // ─── Documents ───────────────────────────────────────
 
-export async function listDocuments({ page = 1, pageSize = 50, documentType, extracted } = {}) {
-  return request('/api/postgresql/documents', {
-    query: { page, page_size: pageSize, document_type: documentType, extracted },
-  })
-}
 
-export async function getDocumentDetail(identifierId) {
-  return request(`/api/postgresql/documents/${encodeURIComponent(identifierId)}`)
-}
 
-export async function uploadDocument({ file, documentType, identifierId, documentName }) {
-  const formData = new FormData()
-  formData.append('file', file)
-  formData.append('document_type', documentType)
-  if (identifierId) formData.append('identifier_id', identifierId)
-  if (documentName) formData.append('document_name', documentName)
 
-  return request('/api/postgresql/documents', {
-    method: 'POST',
-    body: formData,
-  })
-}
 
-export async function updateDocument(identifierId, body) {
-  return request(`/api/postgresql/documents/${encodeURIComponent(identifierId)}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-}
 
-export async function deleteDocument(identifierId) {
-  return request(`/api/postgresql/documents/${encodeURIComponent(identifierId)}`, {
-    method: 'DELETE',
-  })
-}
-
-export async function batchDeleteDocuments(identifierIds) {
-  return request('/api/postgresql/documents/batch-delete', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ identifier_ids: identifierIds }),
-  })
-}
 
 export function getDocumentSourceUrl(fileNameOrId, page) {
   var url = `${API_BASE_URL}/api/postgresql/documents/${encodeURIComponent(fileNameOrId)}/source`
@@ -780,35 +661,9 @@ export async function getDocumentPreview(fileNameOrId, page, { highlight, highli
 
 // ─── Results CRUD ────────────────────────────────────
 
-export async function listResults({ page = 1, pageSize = 50, keyword } = {}) {
-  return request('/api/postgresql/results', {
-    query: { page, page_size: pageSize, keyword },
-  })
-}
 
-export async function createOrOverwriteResult(projectIdentifierId, result) {
-  const payload = await request('/api/postgresql/results', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project_identifier_id: projectIdentifierId, result }),
-  })
-  invalidateProjectCache(projectIdentifierId)
-  return payload
-}
 
-export async function getSingleResult(projectIdentifierId) {
-  return request(`/api/postgresql/results/${encodeURIComponent(projectIdentifierId)}`)
-}
 
-export async function updateResult(projectIdentifierId, result) {
-  const payload = await request(`/api/postgresql/results/${encodeURIComponent(projectIdentifierId)}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ result }),
-  })
-  invalidateProjectCache(projectIdentifierId)
-  return payload
-}
 
 export async function exportProjectResultReport(projectIdentifierId, result) {
   return request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifierId)}/export-report`, {
@@ -818,12 +673,5 @@ export async function exportProjectResultReport(projectIdentifierId, result) {
   })
 }
 
-export async function deleteResult(projectIdentifierId) {
-  const payload = await request(`/api/postgresql/results/${encodeURIComponent(projectIdentifierId)}`, {
-    method: 'DELETE',
-  })
-  invalidateProjectCache(projectIdentifierId)
-  return payload
-}
 
 // ─── Export Report ──────────────────────────────────

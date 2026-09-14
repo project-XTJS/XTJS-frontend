@@ -157,6 +157,12 @@ export function buildManualReviewDisplayFields(item, currentValue) {
       if (isManualValueBlank(currentFieldValue)) currentFieldValue = extractManualReviewAmount(currentValue)
     }
 
+    if (config.path && config.path[0] === 'basis') {
+      var basisLabels = { annual: '年度', contract: '合同全周期', unit: '单价', unknown: '待确认' }
+      originalFieldValue = basisLabels[originalFieldValue] || originalFieldValue
+      currentFieldValue = basisLabels[currentFieldValue] || currentFieldValue
+    }
+
     var notRequired = isManualReviewFieldNotRequired(originalValue, config) || isManualReviewFieldNotRequired(currentValue, config)
     fields.push(Object.assign({}, config, {
       key: config.key || (config.path && config.path.join('.')) || 'value',
@@ -173,6 +179,8 @@ export function buildManualReviewDisplayFields(item, currentValue) {
     addField({ path: ['capital_raw_amount'], label: '大写金额原文（OCR）', valueType: 'text', sourceKeys: ['capital_raw_amount', 'capital_price_str'], readOnly: true })
     addField({ path: ['case_consistency_status'], label: '大小写是否一致', valueType: 'text', sourceKeys: ['case_consistency_status', 'case_consistency_summary'], readOnly: true })
     addField({ path: ['limit_comparison_status'], label: '是否超过最高限价', valueType: 'text', sourceKeys: ['limit_comparison_status', 'price_limit_status', 'tender_limit_status', 'limit_comparison_summary'], readOnly: true })
+    addField({ path: ['basis'], label: '计价口径（年度、合同全周期或单价）', valueType: 'text' })
+    addField({ path: ['package'], label: '适用包件', valueType: 'text' })
     return fields
   }
 
@@ -189,13 +197,18 @@ export function buildManualReviewDisplayFields(item, currentValue) {
       label: rateQuoteThresholdLabel(currentValue, originalValue),
       valueType: 'amount',
       sourceKeys: ['required_min_float_rate', 'rule_threshold', 'threshold'],
-      amountFallback: true,
+      readOnly: true,
+      locateTarget: 'rule',
     })
+    addField({ path: ['rule_operator'], label: '招标规则比较符号', valueType: 'text', readOnly: true })
+    addField({ path: ['rule_resolution'], label: '招标规则识别状态', valueType: 'text', readOnly: true })
     return fields
   }
 
   if (item.field_group === 'price_constraint') {
     addField({ path: ['amount_yuan'], label: '招标文件最高限价（元）', valueType: 'amount', sourceKeys: ['amount_yuan', 'amount', 'limit_amount_yuan'], amountFallback: true })
+    addField({ path: ['basis'], label: '计价口径（年度、合同全周期或单价）', valueType: 'text' })
+    addField({ path: ['package'], label: '适用包件', valueType: 'text' })
     return fields
   }
 
@@ -274,7 +287,7 @@ export function buildManualReviewDisplayFields(item, currentValue) {
 
   if (item.field_group === 'attachment_result') {
     addField({ path: ['date_text'], label: '落款日期', valueType: 'text', sourceKeys: ['date_text', 'date', 'sign_date'], fallbackStatusKeys: ['date_status'] })
-    addField({ path: ['deadline_date'], label: '最晚截止日期', valueType: 'text', sourceKeys: ['deadline_date', 'deadline_text', 'matched_deadline_text'], fallbackStatusKeys: ['date_status'], locateTarget: 'deadline' })
+    addField({ path: ['deadline_date'], label: '有效截止日期', valueType: 'text', sourceKeys: ['deadline_date', 'deadline_text', 'matched_deadline_text'], fallbackStatusKeys: ['date_status'], locateTarget: 'deadline' })
     addField({ path: ['signature_evidence'], label: '签字识别内容（每行一个）', valueType: 'array', sourceKeys: ['signature_evidence', 'signature_texts', 'signature_text'], fallbackStatusKeys: ['signature_parse_status', 'signature_status'], multiline: true, useOriginalValueWhenCurrentMissing: true })
     addField({ path: ['seal_texts'], label: '盖章识别内容（每行一个）', valueType: 'array', sourceKeys: ['seal_texts', 'seal_evidence', 'seal_text'], fallbackStatusKeys: ['seal_status'], multiline: true, useOriginalValueWhenCurrentMissing: true })
     return fields

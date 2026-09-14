@@ -2262,8 +2262,10 @@ function isVerificationAttachmentPassIssue(issue) {
 
 function isVerificationMissingAttachmentIssue(issue) {
   var evidence = (issue && issue.evidence) || {}
-  if (evidence.source !== 'position_check') return false
-  if (arrayify(evidence.template_locations).length === 0) return false
+  if (!['position_check', 'attachment_result'].includes(evidence.source)) return false
+  if (evidence.bid_content_found === false) return true
+  if (evidence.bid_content_found === true) return false
+  if (!evidence.attachment) return false
   if (arrayify(evidence.locations).length > 0) return false
   if (arrayify(evidence.pages).length > 0) return false
   if (String(evidence.matched_bid_title || '').trim()) return false
@@ -3492,6 +3494,10 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
         if ((checkKey === 'verification_check' && !isVerificationMissingAttachment) || checkKey === 'itemized_pricing_check') {
           docRefs = docRefs.filter(function (doc) { return !isTenderTemplateDoc(doc) })
         }
+        if (isVerificationMissingAttachment) {
+          // A tender page is not a fallback location in the bidder's document.
+          docRefs = docRefs.filter(isTenderTemplateDoc)
+        }
         docRefs = orderFormatReviewDocRefs(docRefs)
         var docRef = docRefs.find(function (doc) {
           return isBusinessBidDoc(doc) || doc.role === 'business' || doc.purpose === 'business_bid_source' || doc.purpose === 'quoted_price_source'
@@ -3515,6 +3521,9 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
         var alertDescription = issue.message || (check.review && check.review.summary) || (isPassedItem ? '系统审查通过，关键内容已匹配' : '发现需复核项')
 
         alertDescription = getFormatIssueMessage(checkKey, issue, alertDescription)
+        if (isVerificationMissingAttachment) {
+          alertDescription += ' 未定位到对应投标内容；招标预览仅展示要求位置。'
+        }
 
         var alert = {
           id: makeAlertId(issueEntry.idPrefix, bidder.bidder_key || bidder.bidder_name || bidderIndex, checkKey, issue.title, issueIndex),
@@ -4152,12 +4161,12 @@ function getManualDeadlineSourceValue(item) {
   return {}
 }
 
-function buildManualDeadlineLocator(item) {
+function buildManualDeadlineLocator(item, ruleSource = false) {
   var source = getManualDeadlineSourceValue(item)
-  var locations = uniqueLocationCandidates(arrayify(source.deadline_locations).map(function (location) {
+  var locations = uniqueLocationCandidates(arrayify(ruleSource ? source.rule_locations : source.deadline_locations).map(function (location) {
     return withLocationDocumentRole(location, 'tender')
   }))
-  var page = getFirstNumber(source.deadline_page) ||
+  var page = (ruleSource ? extractFirstPage(locations[0]) : null) || getFirstNumber(source.deadline_page) ||
     getFirstNumber(source.matched_deadline_page) ||
     getFirstNumber(source.deadlinePage) ||
     extractFirstPage(locations[0])
@@ -4180,7 +4189,7 @@ function buildManualDeadlineLocator(item) {
   }).find(function (text) {
     return /递交|提交|投标截止|响应截止/.test(text)
   }) || ''
-  var highlightPhrases = collectHighlightPhrases(deadlinePhrase)
+  var highlightPhrases = collectHighlightPhrases(ruleSource ? pageLocations.map(function (location) { return location.text || '' }).join(' ') : deadlinePhrase)
 
   return {
     page: page,
@@ -4615,6 +4624,10 @@ export default function ReviewPage() {
   var [formatManualRerunning, setFormatManualRerunning] = useState(false)
   var [formatManualLocating, setFormatManualLocating] = useState(false)
   var [deviationManualSaving, setDeviationManualSaving] = useState(false)
+  var [loadedProjectId, setLoadedProjectId] = useState('')
+  var [loadError, setLoadError] = useState(false)
+  var [resultsStale, setResultsStale] = useState(false)
+  var reviewSessionRef = useRef({ projectId: '', sequence: 0, loaded: false })
   var resultsRef = useRef(results)
   var projectDetailRef = useRef(projectDetail)
   var personnelEntryListRef = useRef(null)
@@ -4662,9 +4675,56 @@ export default function ReviewPage() {
     })
   }, [])
 
+  var resetReviewState = useCallback(function () {
+    resultsRef.current = null
+    projectDetailRef.current = null
+    setResults(null)
+    setAllAlerts([])
+    setLoadedProjectId('')
+    setShowExport(false)
+    setPreviewLightbox(null)
+    setPreviewLoading(false)
+    setExportLoading(false)
+    setFormatManualLocating(false)
+    setDeviationManualSaving(false)
+    setReviewStatus({})
+    setReviewNotes({})
+    setOverviewFileResultFilters({})
+    setOverviewFileCheckFilters({})
+    setOverviewFilePages({})
+    setOverviewFileSearchInputs({})
+    setSelectedAlerts(new Set())
+    setPreviewData({})
+    setPreviewPages({})
+    setPreviewPageInputs({})
+    setPreviewBusy({})
+    setPreviewErrors({})
+    setProjectDetail(null)
+    setPersonnelDraftDocuments([])
+    setPersonnelActiveBidderKey('')
+    setPersonnelActiveDocKey('')
+    setPersonnelActivePage(1)
+    setPersonnelDraftDirty(false)
+    setPersonnelDraftSaving(false)
+    setPersonnelConfirming(false)
+    setFormatEditableItems([])
+    setFormatManualDrafts({})
+    setFormatManualEditing({})
+    setFormatManualLoading(false)
+    setFormatManualSaving(false)
+    setFormatManualRerunning(false)
+    setCurrentServiceType(null)
+    setCurrentAlertIndex(0)
+  }, [])
+
   var loadData = useCallback(function (projectId, isActive) {
+    var session = { projectId, sequence: reviewSessionRef.current.sequence + 1, loaded: false }
+    reviewSessionRef.current = session
+    resetReviewState()
+    setLoadError(false)
+    setResultsStale(false)
     // 加载是否仍然“当前有效”（避免陈旧/重复加载在用户已操作后回写、把选择重置回去）
-    var active = function () { return !isActive || isActive() }
+    var active = function () { return reviewSessionRef.current === session && (!isActive || isActive()) }
     if (!projectId) {
       setIsLoading(false)
       setProjectDetail(null)
@@ -4690,6 +4750,12 @@ export default function ReviewPage() {
       var loadedProjectDetail = responses[1]
       var editablePayload = responses[2]
       var projectResults = normalizeProjectResultsPayload(data)
+      var stale = Boolean(data && (data.results_stale || data.result_record_meta && data.result_record_meta.results_stale))
+      setResultsStale(stale)
+      session.loaded = !stale
+      setLoadedProjectId(projectId)
+      resultsRef.current = projectResults
+      projectDetailRef.current = loadedProjectDetail
       setResults(projectResults)
       setProjectDetail(loadedProjectDetail)
       var alerts = enrichAlertsWithProjectFiles(collectAllAlerts(projectResults), loadedProjectDetail)
@@ -4724,13 +4790,15 @@ export default function ReviewPage() {
       setPersonnelDraftDocuments([])
       setPersonnelActiveBidderKey('')
       setPersonnelActiveDocKey('')
+      resetReviewState()
+      setLoadError(true)
       setNotice({ type: 'error', message: '加载项目结果失败' })
     }).finally(function () {
       if (!active()) return
       setIsLoading(false)
       setFormatManualLoading(false)
     })
-  }, [])
+  }, [resetReviewState])
 
   useEffect(function () {
     loadProjects()
@@ -4740,7 +4808,7 @@ export default function ReviewPage() {
     var active = true
     loadData(selectedProjectId, function () { return active })
     // 卸载/切项目/StrictMode 重跑时标记失效：陈旧加载完成后不再回写、不重置已选审查项
-    return function () { active = false }
+    return function () { active = false; reviewSessionRef.current.loaded = false }
   }, [selectedProjectId, loadData])
 
   useEffect(function () {
@@ -4767,36 +4835,10 @@ export default function ReviewPage() {
   }, [previewLightbox])
 
   function handleProjectChange(projectId) {
+    reviewSessionRef.current = { projectId, sequence: reviewSessionRef.current.sequence + 1, loaded: false }
+    resetReviewState()
     setSelectedProjectId(projectId)
     setSearchParams(projectId ? { projectId } : {})
-    setReviewStatus({})
-    setReviewNotes({})
-    setOverviewFileResultFilters({})
-    setOverviewFileCheckFilters({})
-    setOverviewFilePages({})
-    setOverviewFileSearchInputs({})
-    setSelectedAlerts(new Set())
-    setPreviewData({})
-    setPreviewPages({})
-    setPreviewPageInputs({})
-    setPreviewBusy({})
-    setPreviewErrors({})
-    setProjectDetail(null)
-    setPersonnelDraftDocuments([])
-    setPersonnelActiveBidderKey('')
-    setPersonnelActiveDocKey('')
-    setPersonnelActivePage(1)
-    setPersonnelDraftDirty(false)
-    setPersonnelDraftSaving(false)
-    setPersonnelConfirming(false)
-    setFormatEditableItems([])
-    setFormatManualDrafts({})
-    setFormatManualEditing({})
-    setFormatManualLoading(false)
-    setFormatManualSaving(false)
-    setFormatManualRerunning(false)
-    setCurrentServiceType(null)
-    setCurrentAlertIndex(0)
   }
 
   // Compute alerts for current service type
@@ -5105,6 +5147,9 @@ export default function ReviewPage() {
   }
 
   async function handleDocPageChange(docInfo, delta) {
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
     var docKey = docInfo.docKey || docInfo.docId || docInfo.fileName || docInfo.label
     if (getPreviewTargets(docInfo).length === 0) return
 
@@ -5142,6 +5187,7 @@ export default function ReviewPage() {
 
     try {
       var preview = await fetchDocumentPreviewForDoc(docInfo, newPage)
+      if (reviewSessionRef.current !== operation) return
       setPreviewData(function (prev) {
         var next = {}
         for (var k in prev) { next[k] = prev[k] }
@@ -5161,6 +5207,7 @@ export default function ReviewPage() {
         return next
       })
     } catch (e) {
+      if (reviewSessionRef.current !== operation) return
       setPreviewErrors(function (prev) {
         var next = {}
         for (var k in prev) { next[k] = prev[k] }
@@ -5168,13 +5215,16 @@ export default function ReviewPage() {
         return next
       })
     } finally {
+      if (reviewSessionRef.current === operation) {
       setPreviewBusy(function (prev) {
         var next = {}
         for (var k in prev) { next[k] = prev[k] }
         delete next[docKey]
         return next
       })
-    }
+
+      }
+}
   }
 
   function handlePageInputChange(docInfo, value) {
@@ -5188,6 +5238,9 @@ export default function ReviewPage() {
   }
 
   async function handleDocPageJump(docInfo) {
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
     var docKey = docInfo.docKey || docInfo.docId || docInfo.fileName || docInfo.label
     if (getPreviewTargets(docInfo).length === 0) return
 
@@ -5209,9 +5262,13 @@ export default function ReviewPage() {
     }
 
     await handleDocPageChange(docInfo, nextPage - currentPage)
+      if (reviewSessionRef.current !== operation) return
   }
 
   async function handleDocPageGoto(docInfo, targetPage) {
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
     var docKey = docInfo.docKey || docInfo.docId || docInfo.fileName || docInfo.label
     if (getPreviewTargets(docInfo).length === 0) return
 
@@ -5225,6 +5282,7 @@ export default function ReviewPage() {
     if (nextPage === currentPage) return
 
     await handleDocPageChange(docInfo, nextPage - currentPage)
+      if (reviewSessionRef.current !== operation) return
   }
 
   function handleDownloadPdf(docInfo) {
@@ -5335,6 +5393,9 @@ export default function ReviewPage() {
   }
 
   async function exportWordReport(payload) {
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
     return exportProjectResultReport(selectedProjectId, payload)
   }
 
@@ -5379,39 +5440,55 @@ export default function ReviewPage() {
   }, [])
 
   var savePersonnelDraft = useCallback(async function (documents, options) {
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
     if (!selectedProjectId) return null
     setPersonnelDraftSaving(true)
     try {
       var result = await updatePersonnelReuseDraft(selectedProjectId, buildPersonnelDraftPayload(documents))
+      if (reviewSessionRef.current !== operation) return
       refreshPersonnelResult(result)
       if (!(options && options.silent)) {
         setNotice({ type: 'success', message: '人员草稿已保存。' })
       }
       return result
     } catch (error) {
+      if (reviewSessionRef.current !== operation) return
       if (!(options && options.silent)) {
         setNotice({ type: 'error', message: '人员草稿保存失败: ' + (error.message || '未知错误') })
       }
       return null
     } finally {
+      if (reviewSessionRef.current === operation) {
       setPersonnelDraftSaving(false)
-    }
+
+      }
+}
   }, [buildPersonnelDraftPayload, refreshPersonnelResult, selectedProjectId])
   savePersonnelDraftRef.current = savePersonnelDraft
 
   async function handleConfirmPersonnelDraft() {
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
     if (!selectedProjectId || personnelDraftDocuments.length === 0) return
     setPersonnelConfirming(true)
     try {
       var result = await confirmPersonnelReuseDraft(selectedProjectId, buildPersonnelDraftPayload(personnelDraftDocuments))
+      if (reviewSessionRef.current !== operation) return
       refreshPersonnelResult(result)
       setPersonnelDraftDirty(false)
       setNotice({ type: 'success', message: '人员名单已确认，重名检查已完成。' })
     } catch (error) {
+      if (reviewSessionRef.current !== operation) return
       setNotice({ type: 'error', message: '人员确认失败: ' + (error.message || '未知错误') })
     } finally {
+      if (reviewSessionRef.current === operation) {
       setPersonnelConfirming(false)
-    }
+
+      }
+}
   }
 
   function applyFormatEditablePayload(payload) {
@@ -5495,10 +5572,13 @@ export default function ReviewPage() {
   }
 
   async function jumpToManualReviewPage(item, field) {
-    if (field && field.locateTarget === 'deadline') {
-      var locator = buildManualDeadlineLocator(item)
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
+    if (field && ['deadline', 'rule'].includes(field.locateTarget)) {
+      var locator = buildManualDeadlineLocator(item, field.locateTarget === 'rule')
       if (!locator.page && locator.highlightPhrases.length === 0) {
-        setNotice({ type: 'error', message: '未找到最晚截止日期的页码或识别文本' })
+        setNotice({ type: 'error', message: '未找到招标依据的页码或识别文本' })
         return
       }
       var docsForDeadline = getCurrentPreviewDocs()
@@ -5526,7 +5606,7 @@ export default function ReviewPage() {
           })
       }
       if (!targetTenderDoc) {
-        setNotice({ type: 'error', message: '未找到招标文件预览，无法定位截止日期' })
+        setNotice({ type: 'error', message: '未找到招标文件预览，无法定位招标依据' })
         return
       }
       var targetPage = locator.page || getPreviewStartPage(targetTenderDoc, currentAlert)
@@ -5540,6 +5620,7 @@ export default function ReviewPage() {
       setFormatManualLocating(true)
       try {
         var highlightedPreview = await fetchDocumentPreviewForDoc(highlightedDoc, targetPage)
+      if (reviewSessionRef.current !== operation) return
         setPreviewLightbox({
           image: highlightedPreview && highlightedPreview.image_data_url,
           label: (targetTenderDoc.label || targetTenderDoc.fileName || '招标文件') + '（截止日期位置）',
@@ -5547,10 +5628,14 @@ export default function ReviewPage() {
           pageCount: getPreviewPageCount(highlightedPreview, highlightedDoc),
         })
       } catch (error) {
+      if (reviewSessionRef.current !== operation) return
         setNotice({ type: 'error', message: '截止日期预览打开失败，请稍后重试' })
       } finally {
+      if (reviewSessionRef.current === operation) {
         setFormatManualLocating(false)
+
       }
+}
       return
     }
     var page = arrayify(item.page_refs)[0]
@@ -5570,6 +5655,9 @@ export default function ReviewPage() {
   }
 
   async function saveCurrentFormatManualInputs(options) {
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
     if (!selectedProjectId) return null
     var scopeItems = getCurrentFormatManualItems()
     var payloadItems = buildManualReviewPayloadItems(scopeItems, formatManualDrafts)
@@ -5586,6 +5674,7 @@ export default function ReviewPage() {
       var payload = options && options.rerun
         ? await rerunBusinessBidFormatReviewWithManualInputs(selectedProjectId, payloadItems)
         : await saveBusinessBidFormatReviewManualInputs(selectedProjectId, payloadItems)
+      if (reviewSessionRef.current !== operation) return
       applyFormatEditablePayload(payload)
       setFormatManualEditing({})
       if (options && options.rerun && payload && payload.review) {
@@ -5602,18 +5691,25 @@ export default function ReviewPage() {
       })
       return payload
     } catch (error) {
+      if (reviewSessionRef.current !== operation) return
       setNotice({
         type: 'error',
         message: (options && options.rerun ? '二次审查失败: ' : '保存人工识别内容失败: ') + (error.message || '未知错误'),
       })
       return null
     } finally {
+      if (reviewSessionRef.current === operation) {
       setFormatManualSaving(false)
       setFormatManualRerunning(false)
-    }
+
+      }
+}
   }
 
   async function saveCurrentDeviationManualStatus(status) {
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
     if (!selectedProjectId || !currentAlert || currentAlert.sourceResultKey !== 'deviation_check') return null
     if (!currentAlert.manualStatusPath) {
       setNotice({ type: 'error', message: '当前星标结果缺少可保存路径。' })
@@ -5639,18 +5735,24 @@ export default function ReviewPage() {
           },
         ],
       })
+      if (reviewSessionRef.current !== operation) return
       var data = await getProjectResults(selectedProjectId, { forceRefresh: true })
+      if (reviewSessionRef.current !== operation) return
       var nextResults = normalizeProjectResultsPayload(data)
       setResults(nextResults)
       setAllAlerts(enrichAlertsWithProjectFiles(collectAllAlerts(nextResults), projectDetail))
       setNotice({ type: 'success', message: '星标响应修正已保存。' })
       return nextResults
     } catch (error) {
+      if (reviewSessionRef.current !== operation) return
       setNotice({ type: 'error', message: '星标响应修正保存失败: ' + (error.message || '未知错误') })
       return null
     } finally {
+      if (reviewSessionRef.current === operation) {
       setDeviationManualSaving(false)
-    }
+
+      }
+}
   }
 
   function updatePersonnelDraftDocuments(updater) {
@@ -5751,6 +5853,9 @@ export default function ReviewPage() {
   }
 
   async function handleExportJson() {
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
     if (!selectedProjectId) return
 
     setExportLoading(true)
@@ -5761,20 +5866,29 @@ export default function ReviewPage() {
       setNotice({ type: 'success', message: '过滤后的结果已导出' })
       setShowExport(false)
     } catch (e) {
+      if (reviewSessionRef.current !== operation) return
       setNotice({ type: 'error', message: '导出失败: ' + (e.message || '未知错误') })
     } finally {
+      if (reviewSessionRef.current === operation) {
       setExportLoading(false)
-    }
+
+      }
+}
   }
 
   async function handleExportWord() {
+    var operation = reviewSessionRef.current
+    if (!operation.loaded || operation.projectId !== selectedProjectId) return
+
     if (!selectedProjectId) return
 
     setExportLoading(true)
     try {
       var payload = buildFilteredResultJson(allAlerts, selectedAlerts, overviewResultKeys, reviewStatus)
       var response = await exportWordReport(payload)
+      if (reviewSessionRef.current !== operation) return
       var reportUrl = await getReportDownloadUrl(response)
+      if (reviewSessionRef.current !== operation) return
       var reportName = response?.report_name || ('review-report-' + selectedProjectId + '.docx')
 
       if (reportUrl) {
@@ -5785,12 +5899,17 @@ export default function ReviewPage() {
       }
       setShowExport(false)
     } catch (e) {
+      if (reviewSessionRef.current !== operation) return
       setNotice({ type: 'error', message: '导出 Word 报告失败: ' + (e.message || '未知错误') })
     } finally {
+      if (reviewSessionRef.current === operation) {
       setExportLoading(false)
-    }
+
+      }
+}
   }
 
+  var canUseResults = loadedProjectId === selectedProjectId && !isLoading && !loadError && !resultsStale
   var resultTypeKeys = []
   allAlerts.forEach(function (alert) {
     if (resultTypeKeys.indexOf(alert.resultType) < 0) {
@@ -6481,7 +6600,7 @@ export default function ReviewPage() {
             type="button"
             className="primary-button"
             onClick={function () { setShowExport(!showExport) }}
-            disabled={!selectedProjectId}
+            disabled={!canUseResults}
           >
             导出报告{selectedAlerts.size > 0 ? ' (' + selectedAlerts.size + ')' : ''}
           </button>
@@ -6633,6 +6752,10 @@ export default function ReviewPage() {
           <section className="review-main">
             {isLoading ? (
               <EmptyBlock title="加载中..." />
+            ) : loadError ? (
+              <div className="panel"><p>加载项目结果失败</p><button type="button" onClick={function () { loadData(selectedProjectId) }}>重试加载结果</button></div>
+            ) : resultsStale ? (
+              <div className="panel"><p>材料已变更，旧结果已过期，请到分析中心重新检查。</p></div>
             ) : !currentServiceType ? (
               results ? (
                 <div className="overview-container">
