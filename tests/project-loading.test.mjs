@@ -39,6 +39,64 @@ const detail = (project) => ({ project, relations: [{
 }] })
 const fulfill = (route, data, status = 200) => route.fulfill({ status, json: { code: status, message: status === 200 ? 'success' : '测试加载失败', data } })
 
+for (const succeeds of [true, false]) {
+  test(`单文件替换${succeeds ? '成功后更新文件' : '失败后保留原文件'}`, async (t) => {
+    let replaced = false, pending, requestBody
+    const item = { ...projects[0], parsing_status: 2 }
+    const { page } = await pageWithApi(t, async (route, path) => {
+      if (path.endsWith('/replace-document')) {
+        pending = route
+        requestBody = route.request().postData()
+        return true
+      }
+      if (path.endsWith('/ocr-status')) {
+        return fulfill(route, { is_queued: false, ocr_progress: { active: [], stages: [{ stage: 'technical', total_count: 1,
+          completed_count: replaced ? 1 : 0, completed_documents: replaced ? [{ identifier_id: 'new', file_name: '新技术.pdf' }] : [],
+          pending_documents: replaced ? [] : [{ identifier_id: 'technical', file_name: '技术.pdf' }] }] } }).then(() => true)
+      }
+      return false
+    }, [item])
+    const input = page.getByLabel('替换 技术.pdf', { exact: true })
+    await input.waitFor({ state: 'attached' })
+    await input.setInputFiles({ name: '新技术.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 test') })
+    await page.getByText('替换中…', { exact: true }).waitFor()
+    assert.ok(await input.isDisabled())
+    while (!pending) await new Promise(resolve => setTimeout(resolve, 10))
+    assert.match(requestBody, /technical_bid/)
+    assert.match(requestBody, /technical/)
+    replaced = succeeds
+    await fulfill(pending, succeeds ? detail({ ...item, parsing_status: 3 }) : null, succeeds ? 200 : 400)
+    if (succeeds) {
+      await page.getByText(/已识别并替换成功/).waitFor()
+      await page.getByLabel('替换 新技术.pdf', { exact: true }).waitFor({ state: 'attached' })
+    } else {
+      await page.getByText(/替换未确认完成/).waitFor()
+      assert.equal(await page.getByLabel('替换 技术.pdf', { exact: true }).count(), 1)
+    }
+  })
+}
+
+test('替换过程中切换项目，迟到响应不覆盖当前项目', async (t) => {
+  let pending
+  const { page } = await pageWithApi(t, async (route, path) => {
+    if (path.endsWith('/replace-document')) { pending = route; return true }
+    if (path.endsWith('/ocr-status')) {
+      return fulfill(route, { ocr_progress: { active: [], stages: [{ stage: 'technical', total_count: 1, completed_count: 0,
+        pending_documents: [{ identifier_id: 'technical', file_name: '技术.pdf' }] }] } }).then(() => true)
+    }
+    return false
+  }, projects.slice(0, 2))
+  await page.getByLabel('替换 技术.pdf', { exact: true }).setInputFiles({ name: '新技术.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4') })
+  await page.getByText('替换中…', { exact: true }).waitFor()
+  await page.locator('.project-card').nth(1).click()
+  await page.locator('.project-card.is-active').getByText('测试项目 2', { exact: true }).waitFor()
+  while (!pending) await new Promise(resolve => setTimeout(resolve, 10))
+  await fulfill(pending, detail(projects[0]))
+  await page.waitForFunction(() => !document.body.innerText.includes('替换中…'))
+  assert.match(await page.locator('.project-card.is-active').innerText(), /测试项目 2/)
+  assert.equal(await page.getByText(/已识别并替换成功/).count(), 0)
+})
+
 test('上传不完整优先显示，禁止把已完成的部分当作完整项目', async (t) => {
   const item = { ...projects[0], upload_complete: false,
     upload_issues: [{ slot: 'technical_bid:1', company: '测试公司', name: '技术标.pdf', status: 'failed' }] }
@@ -272,3 +330,86 @@ test('材料变更后旧结果标记过期并禁止导出', async (t) => {
   await page.getByText('材料已变更，旧结果已过期，请到分析中心重新检查。').waitFor()
   assert.equal(await page.getByRole('button',{name:/^导出报告/}).isEnabled(),false)
 })
+
+const failedOcr = (active = [], queued = false) => ({ is_queued: queued, ocr_progress: { active, stages: [{
+  stage: 'technical', required_parsing_status: 3, total_count: 2, completed_count: 1,
+  completed_documents: [{ identifier_id: 'done', file_name: '已完成.pdf' }],
+  pending_documents: [{ identifier_id: 'technical', file_name: '技术.pdf', ocr_last_error: {
+    code: 'invalid_pdf', message: 'PDF 无法解析，请替换有效 PDF。', failed_at: '2026-09-15T05:37:27Z',
+  } }],
+}] } })
+
+test('OCR 失败显示原因且继续任务立即结束等待，刷新后仍保留失败', async (t) => {
+  let continued = false
+  const { page } = await pageWithApi(t, async (route, path) => {
+    if (path.endsWith('/ocr-status')) { await fulfill(route, failedOcr()); return true }
+    if (path.endsWith('/workflow-scope')) { await fulfill(route, {}); return true }
+    if (path.endsWith('/continue-technical-ocr')) { continued = true; await fulfill(route, { is_queued: true }); return true }
+    return false
+  }, [{ ...projects[0], parsing_status: 2 }])
+  await page.locator('.ocr-file-failed').getByText('识别失败', { exact: true }).waitFor()
+  assert.match(await page.locator('.ocr-file-error').innerText(), /PDF 无法解析/)
+  assert.match(await page.locator('.summary-head .status-pill').innerText(), /识别失败待处理/)
+  assert.equal(await page.locator('.ocr-file-done').count(), 1)
+  const retry = page.getByRole('button', { name: '继续技术标 OCR', exact: true })
+  await retry.click()
+  await page.getByText(/技术标 OCR未完成：/).waitFor({ timeout: 10000 })
+  assert.ok(continued)
+  assert.equal(await retry.isEnabled(), true)
+  assert.equal(await page.getByLabel('替换 技术.pdf', { exact: true }).isEnabled(), true)
+  await page.reload()
+  await page.locator('.ocr-file-error').getByText(/PDF 无法解析/).waitFor()
+})
+
+test('失败文件重试时显示实时进度，成功后移除错误；不会把旧错误带到另一个项目', async (t) => {
+  let mode = 'active'
+  const { page } = await pageWithApi(t, async (route, path) => {
+    if (!path.endsWith('/ocr-status')) return false
+    let data = failedOcr([{ document_id: 'technical', total_pages: 10, current_page: 2, percent: 20 }], true)
+    if (mode === 'done') data = { is_queued: false, ocr_progress: { active: [], stages: [{ stage: 'technical', total_count: 1, completed_count: 1,
+      completed_documents: [{ identifier_id: 'technical', file_name: '技术.pdf' }], pending_documents: [] }] } }
+    if (path.includes('/project-2/')) data = {}
+    await fulfill(route, data)
+    return true
+  }, projects.slice(0, 2).map(item => ({ ...item, parsing_status: 2 })))
+  await page.locator('.ocr-file-active').waitFor()
+  assert.equal(await page.locator('.ocr-file-failed').count(), 0)
+  assert.equal(await page.getByLabel('替换 技术.pdf', { exact: true }).isEnabled(), false)
+  mode = 'done'
+  await page.locator('.ocr-file-active').waitFor({ state: 'detached' })
+  assert.equal(await page.locator('.ocr-file-error').count(), 0)
+  await page.locator('.project-card').nth(1).click()
+  await page.locator('.project-card.is-active').getByText('测试项目 2', { exact: true }).waitFor()
+  assert.equal(await page.locator('.ocr-file-error').count(), 0)
+})
+
+test('OCR 状态请求失败显示提示，不静默当作没有任务', async (t) => {
+  const { page } = await pageWithApi(t, async (route, path) => {
+    if (path.endsWith('/ocr-status')) { await fulfill(route, null, 503); return true }
+    return false
+  }, [{ ...projects[0], parsing_status: 2 }])
+  await page.getByRole('alert').getByText(/OCR 状态获取失败/).waitFor()
+})
+
+for (const onlyFailed of [false,true]) {
+ test(`总览${onlyFailed ? '全部不通过' : '全部'}按条目跳转并返回原滚动位置`, async(t)=>{
+  const fixture={business_bid_format_review:{bidders:[{bidder_key:'fixture',bidder_identity:{status:'resolved',name:'测试单位有限公司'},checks:{verification_check:{issues:{failed:Array.from({length:45},(_,i)=>({title:`待核条目 ${i+1}`,status:'fail',message:`原文依据 ${i+1}`,severity:'error'})),passed:[{title:'正常条目',status:'pass',message:'通过'}]}}}}]}}
+  const {page}=await pageWithApi(t,async(route,path)=>{
+   if(path.endsWith('/results')){await fulfill(route,{results:fixture,input_revision:1});return true}
+   if(path.includes('/format-review/editable')){await fulfill(route,{items:[]});return true}
+   return false
+  },projects.slice(0,1))
+  await page.goto(`${origin}/#/review?projectId=project-1`)
+  await page.getByRole('heading',{name:'项目级审查总览'}).waitFor()
+  if(onlyFailed){await page.locator('.overview-stat-card').filter({hasText:'不通过项'}).click();await page.getByRole('heading',{name:'全部不通过项'}).waitFor();assert.equal(await page.locator('.overview-section-list').getByText('正常条目',{exact:true}).count(),0)}
+  const row=page.locator('.overview-table tbody tr').filter({hasText:'待核条目 32'}).first()
+  await row.scrollIntoViewIfNeeded()
+  const before=await page.evaluate(()=>window.scrollY);assert.ok(before>500)
+  await row.getByRole('button',{name:'查看',exact:true}).click()
+  await page.locator('.detail-container').waitFor();assert.match(await page.locator('.detail-container').innerText(),/待核条目 32/)
+  await page.getByRole('button',{name:'返回总览原位置'}).click()
+  await page.locator('.overview-container').waitFor()
+  assert.ok(Math.abs(await page.evaluate(()=>window.scrollY)-before)<8)
+  if(onlyFailed) await page.getByRole('heading',{name:'全部不通过项'}).waitFor()
+ })
+}

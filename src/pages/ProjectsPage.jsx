@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useState } from 'react'
+import { startTransition, useCallback, useEffect, useRef, useState } from 'react'
 import {
   continueTechnicalOcr,
   deleteProject,
@@ -15,10 +15,11 @@ import {
   saveProjectWorkflowScope,
   uploadProjectFolder,
   uploadMissingProjectFile,
+  replaceProjectDocument,
 } from '../lib/xtjsApi'
 import {
   DOCUMENT_LABELS,
-  deriveBidderName,
+  bidderDisplayName,
   deriveProjectTitle,
   formatDateTime,
   getParsingProgress,
@@ -164,14 +165,14 @@ function normalizeRelation(rawRelation, index) {
       documentType: 'business_bid',
       fileName: rawRelation.business_bid_file_name,
       fileUrl: rawRelation.business_bid_file_url,
-      bidderName: deriveBidderName(rawRelation.business_bid_file_name),
+      bidderName: bidderDisplayName(rawRelation.bidder_identity),
     },
     technicalFile: {
       identifierId: rawRelation.technical_bid_identifier_id,
       documentType: 'technical_bid',
       fileName: rawRelation.technical_bid_file_name,
       fileUrl: rawRelation.technical_bid_file_url,
-      bidderName: deriveBidderName(rawRelation.technical_bid_file_name),
+      bidderName: bidderDisplayName(rawRelation.bidder_identity),
     },
   }
 }
@@ -194,6 +195,7 @@ function normalizeProject(detail) {
     identifierId,
     projectName,
     title: projectName || deriveProjectTitle(identifierId, relations),
+    uploaderName: detail.project.uploader_name || (detail.project.owner_user_id ? "上传用户" : "历史项目（上传人未记录）"),
     createdAt: detail.project.create_time,
     updatedAt: detail.project.update_time,
     parsingStatus: detail.project.parsing_status ?? 0,
@@ -215,6 +217,7 @@ function normalizeProjectFromListItem(item) {
     identifierId,
     projectName,
     title: projectName || identifierId,
+    uploaderName: item.uploader_name || (item.owner_user_id ? "上传用户" : "历史项目（上传人未记录）"),
     createdAt: item.create_time,
     updatedAt: item.update_time,
     parsingStatus: item.parsing_status ?? 0,
@@ -246,6 +249,7 @@ export default function ProjectsPage() {
   const [deleteConfirm, setDeleteConfirm] = useState('')
   const [technicalOcrExcludedIdsByProject, setTechnicalOcrExcludedIdsByProject] = useState({})
   const [ocrStatus, setOcrStatus] = useState(null)
+  const [ocrStatusError, setOcrStatusError] = useState(null)
   // 作者查重预警弹窗：{ report, onProceed?, proceedLabel }；onProceed 存在时显示“仍然继续”。
   const [authorModal, setAuthorModal] = useState(null)
 
@@ -302,6 +306,8 @@ export default function ProjectsPage() {
     null
 
   const activeProjectId = activeProject?.identifierId
+  const activeProjectIdRef = useRef(activeProjectId)
+  activeProjectIdRef.current = activeProjectId
   useEffect(() => {
     if (!activeProjectId) return undefined
     let cancelled = false
@@ -363,13 +369,17 @@ export default function ProjectsPage() {
 
     let cancelled = false
     let timer = null
-    setOcrStatus(null)
+    setOcrStatus((current) => current?.project_identifier === projectId ? current : null)
+    setOcrStatusError(null)
     const tick = async () => {
       try {
         const status = await getProjectOcrStatus(projectId)
-        if (!cancelled) setOcrStatus(status)
+        if (!cancelled) {
+          setOcrStatus({ ...status, project_identifier: projectId })
+          setOcrStatusError(null)
+        }
       } catch {
-        if (!cancelled) setOcrStatus(null)
+        if (!cancelled) setOcrStatusError({ projectId, message: 'OCR 状态获取失败，当前进度暂时无法确认。正在重试查询。' })
       }
     }
     const poll = async () => {
@@ -381,17 +391,22 @@ export default function ProjectsPage() {
       cancelled = true
       if (timer) window.clearTimeout(timer)
     }
-  }, [activeProject?.identifierId, activeProject?.parsingStatus, activeProject?.uploadComplete, busyToken])
+  }, [activeProject?.identifierId, activeProject?.parsingStatus, activeProject?.uploadComplete, busyToken, loadAttempt])
 
   const activeProjectHasBusinessResults = hasBusinessAnalysisResults(activeProject)
   const activeProjectParsingStatus = Number(activeProject?.parsingStatus || 0)
-  const ocrProgress = ocrStatus?.ocr_progress ?? null
+  const ocrProgress = ocrStatus?.project_identifier === activeProjectId ? ocrStatus?.ocr_progress : null
   // active 为"正在进行中的文件"列表(多卡并发时可能多个);兼容旧的单对象形态。
   const ocrActiveList = Array.isArray(ocrProgress?.active)
     ? ocrProgress.active
     : (ocrProgress?.active ? [ocrProgress.active] : [])
   const ocrActiveById = new Map(ocrActiveList.map((item) => [String(item.document_id), item]))
   const ocrStages = (ocrProgress?.stages ?? []).filter((stage) => Number(stage?.total_count || 0) > 0)
+  const ocrFailures = ocrStages.flatMap((stage) => stage.pending_documents ?? [])
+    .filter((doc) => doc.ocr_last_error && !ocrActiveById.has(String(doc.identifier_id)))
+  const activeOcrStatus = ocrFailures.length && activeProject?.uploadComplete !== false
+    ? { label: ocrActiveList.length || ocrStatus?.is_queued ? '识别中，有失败文件' : '识别失败待处理', className: 'status-risk' }
+    : activeProject ? getProjectStatus(activeProject) : { label: '', className: '' }
   const technicalOcrCandidates = getTechnicalOcrCandidates(activeProject)
   const technicalOcrExcludedIds = technicalOcrExcludedIdsByProject[activeProject?.identifierId] ?? []
   const technicalOcrExcludedSet = new Set(technicalOcrExcludedIds)
@@ -555,10 +570,25 @@ export default function ProjectsPage() {
   }
 
   async function waitForProjectParsingStatus(projectId, targetStatus, targetLabel) {
+    let idleObservations = 0
     for (let attempt = 0; attempt < PROJECT_STAGE_POLL_ATTEMPTS; attempt += 1) {
       const project = await refreshProjectDetailSnapshot(projectId)
       if (Number(project.parsingStatus || 0) >= targetStatus) {
         return project
+      }
+      const status = await getProjectOcrStatus(projectId)
+      const active = status?.ocr_progress?.active
+      const hasActive = Array.isArray(active) ? active.length > 0 : Boolean(active)
+      const stages = (status?.ocr_progress?.stages ?? []).filter((stage) =>
+        Number(stage.required_parsing_status || ({ tender: 1, business: 2, technical: 3 }[stage.stage])) <= targetStatus)
+      const failed = stages.flatMap((stage) => stage.pending_documents ?? []).filter((doc) => doc.ocr_last_error)
+      if (!status?.is_queued && !hasActive && failed.length) {
+        throw new Error(`${targetLabel}未完成：${failed.map((doc) => `${doc.file_name || doc.identifier_id}：${doc.ocr_last_error.message || '识别失败'}`).join('；')} 可重试或替换文件，已完成文件会保留。`)
+      }
+      const pendingCount = stages.reduce((count, stage) => count + (stage.pending_documents?.length || 0), 0)
+      idleObservations = !status?.is_queued && !hasActive && pendingCount ? idleObservations + 1 : 0
+      if (idleObservations >= 2) {
+        throw new Error(`${targetLabel}尚未完成，但当前没有运行中的任务。可能已中断，请点击继续 OCR；已完成文件会保留。`)
       }
       await delay(PROJECT_STAGE_POLL_INTERVAL_MS)
     }
@@ -751,6 +781,36 @@ export default function ProjectsPage() {
     } finally {
       setBusyToken('')
     }
+  }
+
+  async function handleReplaceFile(doc, stage, file) {
+    if (!activeProject || busyToken || ocrActiveList.length || ocrStatus?.is_queued) return
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      setNotice({ type: 'error', message: '请选择 PDF 文件。' })
+      return
+    }
+    const projectId = activeProject.identifierId
+    const projectTitle = activeProject.title
+    setBusyToken(`replace-file:${doc.identifier_id}`)
+    setNotice({ type: 'info', message: `${projectTitle}：正在上传并识别“${file.name}”，成功后替换“${doc.file_name}”。请保持页面打开，大文件可能需要较长时间。` })
+    try {
+      const detail = await replaceProjectDocument(projectId, {
+        documentIdentifier: doc.identifier_id,
+        documentType: { tender: 'tender', business: 'business_bid', technical: 'technical_bid' }[stage],
+        file,
+      })
+      const loaded = normalizeProject(detail)
+      setProjects((current) => current.map((p) => p.id === projectId ? { ...p, ...loaded, results: {}, resultsLoaded: false } : p))
+      if (activeProjectIdRef.current === projectId) {
+        setLoadAttempt((v) => v + 1)
+        setNotice({ type: 'success', message: `“${file.name}”已识别并替换成功。旧文件保留，历史审查结果已过期，请重新检查。` })
+      }
+    } catch (error) {
+      if (activeProjectIdRef.current === projectId) {
+        setLoadAttempt((v) => v + 1)
+        setNotice({ type: 'error', message: `替换未确认完成：${error.message || '请求失败'}。请查看刷新后的文件列表再重试；识别失败不会替换原关联。` })
+      }
+    } finally { setBusyToken('') }
   }
 
   async function handleRepairUpload(issue, file) {
@@ -1178,7 +1238,7 @@ export default function ProjectsPage() {
           <div className="project-list">
             {filteredProjects.length > 0 ? (
               filteredProjects.map((project) => {
-                const status = getProjectStatus(project)
+                const status = project.identifierId === activeProjectId ? activeOcrStatus : getProjectStatus(project)
 
                 return (
                   <button
@@ -1195,6 +1255,7 @@ export default function ProjectsPage() {
                       <StatusPill label={status.label} className={status.className} />
                     </div>
                     <p>{project.identifierId}</p>
+                    <small>上传人：{project.uploaderName}</small>
                     <div className="project-card-foot">
                       <span>{project.relationCount ?? project.relations.length} 组标书</span>
                       <span>{formatDateTime(project.updatedAt)}</span>
@@ -1250,19 +1311,20 @@ export default function ProjectsPage() {
                     <p>{activeProject.identifierId}</p>
                   </div>
                   <StatusPill
-                    label={getProjectStatus(activeProject).label}
-                    className={getProjectStatus(activeProject).className}
+                    label={activeOcrStatus.label}
+                    className={activeOcrStatus.className}
                   />
                 </div>
 
                 <div className="stats-grid">
                   <StatItem label="项目标识" value={activeProject.identifierId} />
+                  <StatItem label="上传人" value={activeProject.uploaderName} />
                   <StatItem label="创建时间" value={formatDateTime(activeProject.createdAt)} />
                   <StatItem label="更新时间" value={formatDateTime(activeProject.updatedAt)} />
                   <StatItem label="标书组数" value={activeProject.relationCount ?? activeProject.relations.length} />
                   <StatItem
                     label="分析状态"
-                    value={getProjectStatus(activeProject).label}
+                    value={activeOcrStatus.label}
                   />
                 </div>
 
@@ -1276,6 +1338,9 @@ export default function ProjectsPage() {
                   <span>{activeProject.uploadComplete === false ? '上传不完整' : getParsingProgress(activeProject.parsingStatus).label}</span>
                 </div>
 
+                {ocrStatusError?.projectId === activeProjectId ? (
+                  <div className="ocr-failure-notice" role="alert">{ocrStatusError.message}</div>
+                ) : null}
                 {ocrStages.length > 0 ? (
                   <div className="ocr-progress-panel">
                     <div className="ocr-progress-panel-head">
@@ -1292,13 +1357,19 @@ export default function ProjectsPage() {
                           正在并行处理 {ocrActiveList.length} 个文件
                         </span>
                       ) : (
-                        <span className="ocr-progress-idle-hint">当前无进行中的文件</span>
+                        <span className="ocr-progress-idle-hint">{ocrStatus?.is_queued ? '已加入队列，等待识别' : ocrFailures.length ? '本轮识别已结束，有文件识别失败' : '当前无进行中的文件'}</span>
                       )}
                     </div>
 
+                    {ocrFailures.length > 0 ? (
+                      <div className="ocr-failure-notice" role="alert">
+                        <strong>{ocrFailures.length} 个文件识别失败，原因见下方文件行。</strong>
+                        <span> 已完成的文件保留。请根据原因使用下方“继续 OCR”重试，或在文件行替换有效 PDF。</span>
+                      </div>
+                    ) : null}
                     {ocrStages.map((stage) => {
                       const completedDocs = (stage.completed_documents ?? []).map((doc) => ({ doc, state: 'done' }))
-                      const pendingDocs = (stage.pending_documents ?? []).map((doc) => ({ doc, state: 'pending' }))
+                      const pendingDocs = (stage.pending_documents ?? []).map((doc) => ({ doc, state: doc.ocr_last_error ? 'failed' : 'pending' }))
                       const files = [...completedDocs, ...pendingDocs]
                       if (files.length === 0) return null
                       return (
@@ -1313,12 +1384,12 @@ export default function ProjectsPage() {
                             {files.map(({ doc, state }) => {
                               const activeRec = ocrActiveById.get(String(doc.identifier_id))
                               const isActive = Boolean(activeRec)
-                              const itemState = isActive ? 'active' : state
+                              const itemState = state === 'done' ? 'done' : isActive ? 'active' : state
                               const hasPages = isActive && Number(activeRec.total_pages) > 0
                               return (
                                 <li className={`ocr-file ocr-file-${itemState}`} key={doc.identifier_id}>
                                   <span className="ocr-file-icon">
-                                    {itemState === 'done' ? '✓' : itemState === 'active' ? '⏳' : '…'}
+                                    {itemState === 'done' ? '✓' : itemState === 'active' ? '⏳' : itemState === 'failed' ? '!' : '…'}
                                   </span>
                                   <span className="ocr-file-name">{doc.file_name || doc.identifier_id}</span>
                                   {isActive ? (
@@ -1329,9 +1400,34 @@ export default function ProjectsPage() {
                                     </span>
                                   ) : (
                                     <span className="ocr-file-tag">
-                                      {itemState === 'done' ? '已完成' : '待处理'}
+                                      {itemState === 'done' ? '已完成' : itemState === 'failed' ? '识别失败' : ocrStatus?.is_queued ? '排队等待' : '未完成，待继续'}
                                     </span>
                                   )}
+                                  <label className={`ocr-file-replace ${busyToken || ocrActiveList.length || ocrStatus?.is_queued || !activeProject.detailLoaded ? 'is-disabled' : ''}`}
+                                    role="button" tabIndex={busyToken || ocrActiveList.length || ocrStatus?.is_queued || !activeProject.detailLoaded ? -1 : 0}
+                                    aria-disabled={Boolean(busyToken || ocrActiveList.length || ocrStatus?.is_queued || !activeProject.detailLoaded)}
+                                    onKeyDown={(event) => {
+                                      if (event.key === 'Enter' || event.key === ' ') {
+                                        event.preventDefault()
+                                        event.currentTarget.querySelector('input')?.click()
+                                      }
+                                    }}>
+                                    {busyToken === `replace-file:${doc.identifier_id}` ? '替换中…' : '替换文件'}
+                                    <input type="file" accept=".pdf" hidden
+                                      aria-label={`替换 ${doc.file_name || doc.identifier_id}`}
+                                      disabled={Boolean(busyToken || ocrActiveList.length || ocrStatus?.is_queued || !activeProject.detailLoaded)}
+                                      onChange={(event) => {
+                                        const file = event.target.files?.[0]
+                                        event.target.value = ''
+                                        if (file) handleReplaceFile(doc, stage.stage, file)
+                                      }} />
+                                  </label>
+                                  {itemState === 'failed' ? (
+                                    <div className="ocr-file-error">
+                                      {doc.ocr_last_error.message || '识别失败，请重试或联系管理员。'}
+                                      {doc.ocr_last_error.failed_at ? <span>（失败时间：{formatDateTime(doc.ocr_last_error.failed_at)}）</span> : null}
+                                    </div>
+                                  ) : null}
                                   {hasPages ? (
                                     <div className="ocr-file-bar">
                                       <div

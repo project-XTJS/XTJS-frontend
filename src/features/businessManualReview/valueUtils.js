@@ -199,6 +199,7 @@ export function stringifyManualFieldInput(value, valueType) {
 }
 
 export function parseManualFieldInput(text, field) {
+  if (field.valueType === 'boolean') return text === true || text === 'true'
   var raw = String(text ?? '').trim()
   if (field.valueType === 'array') {
     if (!raw) return []
@@ -257,12 +258,12 @@ export function buildManualReviewValueWithField(item, field, fieldValue, manualD
       nextValue = setManualReviewPathValue(nextValue, ['date_status'], isManualValueBlank(fieldValue) ? (field.path[0] === 'deadline_date' ? 'missing_deadline' : 'missing_date') : 'pending')
     }
     if (field.path && ['signature_text', 'signature_texts', 'signature_evidence'].includes(field.path[0])) {
-      var signatureStatus = getManualReviewObjectValue(item.original_value, ['signature_status', 'status'])
-      nextValue = setManualReviewPathValue(nextValue, ['signature_status'], isManualValueBlank(fieldValue) ? (signatureStatus || 'missing') : 'pass')
+      nextValue = setManualReviewPathValue(nextValue, ['signature_status'], 'pending')
+      nextValue = setManualReviewPathValue(nextValue, ['signature_manually_confirmed'], false)
     }
     if (field.path && ['seal_text', 'seal_texts', 'seal_evidence'].includes(field.path[0])) {
-      var sealStatus = getManualReviewObjectValue(item.original_value, ['seal_status', 'status'])
-      nextValue = setManualReviewPathValue(nextValue, ['seal_status'], isManualValueBlank(fieldValue) ? (sealStatus || 'missing') : 'pass')
+      nextValue = setManualReviewPathValue(nextValue, ['seal_status'], 'pending')
+      nextValue = setManualReviewPathValue(nextValue, ['seal_manually_confirmed'], false)
     }
   }
   return nextValue

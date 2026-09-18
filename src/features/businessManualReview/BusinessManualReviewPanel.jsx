@@ -256,6 +256,7 @@ export default function BusinessManualReviewPanel({
   }
 
   function renderFieldInput(item, field, inputValue) {
+    if (field.valueType === 'boolean') return <input type="checkbox" checked={inputValue === 'true'} onChange={function (event) { handleFieldChange(item, field, event.target.checked) }} />
     if (field.valueType === 'status') {
       var hasCurrentOption = MANUAL_REVIEW_STATUS_OPTIONS.some(function (option) {
         return option[0] === inputValue

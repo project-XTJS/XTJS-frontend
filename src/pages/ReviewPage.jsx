@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useState, useRef } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useState, useRef } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
-  getDocumentSourceUrl,
+  getDocumentDownloadUrl,
   getDocumentPreview,
-  getObjectPresignedUrl,
+  getProjectReportDownloadUrl,
   getProjectDetail,
   getProjectResults,
   listProjects,
@@ -15,7 +15,7 @@ import {
   rerunBusinessBidFormatReviewWithManualInputs,
   exportProjectResultReport,
 } from '../lib/xtjsApi'
-import { DOCUMENT_LABELS, deriveBidderName } from '../utils/formatters'
+import { DOCUMENT_LABELS, bidderDisplayName } from '../utils/formatters'
 import { normalizeProjectResultsPayload } from '../utils/results'
 import EmptyBlock from '../components/EmptyBlock'
 import ProjectDropdown from '../components/ProjectDropdown'
@@ -1241,7 +1241,7 @@ function collectDuplicateAlerts(results, allAlerts) {
           '相似表格': item.metrics && item.metrics.similar_table_count,
           '重复字数': item.duplicate_text_length || item.metrics && item.metrics.duplicate_text_length,
           '上报规则': formatDuplicateReportReason(item.duplicate_report_reason),
-          '错别字': arrayify(item.short_duplicate_typo_issues).length || '',
+          '错别字': item.typo_check?.status === 'incomplete' ? '检查未完成，请重试' : arrayify(item.short_duplicate_typo_issues).length || '',
         },
         evidence: {
           cluster: item,
@@ -1709,18 +1709,8 @@ function applyPersonnelDocumentTypeToEntries(entries, documentType) {
   })
 }
 
-function getPersonnelRelationBidderName(relation, index) {
-  return String(
-    relation && (
-      relation.bidder_name ||
-      relation.bidderName ||
-      relation.company_name ||
-      relation.companyName ||
-      deriveBidderName(relation.business_bid_file_name) ||
-      deriveBidderName(relation.technical_bid_file_name)
-    ) ||
-    '投标人 ' + (index + 1)
-  ).trim()
+function getPersonnelRelationBidderName(relation) {
+  return bidderDisplayName(relation?.bidder_identity)
 }
 
 function getPersonnelRelationBidderKey(relation, index, bidderName) {
@@ -1730,17 +1720,8 @@ function getPersonnelRelationBidderKey(relation, index, bidderName) {
   return nameKey ? 'bidder:' + nameKey : 'relation-index:' + index
 }
 
-function getPersonnelDocBidderName(doc, fileName) {
-  return String(
-    doc && (
-      doc.bidder_name ||
-      doc.bidderName ||
-      doc.company_name ||
-      doc.companyName
-    ) ||
-    deriveBidderName(fileName || doc && doc.file_name) ||
-    ''
-  ).trim()
+function getPersonnelDocBidderName(doc) {
+  return bidderDisplayName(doc?.bidder_identity)
 }
 
 function getPersonnelDocBidderKey(doc, fileName, bidderName) {
@@ -2262,6 +2243,7 @@ function isVerificationAttachmentPassIssue(issue) {
 
 function isVerificationMissingAttachmentIssue(issue) {
   var evidence = (issue && issue.evidence) || {}
+  if (['ambiguous', 'not_found'].includes(evidence.location_status)) return true
   if (!['position_check', 'attachment_result'].includes(evidence.source)) return false
   if (evidence.bid_content_found === false) return true
   if (evidence.bid_content_found === true) return false
@@ -3293,9 +3275,11 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
 
   arrayify(result.bidders).forEach(function (bidder, bidderIndex) {
     var bidderDocumentLookup = buildInlineDocumentLookup(
-      bidder.documents,
+      arrayify(result.dataset && result.dataset.bidders).filter(function (item) {
+        return bidder.bidder_key && item.bidder_key === bidder.bidder_key
+      }),
       result.dataset && result.dataset.tender,
-      result.dataset && result.dataset.bidders
+      bidder.documents
     )
 
     Object.entries(bidder.checks || {}).forEach(function (entry) {
@@ -3379,7 +3363,8 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
         sourceDocs = sourceDocs.map(function (doc) {
           return mergeDocumentCandidate(doc, bidderDocumentLookup)
         })
-        var canUseConsistencyBidFallback = checkKey !== 'consistency_check' || hasBusinessFormatPreviewLocation(formatLocations)
+        var unresolvedAttachment = ['ambiguous', 'not_found'].includes((issue.evidence || {}).location_status)
+        var canUseConsistencyBidFallback = !unresolvedAttachment && (checkKey !== 'consistency_check' || hasBusinessFormatPreviewLocation(formatLocations))
         var bidFallbackPage = canUseConsistencyBidFallback
           ? getFormatBidFallbackPage(issue, page)
           : null
@@ -3498,6 +3483,24 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
           // A tender page is not a fallback location in the bidder's document.
           docRefs = docRefs.filter(isTenderTemplateDoc)
         }
+        if (unresolvedAttachment) {
+          docRefs = docRefs.filter(isTenderTemplateDoc)
+          arrayify((issue.evidence || {}).location_candidates).forEach(function (candidate, candidateIndex) {
+            var candidateRefs = buildIssueLocationDocRefs({}, {
+              locations: arrayify(candidate.locations).map(function (loc) {
+                return withLocationDocumentRole(loc, 'business_bid')
+              }),
+              documentLookup: bidderDocumentLookup,
+              docKeyPrefix: 'attachment-candidate-' + candidateIndex,
+              defaultLabel: '候选附件，待确认',
+            })
+            candidateRefs.forEach(function (ref) {
+              ref.label = '候选 ' + (candidateIndex + 1) + '（待确认）：' + (candidate.title || '') + ' — ' + (ref.fileName || '')
+              ref.purpose = 'attachment_candidate'
+            })
+            docRefs = docRefs.concat(candidateRefs)
+          })
+        }
         docRefs = orderFormatReviewDocRefs(docRefs)
         var docRef = docRefs.find(function (doc) {
           return isBusinessBidDoc(doc) || doc.role === 'business' || doc.purpose === 'business_bid_source' || doc.purpose === 'quoted_price_source'
@@ -3541,9 +3544,9 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
           groupLabel: defaultGroupLabel,
           riskLevel: isPassedItem ? 'none' : (riskLevel === 'none' ? 'medium' : riskLevel),
           title: (isPassedItem ? '符合项：' : '') + alertTitle,
-          description: (bidder.bidder_name || bidder.bidder_key || '投标人') + ' - ' + alertDescription,
+          description: bidderDisplayName(bidder.bidder_identity) + ' - ' + alertDescription,
           metrics: {
-            '投标人': bidder.bidder_name || bidder.bidder_key || '--',
+            '投标人': bidderDisplayName(bidder.bidder_identity),
             '审查项': checkLabel,
             '系统结论': isPassedItem ? '通过' : (issue.status || reviewStatus || '--'),
             '页码': previewPage || '--',
@@ -4268,22 +4271,9 @@ function downloadUrl(url, fileName) {
   document.body.removeChild(a)
 }
 
-async function getReportDownloadUrl(response) {
-  var candidate = response?.report_upload?.presigned_url ||
-    response?.report_upload?.file_url ||
-    response?.report_url ||
-    ''
-  // 兜底：minio:// 内部协议不能在浏览器直接打开，转调后端换取公网预签名地址。
-  if (candidate && candidate.indexOf('minio://') === 0) {
-    var objectPath = candidate.replace(/^minio:\/\/[^/]+\//, '')
-    try {
-      var presigned = await getObjectPresignedUrl(objectPath)
-      if (presigned && presigned.presigned_url) return presigned.presigned_url
-    } catch (e) {
-      // 换取失败时保持原值返回，由上层提示
-    }
-  }
-  return candidate
+async function getReportDownloadUrl(response, projectId) {
+  const result = await getProjectReportDownloadUrl(projectId)
+  return result.presigned_url
 }
 
 function getProjectIdentifierValue(project) {
@@ -4582,6 +4572,15 @@ export default function ReviewPage() {
   var [allAlerts, setAllAlerts] = useState([])
   var [currentServiceType, setCurrentServiceType] = useState(null)
   var [currentAlertIndex, setCurrentAlertIndex] = useState(0)
+  var [overviewMode, setOverviewMode] = useState('all')
+  var [overviewReturn, setOverviewReturn] = useState(null)
+  var restoreOverviewScroll = useRef(null)
+  useLayoutEffect(function () {
+    if (!currentServiceType && restoreOverviewScroll.current !== null) {
+      window.scrollTo({ top: restoreOverviewScroll.current, behavior: 'instant' })
+      restoreOverviewScroll.current = null
+    }
+  }, [currentServiceType, overviewMode])
   var [detailResultFilter, setDetailResultFilter] = useState('all')
   var [detailFileFilter, setDetailFileFilter] = useState('all')
   var [detailCheckFilter, setDetailCheckFilter] = useState('all')
@@ -4676,6 +4675,9 @@ export default function ReviewPage() {
   }, [])
 
   var resetReviewState = useCallback(function () {
+    setOverviewMode('all')
+    setOverviewReturn(null)
+    restoreOverviewScroll.current = null
     resultsRef.current = null
     projectDetailRef.current = null
     setResults(null)
@@ -4915,7 +4917,7 @@ export default function ReviewPage() {
   }, [currentServiceType, personnelDraftDocuments, personnelActiveBidderKey, personnelActiveDocKey])
 
   var getCurrentPreviewDocs = useCallback(function () {
-    if (currentServiceType === 'personnel_reuse_check' && personnelActiveDocument) {
+    if (currentServiceType === 'personnel_reuse_check' && !overviewReturn && personnelActiveDocument) {
       var personnelDocRef = buildPersonnelDraftDocRef(personnelActiveDocument, personnelActivePage)
       return personnelDocRef ? [personnelDocRef] : []
     }
@@ -4949,7 +4951,7 @@ export default function ReviewPage() {
       }
     }
     return docs
-  }, [currentServiceType, currentAlert, personnelActiveDocument, personnelActivePage, formatEditableItems])
+  }, [currentServiceType, currentAlert, personnelActiveDocument, personnelActivePage, formatEditableItems, overviewReturn])
 
   // Load previews for current alert
   useEffect(function () {
@@ -5032,6 +5034,8 @@ export default function ReviewPage() {
   }, [personnelDraftDirty, personnelDraftDocuments, selectedProjectId])
 
   function selectServiceType(key) {
+    setOverviewReturn(null)
+    setOverviewMode('all')
     setCurrentServiceType(key)
     setCurrentAlertIndex(0)
     setDetailResultFilter('all')
@@ -5058,8 +5062,13 @@ export default function ReviewPage() {
       return item.id === alert.id
     })
 
+    if (targetIndex < 0) {
+      setNotice({ type: 'error', message: '该条目已更新，请刷新总览后重新选择。' })
+      return
+    }
+    setOverviewReturn({ projectId: selectedProjectId, scrollY: window.scrollY, mode: overviewMode })
     setCurrentServiceType(targetResultType)
-    setCurrentAlertIndex(targetIndex >= 0 ? targetIndex : 0)
+    setCurrentAlertIndex(targetIndex)
     setDetailResultFilter('all')
     setDetailFileFilter('all')
     setDetailCheckFilter('all')
@@ -5068,6 +5077,14 @@ export default function ReviewPage() {
     setPreviewPageInputs({})
     setPreviewBusy({})
     setPreviewErrors({})
+  }
+
+  function returnToOverview() {
+    if (!overviewReturn || overviewReturn.projectId !== selectedProjectId) return
+    restoreOverviewScroll.current = overviewReturn.scrollY
+    setOverviewMode(overviewReturn.mode)
+    setCurrentServiceType(null)
+    setOverviewReturn(null)
   }
 
   function resetDetailCursorAndPreview() {
@@ -5285,14 +5302,19 @@ export default function ReviewPage() {
       if (reviewSessionRef.current !== operation) return
   }
 
-  function handleDownloadPdf(docInfo) {
+  async function handleDownloadPdf(docInfo) {
     var target = getPreviewTargets(docInfo)[0]
     if (!target) {
       setNotice({ type: 'error', message: '当前文档缺少下载标识' })
       return
     }
 
-    downloadUrl(getDocumentSourceUrl(target), docInfo.fileName || docInfo.label || 'document.pdf')
+    try {
+      const result = await getDocumentDownloadUrl(target)
+      downloadUrl(result.presigned_url, docInfo.fileName || docInfo.label || 'document.pdf')
+    } catch (error) {
+      setNotice({ type: 'error', message: '文件下载失败：' + error.message })
+    }
   }
 
   function handleReview(alertId, status) {
@@ -5887,7 +5909,7 @@ export default function ReviewPage() {
       var payload = buildFilteredResultJson(allAlerts, selectedAlerts, overviewResultKeys, reviewStatus)
       var response = await exportWordReport(payload)
       if (reviewSessionRef.current !== operation) return
-      var reportUrl = await getReportDownloadUrl(response)
+      var reportUrl = await getReportDownloadUrl(response, selectedProjectId)
       if (reviewSessionRef.current !== operation) return
       var reportName = response?.report_name || ('review-report-' + selectedProjectId + '.docx')
 
@@ -5944,6 +5966,7 @@ export default function ReviewPage() {
   var projectFiles = getProjectOverviewFiles(projectDetail)
   var overviewSections = overviewResultKeys.map(function (key) {
     var sectionAlerts = getAlertsForResultType(key, allAlerts)
+    if (overviewMode === 'fail') sectionAlerts = filterReviewAlertsByResult(sectionAlerts, 'fail')
     return {
       key: key,
       label: RESULT_TYPE_LABELS[key] || key,
@@ -6117,7 +6140,7 @@ export default function ReviewPage() {
     var group = fileGroups[activeFileIndex]
     var filterKey = section.key + ':' + group.key
     var showCheckFilter = section.key === FORMAT_REVIEW_RESULT_KEY || section.key === FORMAT_REVIEW_PASSED_RESULT_KEY
-    var activeResultFilter = overviewFileResultFilters[filterKey] || 'all'
+    var activeResultFilter = overviewMode === 'fail' ? 'fail' : (overviewFileResultFilters[filterKey] || 'all')
     var activeCheckFilter = showCheckFilter ? (overviewFileCheckFilters[filterKey] || 'all') : 'all'
     var checkCounts = getReviewCheckFilterCounts(group.alerts)
     var checkFilteredAlerts = filterReviewAlertsByCheck(group.alerts, activeCheckFilter)
@@ -6750,6 +6773,7 @@ export default function ReviewPage() {
           </aside>
 
           <section className="review-main">
+            {currentServiceType && overviewReturn ? <button type="button" className="ghost-button overview-return" onClick={returnToOverview}>返回总览原位置</button> : null}
             {isLoading ? (
               <EmptyBlock title="加载中..." />
             ) : loadError ? (
@@ -6763,7 +6787,7 @@ export default function ReviewPage() {
                     <div className="overview-title-row">
                       <div>
                         <span className="overview-kicker">全项目</span>
-                        <h3>项目级审查总览</h3>
+                        <h3>{overviewMode === 'fail' ? '全部不通过项' : '项目级审查总览'}</h3>
                         <p>{projectTitle}</p>
                       </div>
                       <span className="overview-scope">当前视角：全项目</span>
@@ -6777,9 +6801,11 @@ export default function ReviewPage() {
                             key={card.key}
                             className="overview-stat-card"
                             onClick={function () {
-                              if (card.key !== 'total' && card.key !== 'fail-total') selectServiceType(card.key)
+                              if (card.key === 'total') setOverviewMode('all')
+                              else if (card.key === 'fail-total') setOverviewMode('fail')
+                              else selectServiceType(card.key)
                             }}
-                            disabled={card.key === 'fail-total'}
+                            aria-pressed={card.key === 'fail-total' ? overviewMode === 'fail' : card.key === 'total' ? overviewMode === 'all' : undefined}
                           >
                             <span>{card.label}</span>
                             <strong style={{ color: card.color }}>{card.value}</strong>
@@ -6901,7 +6927,7 @@ export default function ReviewPage() {
               ) : (
                 <EmptyBlock title="暂无分析结果" />
               )
-            ) : currentServiceType === 'personnel_reuse_check' ? (
+            ) : currentServiceType === 'personnel_reuse_check' && !overviewReturn ? (
               renderPersonnelDraftWorkspace()
             ) : serviceAlerts.length === 0 ? (
               <EmptyBlock title={

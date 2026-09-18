@@ -288,6 +288,8 @@ export function buildManualReviewDisplayFields(item, currentValue) {
   if (item.field_group === 'attachment_result') {
     addField({ path: ['date_text'], label: '落款日期', valueType: 'text', sourceKeys: ['date_text', 'date', 'sign_date'], fallbackStatusKeys: ['date_status'] })
     addField({ path: ['deadline_date'], label: '有效截止日期', valueType: 'text', sourceKeys: ['deadline_date', 'deadline_text', 'matched_deadline_text'], fallbackStatusKeys: ['date_status'], locateTarget: 'deadline' })
+    addField({ path: ['signature_manually_confirmed'], label: '已对照原件确认全部所需签字', valueType: 'boolean' })
+    addField({ path: ['seal_manually_confirmed'], label: '已对照原件确认公章及主体符合要求', valueType: 'boolean' })
     addField({ path: ['signature_evidence'], label: '签字识别内容（每行一个）', valueType: 'array', sourceKeys: ['signature_evidence', 'signature_texts', 'signature_text'], fallbackStatusKeys: ['signature_parse_status', 'signature_status'], multiline: true, useOriginalValueWhenCurrentMissing: true })
     addField({ path: ['seal_texts'], label: '盖章识别内容（每行一个）', valueType: 'array', sourceKeys: ['seal_texts', 'seal_evidence', 'seal_text'], fallbackStatusKeys: ['seal_status'], multiline: true, useOriginalValueWhenCurrentMissing: true })
     return fields

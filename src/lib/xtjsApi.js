@@ -48,6 +48,7 @@ export function getToken() {
 }
 
 export function setToken(token) {
+  invalidateApiCache(() => true)
   if (!canUseLocalStorage()) return
   try {
     if (token) {
@@ -270,7 +271,15 @@ function invalidateProjectResultsCache(identifierId) {
   invalidateApiCache((key) => key.includes(`/api/postgresql/projects/${encodedIdentifier}/results`))
 }
 
+let cachedSessionToken = null
+
 function cachedRequest(path, { query, ttl, forceRefresh = false, timeoutMs, cacheVersion = '' } = {}) {
+  // localStorage can change in another tab without calling setToken here.
+  const requestToken = getToken()
+  if (requestToken !== cachedSessionToken) {
+    invalidateApiCache(() => true)
+    cachedSessionToken = requestToken
+  }
   const cacheKey = buildRequestUrl(path, query).href + (cacheVersion ? `#${cacheVersion}` : '')
 
   if (!forceRefresh) {
@@ -283,6 +292,7 @@ function cachedRequest(path, { query, ttl, forceRefresh = false, timeoutMs, cach
   const requestEpoch = apiCacheEpoch
   const requestPromise = request(path, { query, timeoutMs })
     .then((payload) => {
+      if (requestToken !== getToken()) throw new Error('登录账号已变更，请重新加载')
       if (requestEpoch === apiCacheEpoch) {
         writeCachedPayload(cacheKey, payload, ttl)
       }
@@ -574,6 +584,19 @@ export async function confirmPersonnelReuseDraft(projectIdentifier, documents) {
 
 // ─── Relations ───────────────────────────────────────
 
+export async function replaceProjectDocument(projectIdentifier, { documentIdentifier, documentType, file }) {
+  const body = new FormData()
+  body.append('document_identifier', documentIdentifier)
+  body.append('document_type', documentType)
+  body.append('file', file)
+  try {
+    return await request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/replace-document`, { method: 'POST', body })
+  } finally {
+    // Even a lost response may follow a committed replacement.
+    invalidateProjectCache(projectIdentifier)
+  }
+}
+
 export async function getBusinessBidFormatReviewEditable(projectIdentifier) {
   return request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/business-bid-format-review/editable`)
 }
@@ -612,16 +635,12 @@ export async function rerunBusinessBidFormatReviewWithManualInputs(projectIdenti
 
 
 
-export function getDocumentSourceUrl(fileNameOrId, page) {
-  var url = `${API_BASE_URL}/api/postgresql/documents/${encodeURIComponent(fileNameOrId)}/source`
-  if (page) {
-    url += `?page=${encodeURIComponent(page)}`
-  }
-  return url
+export async function getDocumentDownloadUrl(identifier) {
+  return request(`/api/postgresql/documents/${encodeURIComponent(identifier)}/source`, { query: { as_json: true } })
 }
 
-export async function getObjectPresignedUrl(objectName) {
-  return request(`/api/file/objects/${encodeURIComponent(objectName)}/presigned-url`)
+export async function getProjectReportDownloadUrl(identifier) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(identifier)}/report-source`)
 }
 
 export async function getDocumentPreview(fileNameOrId, page, { highlight, highlightBbox, highlightRects, highlightCoordinateSpace } = {}) {

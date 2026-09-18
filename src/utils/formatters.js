@@ -24,12 +24,8 @@ export function stripExtension(fileName) {
   return String(fileName || '').replace(/\.[^.]+$/, '')
 }
 
-export function deriveBidderName(fileName) {
-  return stripExtension(fileName)
-    .replace(/(商务标|技术标|投标文件|扫描件|商务|技术)/g, '')
-    .replace(/[()（）_-]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
+export function bidderDisplayName(identity) {
+  return identity?.status === 'resolved' && identity?.name ? identity.name : '单位名称未识别'
 }
 
 export function deriveProjectTitle(identifierId, relations) {
