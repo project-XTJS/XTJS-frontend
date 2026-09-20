@@ -252,6 +252,10 @@ function getFormatCheckStatus(check) {
     return { state: 'warning', label: issueCount > 0 ? `${issueCount} 项待复核` : '待复核', count: issueCount }
   }
 
+  if (['not_applicable', 'not_required', 'skipped'].includes(status)) {
+    return { state: 'pass', label: '无需检查', count: 0 }
+  }
+
   if (['pass', 'passed', 'ok', 'correct', 'success'].includes(status)) {
     return { state: 'pass', label: '通过', count: 0 }
   }
