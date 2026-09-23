@@ -6,6 +6,13 @@ import {
   getProjectReportDownloadUrl,
   getProjectDetail,
   getProjectResults,
+  getProjectReviewSummary,
+  getProjectReviewComponent,
+  listProjectReviewIssues,
+  getProjectReviewIssue,
+  getProjectReviewIssueEvidence,
+  getProjectReviewIssueIds,
+  exportProjectReview,
   listProjects,
   confirmPersonnelReuseDraft,
   getBusinessBidFormatReviewEditable,
@@ -572,7 +579,7 @@ function buildExportPayload(alert, item) {
 
 function isDuplicateIssueVisible(item) {
   var riskLevel = String(item.risk_level || '').toLowerCase()
-  return Boolean(item) && riskLevel !== '' && riskLevel !== 'none'
+  return Boolean(item) && (Boolean(item.review_only) || (riskLevel !== '' && riskLevel !== 'none'))
 }
 
 function getDuplicateAlertResultType(resultKey) {
@@ -905,13 +912,17 @@ function getDuplicateOccurrenceDocEntries(cluster, occurrence) {
 
 function getDuplicateOccurrenceSideText(occurrence, entry, side) {
   var evidence = (occurrence && occurrence.evidence) || {}
+  var analysisText = evidence[side + '_analysis_text']
+  var rows = evidence[side + '_rows'] || evidence[side + '_sample_rows'] || evidence.sample_rows
   return firstTextValue(
-    entry && entry.doc && entry.doc.preview,
-    evidence[side + '_preview'],
+    analysisText,
     evidence[side + '_text'],
+    Array.isArray(rows) ? rows.map(function (value) { return String(value || '').trim() }).filter(Boolean).join('\n') : rows,
+    evidence[side + '_preview'],
+    side === 'left' && evidence.text,
+    entry && entry.doc && entry.doc.preview,
     evidence[side + '_title'],
     evidence.preview,
-    evidence.text,
     evidence.title,
   )
 }
@@ -931,11 +942,12 @@ function duplicateOccurrenceIsSimilar(occurrence, cluster) {
 }
 
 function getDuplicateEvidenceSideText(evidence, side) {
+  var rows = evidence && (evidence[side + '_rows'] || evidence[side + '_sample_rows'] || evidence.sample_rows)
   return firstTextValue(
+    evidence && evidence[side + '_analysis_text'],
     evidence && evidence[side + '_text'],
+    Array.isArray(rows) ? rows.map(function (value) { return String(value || '').trim() }).filter(Boolean).join('\n') : rows,
     evidence && evidence[side + '_preview'],
-    evidence && evidence[side + '_rows'],
-    evidence && evidence[side + '_sample_rows'],
     side === 'left' && evidence && evidence.text,
   )
 }
@@ -959,6 +971,8 @@ function buildDuplicateEvidenceRows(cluster) {
         file_name: entry.fileName,
         page: getDuplicateOccurrenceSidePage(occurrence, entry, side),
         text: getDuplicateOccurrenceSideText(occurrence, entry, side),
+        side: side,
+        source_evidence_id: occurrence.evidence && occurrence.evidence.typo_evidence_id,
       }
     }).filter(function (doc) {
       return doc.file_name || doc.text
@@ -985,6 +999,7 @@ function buildDuplicateEvidenceRows(cluster) {
       left_text: leftText,
       right_text: rightText,
       similarity: occurrence.similarity || (cluster && cluster.similarity),
+      source_evidence_id: occurrence.evidence && occurrence.evidence.typo_evidence_id,
       source_index: index,
     })
   })
@@ -1008,6 +1023,7 @@ function buildDuplicateEvidenceRows(cluster) {
         left_text: leftText,
         right_text: rightText,
         similarity: evidence.similarity || (cluster && cluster.similarity_match_score),
+        source_evidence_id: evidence.typo_evidence_id,
         source_index: index,
       })
     })
@@ -1039,63 +1055,153 @@ function getAlertDuplicateEvidenceRows(alert) {
 function getDuplicateTypoIssues(alert) {
   var evidence = (alert && alert.evidence) || {}
   var fromAlert = arrayify(evidence.shortDuplicateTypoIssues)
-  if (fromAlert.length > 0) return fromAlert
   var cluster = evidence.cluster
-  return arrayify(cluster && cluster.short_duplicate_typo_issues)
-}
-
-function getTypoTermsFromIssues(issues) {
-  var terms = []
-  arrayify(issues).forEach(function (issue) {
-    var term = String((issue && (issue.highlight_text || issue.matched_text)) || '').trim()
-    if (term && terms.indexOf(term) < 0) terms.push(term)
+  var values = fromAlert.length > 0 ? fromAlert : arrayify(cluster && cluster.short_duplicate_typo_issues)
+  return values.filter(function (issue) {
+    return issue && issue.verification_status === 'confirmed' && arrayify(issue.occurrences).length > 0
   })
-  // 长词优先，避免短词先匹配把长词截断
-  return terms.sort(function (a, b) { return b.length - a.length })
 }
 
-function renderTypoText(text, terms, keyPrefix) {
+function getDuplicateTypoReviewCandidates(alert) {
+  var evidence = (alert && alert.evidence) || {}
+  var cluster = evidence.cluster
+  var explicit = arrayify(evidence.typoReviewCandidates)
+  if (explicit.length === 0) explicit = arrayify(cluster && cluster.typo_review_candidates)
+  var legacy = arrayify(evidence.shortDuplicateTypoIssues).concat(arrayify(cluster && cluster.short_duplicate_typo_issues)).filter(function (issue) {
+    return issue && !(issue.verification_status === 'confirmed' && arrayify(issue.occurrences).length > 0)
+  })
+  var seen = new Set()
+  return explicit.concat(legacy).filter(function (issue) {
+    if (!issue) return false
+    var key = issue.shared_id || [issue.matched_text, issue.suggestion, issue.page].join('|')
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function getTypoSpansForSource(issues, sourceEvidenceId, side) {
+  if (!sourceEvidenceId || !side) return []
+  var spans = []
+  arrayify(issues).forEach(function (issue) {
+    arrayify(issue && issue.occurrences).forEach(function (occurrence) {
+      if (!occurrence || occurrence.source_evidence_id !== sourceEvidenceId || occurrence.side !== side) return
+      if (!Number.isInteger(occurrence.start) || !Number.isInteger(occurrence.end) || occurrence.end <= occurrence.start) return
+      spans.push({
+        start: occurrence.start,
+        end: occurrence.end,
+        review: issue.verification_status !== 'confirmed',
+      })
+    })
+  })
+  return spans.sort(function (left, right) {
+    if (left.start !== right.start) return left.start - right.start
+    if (left.review !== right.review) return left.review ? 1 : -1
+    return right.end - left.end
+  })
+}
+
+function getTypoPagesForSource(issues, sourceEvidenceId, side) {
+  var pages = []
+  arrayify(issues).forEach(function (issue) {
+    arrayify(issue && issue.occurrences).forEach(function (occurrence) {
+      if (!occurrence || occurrence.source_evidence_id !== sourceEvidenceId || occurrence.side !== side) return
+      var page = Number(occurrence.page)
+      if (Number.isInteger(page) && page > 0 && pages.indexOf(page) < 0) pages.push(page)
+    })
+  })
+  return pages.sort(function (left, right) { return left - right })
+}
+
+function renderTypoText(text, issues, sourceEvidenceId, side, keyPrefix) {
   var str = String(text === undefined || text === null ? '' : text)
   if (!str) return str
-  var valid = arrayify(terms).filter(Boolean)
-  if (valid.length === 0) return str
-  var escaped = valid.map(function (term) { return String(term).replace(/[.*+?^${}()|[\]\\]/g, '\\$&') })
-  var pattern = new RegExp('(' + escaped.join('|') + ')')
-  return str.split(pattern).map(function (segment, index) {
-    if (segment && valid.indexOf(segment) >= 0) {
-      return <span className="typo-highlight" key={(keyPrefix || 'typo') + '-' + index}>{segment}</span>
-    }
-    return <span key={(keyPrefix || 'seg') + '-' + index}>{segment}</span>
+  var characters = Array.from(str)
+  var spans = getTypoSpansForSource(issues, sourceEvidenceId, side).filter(function (span) {
+    return span.start >= 0 && span.end <= characters.length
   })
+  if (spans.length === 0) return str
+  var nodes = []
+  var cursor = 0
+  spans.forEach(function (span, index) {
+    if (span.start < cursor) return
+    if (span.start > cursor) nodes.push(<span key={(keyPrefix || 'text') + '-plain-' + index}>{characters.slice(cursor, span.start).join('')}</span>)
+    nodes.push(
+      <span className={span.review ? 'typo-highlight typo-highlight-review' : 'typo-highlight'} key={(keyPrefix || 'typo') + '-' + index}>
+        {characters.slice(span.start, span.end).join('')}
+      </span>
+    )
+    cursor = span.end
+  })
+  if (cursor < characters.length) nodes.push(<span key={(keyPrefix || 'text') + '-tail'}>{characters.slice(cursor).join('')}</span>)
+  return nodes
 }
 
-function renderDuplicateTypoSummary(issues) {
+function renderDuplicateTypoSummary(issues, options) {
   var list = arrayify(issues).filter(function (issue) {
     return issue && (issue.matched_text || issue.highlight_text)
   })
   if (list.length === 0) return null
+  var review = Boolean(options && options.review)
+  function renderOriginalWord(issue, index) {
+    var word = String(issue.original_word || issue.matched_text || issue.highlight_text || '').trim()
+    var characters = Array.from(word)
+    var occurrence = arrayify(issue.occurrences)[0]
+    var relativeStart = occurrence && Number.isInteger(occurrence.start) && Number.isInteger(occurrence.word_start)
+      ? occurrence.start - occurrence.word_start
+      : -1
+    var relativeEnd = occurrence && Number.isInteger(occurrence.end) && Number.isInteger(occurrence.word_start)
+      ? occurrence.end - occurrence.word_start
+      : -1
+    if (relativeStart < 0 || relativeEnd <= relativeStart || relativeEnd > characters.length) return word
+    return (
+      <>
+        {characters.slice(0, relativeStart).join('')}
+        <span className={review ? 'typo-highlight typo-highlight-review' : 'typo-highlight'} key={'word-error-' + index}>
+          {characters.slice(relativeStart, relativeEnd).join('')}
+        </span>
+        {characters.slice(relativeEnd).join('')}
+      </>
+    )
+  }
+  var chips = list.map(function (issue, index) {
+    var suggestion = String(issue.replacement_word || issue.suggestion || '').trim()
+    var legacy = arrayify(issue.occurrences).length === 0
+    return (
+      <span className={review ? 'duplicate-typo-chip duplicate-typo-chip-review' : 'duplicate-typo-chip'} key={'typo-chip-' + index}>
+        {renderOriginalWord(issue, index)}
+        {suggestion ? ' → ' + suggestion : ''}
+        {legacy ? '（历史候选）' : ''}
+      </span>
+    )
+  })
+  if (review) {
+    return (
+      <details className="duplicate-typo-summary duplicate-typo-summary-review">
+        <summary><strong>待复核候选（{list.length}）</strong></summary>
+        <div className="duplicate-typo-summary-items">{chips}</div>
+      </details>
+    )
+  }
   return (
     <div className="duplicate-typo-summary">
-      <strong>疑似错别字（{list.length}）：</strong>
-      {list.map(function (issue, index) {
-        var wrong = String(issue.highlight_text || issue.matched_text || '').trim()
-        var suggestion = String(issue.suggestion || '').trim()
-        return (
-          <span className="duplicate-typo-chip" key={'typo-chip-' + index}>
-            <span className="typo-highlight">{wrong}</span>
-            {suggestion ? ' → ' + suggestion : ''}
-          </span>
-        )
-      })}
+      <strong>确认错别字（{list.length}）：</strong>
+      {chips}
     </div>
   )
 }
 
 function renderDuplicateEvidenceRows(alert) {
   var typoIssues = getDuplicateTypoIssues(alert)
-  var typoTerms = getTypoTermsFromIssues(typoIssues)
+  var typoReviewCandidates = getDuplicateTypoReviewCandidates(alert)
+  var allTypoResults = typoIssues.concat(typoReviewCandidates)
+  var hasPreciseTypoLocations = allTypoResults.some(function (issue) {
+    return arrayify(issue && issue.occurrences).some(function (occurrence) {
+      return occurrence && occurrence.source_evidence_id && Number.isInteger(occurrence.start) && Number.isInteger(occurrence.end)
+    })
+  })
   var cluster = alert && alert.evidence && alert.evidence.cluster
-  if (isObject(cluster) && isObject(cluster.doc_previews_by_file)) {
+  if (isObject(cluster) && isObject(cluster.doc_previews_by_file) && !hasPreciseTypoLocations) {
     var files = arrayify(cluster.files)
     Object.keys(cluster.doc_previews_by_file).forEach(function (fileName) {
       if (files.indexOf(fileName) < 0) files.push(fileName)
@@ -1103,6 +1209,7 @@ function renderDuplicateEvidenceRows(alert) {
     return (
       <div className="duplicate-evidence-list duplicate-cluster-evidence-list">
         {renderDuplicateTypoSummary(typoIssues)}
+        {renderDuplicateTypoSummary(typoReviewCandidates, { review: true })}
         {files.map(function (fileName, fileIndex) {
           var previews = arrayify(cluster.doc_previews_by_file[fileName])
           var ranges = arrayify(cluster.doc_ranges_by_file && cluster.doc_ranges_by_file[fileName])
@@ -1124,7 +1231,7 @@ function renderDuplicateEvidenceRows(alert) {
                   return (
                     <div className="duplicate-segment" key={'dup-seg-' + previewIndex}>
                       <span className="duplicate-segment-label">{segLabel}</span>
-                      <p className="duplicate-preview-text">{renderTypoText(preview, typoTerms, 'seg-' + fileIndex + '-' + previewIndex)}</p>
+                      <p className="duplicate-preview-text">{preview}</p>
                     </div>
                   )
                 })
@@ -1132,7 +1239,7 @@ function renderDuplicateEvidenceRows(alert) {
                 previews.map(function (preview, previewIndex) {
                   return (
                     <p className="duplicate-preview-text" key={'dup-preview-' + previewIndex}>
-                      {renderTypoText(preview, typoTerms, 'prev-' + fileIndex + '-' + previewIndex)}
+                      {preview}
                     </p>
                   )
                 })
@@ -1150,9 +1257,12 @@ function renderDuplicateEvidenceRows(alert) {
   return (
     <div className="duplicate-evidence-list">
       {renderDuplicateTypoSummary(typoIssues)}
+      {renderDuplicateTypoSummary(typoReviewCandidates, { review: true })}
       {rows.map(function (row, index) {
         var isSimilar = row.kind === 'similar'
         var rowDocs = arrayify(row.docs)
+        var leftTypoPages = getTypoPagesForSource(allTypoResults, row.source_evidence_id, 'left')
+        var rightTypoPages = getTypoPagesForSource(allTypoResults, row.source_evidence_id, 'right')
         if (rowDocs.length > 2) {
           return (
             <div key={'dup-row-' + index} className={isSimilar ? 'diff-block diff-block-similar' : 'diff-block'}>
@@ -1160,12 +1270,13 @@ function renderDuplicateEvidenceRows(alert) {
                 问题 {index + 1} / 共 {rowDocs.length} 份文件
               </span>
               {rowDocs.map(function (doc, docIndex) {
+                var typoPages = getTypoPagesForSource(allTypoResults, doc.source_evidence_id || row.source_evidence_id, doc.side)
                 return (
                   <div className="duplicate-doc-line" key={'dup-doc-' + docIndex}>
                     <span className="diff-block-page">
-                      {docIndex + 1}. {doc.file_name || '关联文件'} / 第 {doc.page || '--'} 页
+                      {docIndex + 1}. {doc.file_name || '关联文件'} / 第 {typoPages.length ? typoPages.join('、') : (doc.page || '--')} 页
                     </span>
-                    <p className="duplicate-preview-text">{renderTypoText(doc.text || '', typoTerms, 'rowdoc-' + index + '-' + docIndex)}</p>
+                    <p className="duplicate-preview-text">{renderTypoText(doc.text || '', allTypoResults, doc.source_evidence_id || row.source_evidence_id, doc.side, 'rowdoc-' + index + '-' + docIndex)}</p>
                   </div>
                 )
               })}
@@ -1175,15 +1286,15 @@ function renderDuplicateEvidenceRows(alert) {
         return (
           <div key={'dup-row-' + index} className={isSimilar ? 'diff-block diff-block-similar' : 'diff-block'}>
             <span className="diff-block-page">
-              问题 {index + 1} / 第 {row.left_page || '--'} 页（左）/ 第 {row.right_page || '--'} 页（右）
+              问题 {index + 1} / 第 {leftTypoPages.length ? leftTypoPages.join('、') : (row.left_page || '--')} 页（左）/ 第 {rightTypoPages.length ? rightTypoPages.join('、') : (row.right_page || '--')} 页（右）
             </span>
-            {isSimilar ? (
+            {isSimilar || row.right_text ? (
               <>
-                <p className="duplicate-preview-text">{renderTypoText('L: ' + (row.left_text || row.text || ''), typoTerms, 'rowL-' + index)}</p>
-                <p className="duplicate-preview-text">{renderTypoText('R: ' + (row.right_text || ''), typoTerms, 'rowR-' + index)}</p>
+                <p className="duplicate-preview-text"><span>L: </span>{renderTypoText(row.left_text || row.text || '', allTypoResults, row.source_evidence_id, 'left', 'rowL-' + index)}</p>
+                <p className="duplicate-preview-text"><span>R: </span>{renderTypoText(row.right_text || '', allTypoResults, row.source_evidence_id, 'right', 'rowR-' + index)}</p>
               </>
             ) : (
-              <p className="duplicate-preview-text">{renderTypoText(row.text || row.left_text || row.right_text, typoTerms, 'row-' + index)}</p>
+              <p className="duplicate-preview-text">{renderTypoText(row.text || row.left_text || row.right_text, allTypoResults, row.source_evidence_id, 'left', 'row-' + index)}</p>
             )}
           </div>
         )
@@ -1225,6 +1336,7 @@ function collectDuplicateAlerts(results, allAlerts) {
 
       var alert = {
         id: makeAlertId('duplicate', resultKey, groupKey, item.cluster_id, index),
+        reviewIssueId: item._review_issue_id || item.issue_id || item.cluster_id,
         resultType: alertResultType,
         parentResultType: alertResultType !== resultKey ? resultKey : '',
         sourceResultKey: resultKey,
@@ -1232,8 +1344,9 @@ function collectDuplicateAlerts(results, allAlerts) {
         groupKey: groupKey,
         groupLabel: getGroupLabel(groupKey, item.document_type),
         riskLevel: normalizeRiskLevel(item.risk_level),
+        sourceStatus: item.status || (item.review_only ? 'unclear' : ''),
         title: item.title || [item.left_file_name, item.right_file_name].filter(Boolean).join(' / ') || '疑似重复内容',
-        description: '共 ' + duplicateEvidenceRows.length + ' 条重复证据，匹配得分 ' + (score === undefined || score === null ? '--' : score),
+        description: '共 ' + (item.occurrence_count ?? duplicateEvidenceRows.length) + ' 条重复证据，匹配得分 ' + (score === undefined || score === null ? '--' : score) + (item.short_summary ? '；' + item.short_summary : ''),
         metrics: {
           '完全重复块': item.metrics && item.metrics.exact_block_count,
           '相似块': item.metrics && item.metrics.similar_block_count,
@@ -1241,7 +1354,8 @@ function collectDuplicateAlerts(results, allAlerts) {
           '相似表格': item.metrics && item.metrics.similar_table_count,
           '重复字数': item.duplicate_text_length || item.metrics && item.metrics.duplicate_text_length,
           '上报规则': formatDuplicateReportReason(item.duplicate_report_reason),
-          '错别字': item.typo_check?.status === 'incomplete' ? '检查未完成，请重试' : arrayify(item.short_duplicate_typo_issues).length || '',
+          '确认错别字': item.typo_check?.status === 'incomplete' ? '检查未完成，请重试' : (item.typo_check?.confirmed_count ?? (arrayify(item.short_duplicate_typo_issues).length || '')),
+          '待复核候选': item.typo_check?.review_candidate_count ?? (arrayify(item.typo_review_candidates).length || ''),
         },
         evidence: {
           cluster: item,
@@ -1249,6 +1363,7 @@ function collectDuplicateAlerts(results, allAlerts) {
           duplicateBlocks: duplicateBlocks,
           similarBlocks: similarBlocks,
           shortDuplicateTypoIssues: item.short_duplicate_typo_issues,
+          typoReviewCandidates: item.typo_review_candidates,
         },
         documents: docs,
         page: docs[0] && docs[0].startPage,
@@ -1468,6 +1583,24 @@ function getFormatIssueSnippet(issue, reviewSummary) {
     issue && issue.message,
     reviewSummary,
   )
+}
+
+function getConsistencyDifferenceItems(issue) {
+  return arrayify(issue && issue.evidence && issue.evidence.difference_items)
+}
+
+function getConsistencyUnclearReasons(issue) {
+  return arrayify(issue && issue.evidence && issue.evidence.unclear_reasons)
+}
+
+function getConsistencyDifferenceLabel(item) {
+  var labels = { replace: '替换', insert: '新增', delete: '删除', move: '移位' }
+  var templateRange = item && item.template_range
+  var bidRange = item && item.bid_range
+  var ranges = []
+  if (templateRange) ranges.push('模板[' + templateRange.start + ',' + templateRange.end + ')')
+  if (bidRange) ranges.push('投标[' + bidRange.start + ',' + bidRange.end + ')')
+  return (labels[item && item.type] || '差异') + (ranges.length ? ' · ' + ranges.join(' / ') : '')
 }
 
 function collectPersonnelNamesFromCheck(check, groupValue) {
@@ -3263,6 +3396,49 @@ function enrichDeviationIssue(issue) {
   return Object.assign({}, issue, { message: prefix + message })
 }
 
+var REMOVED_BUSINESS_SCOPE_ISSUE_TITLE = '商务材料组成范围待确认'
+
+function isRemovedBusinessScopeIssue(issue) {
+  return Boolean(issue) && String(issue.title || '').trim() === REMOVED_BUSINESS_SCOPE_ISSUE_TITLE
+}
+
+function businessReviewIssueTitleKey(issue) {
+  return String((issue && issue.title) || '')
+    .replace(/[（(](?:本项目|不项目|本项日)?(?:为)?不适用[）)]/g, '')
+    .replace(/[\s：:；;，,。()（）【】[\]]+/g, '')
+}
+
+function isOptionalBusinessReviewIssue(issue) {
+  if (!issue) return false
+  var evidence = issue.evidence && typeof issue.evidence === 'object' ? issue.evidence : {}
+  var requirements = evidence.requirements && typeof evidence.requirements === 'object'
+    ? evidence.requirements
+    : {}
+  var skipReason = evidence.skip_reason && typeof evidence.skip_reason === 'object'
+    ? evidence.skip_reason
+    : {}
+  if (evidence.optionality_conflict || requirements.optionality_conflict) return false
+  if (evidence.is_optional || requirements.is_optional) return true
+  var applicability = String(
+    evidence.applicability_status || requirements.applicability_status || '',
+  ).toLowerCase()
+  if (['optional', 'not_applicable'].includes(applicability)) return true
+  if (String(skipReason.type || '') === 'optional_attachment_not_provided') return true
+  var searchable = [issue.title, issue.message, issue.description, issue.reason]
+    .filter(Boolean)
+    .join('\n')
+  return /招标文件将.{0,30}列为可选/.test(searchable) ||
+    /(?:本项目|不项目|本项日)\s*(?:为)?\s*不适用/.test(searchable)
+}
+
+function cleanBusinessIntegritySummary(checkKey, value) {
+  var text = String(value || '').trim()
+  if (checkKey !== 'integrity_check' || !text) return text
+  return text
+    .replace(/\s*商务材料组成范围待确认[。.]?/g, '')
+    .trim()
+}
+
 function collectFormatReviewAlerts(results, allAlerts, options) {
   var opts = options || {}
   var sourceResultKey = opts.resultKey || FORMAT_REVIEW_RESULT_KEY
@@ -3282,14 +3458,62 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
       bidder.documents
     )
 
+    var optionalTitleKeys = new Set()
+    Object.values(bidder.checks || {}).forEach(function (check) {
+      Object.values((check && check.issues) || {}).forEach(function (issues) {
+        arrayify(issues).forEach(function (issue) {
+          if (isOptionalBusinessReviewIssue(issue)) {
+            var key = businessReviewIssueTitleKey(issue)
+            if (key) optionalTitleKeys.add(key)
+          }
+        })
+      })
+    })
+    function isExcludedScopeIssue(issue) {
+      var key = businessReviewIssueTitleKey(issue)
+      return isRemovedBusinessScopeIssue(issue) ||
+        isOptionalBusinessReviewIssue(issue) ||
+        Boolean(key && Array.from(optionalTitleKeys).some(function (optionalKey) {
+          return key === optionalKey ||
+            (Math.min(key.length, optionalKey.length) >= 4 &&
+              (key.includes(optionalKey) || optionalKey.includes(key)))
+        }))
+    }
+
     Object.entries(bidder.checks || {}).forEach(function (entry) {
       var checkKey = entry[0]
       var check = entry[1] || {}
-      var failedIssues = arrayify(check.issues && check.issues.failed)
-      var missingIssues = arrayify(check.issues && check.issues.missing)
-      var unclearIssues = arrayify(check.issues && check.issues.unclear)
-      var bonusIssues = arrayify(check.issues && check.issues.bonus)
-      var passedIssues = arrayify(check.issues && check.issues.passed)
+      var optionalCheckExcluded = checkKey === 'itemized_pricing_check' &&
+        Array.from(optionalTitleKeys).some(function (key) { return key.includes('分项报价表') })
+      function isExcludedCheckIssue(issue) {
+        return optionalCheckExcluded || isExcludedScopeIssue(issue)
+      }
+      var reviewSummary = cleanBusinessIntegritySummary(checkKey, check.review && check.review.summary)
+      var rawFailedIssues = arrayify(check.issues && check.issues.failed)
+      var rawMissingIssues = arrayify(check.issues && check.issues.missing)
+      var sourceUnclearIssues = arrayify(check.issues && check.issues.unclear)
+      var removedScopeIssue = sourceUnclearIssues.some(isRemovedBusinessScopeIssue)
+      var excludedScopeIssue = rawFailedIssues
+        .concat(rawMissingIssues, sourceUnclearIssues)
+        .concat(arrayify(check.issues && check.issues.bonus))
+        .concat(arrayify(check.issues && check.issues.passed))
+        .concat(arrayify(check.issues && check.issues.not_applicable))
+        .some(isExcludedCheckIssue) || optionalCheckExcluded
+      var failedIssues = rawFailedIssues.filter(function (issue) {
+        return !isExcludedCheckIssue(issue)
+      })
+      var missingIssues = rawMissingIssues.filter(function (issue) {
+        return !isExcludedCheckIssue(issue)
+      })
+      var unclearIssues = sourceUnclearIssues.filter(function (issue) {
+        return !isExcludedCheckIssue(issue)
+      })
+      var bonusIssues = arrayify(check.issues && check.issues.bonus).filter(function (issue) {
+        return !isExcludedCheckIssue(issue)
+      })
+      var passedIssues = arrayify(check.issues && check.issues.passed).filter(function (issue) {
+        return !isExcludedCheckIssue(issue)
+      })
       var warningIssues = failedIssues.concat(missingIssues, unclearIssues, bonusIssues)
       if (checkKey === 'deviation_check') {
         // 偏离检查：失败/缺失/加分项标注 ★/△ 与语义判定；
@@ -3325,12 +3549,12 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
       }))
       var reviewStatus = check.review && check.review.status
 
-      if (issueEntries.length === 0 && normalizeRiskLevel(reviewStatus) !== 'none') {
+      if (issueEntries.length === 0 && !removedScopeIssue && !excludedScopeIssue && normalizeRiskLevel(reviewStatus) !== 'none') {
         issueEntries = [{
           issue: {
             title: check.check_name || FORMAT_CHECK_LABELS[checkKey] || checkKey,
             status: reviewStatus,
-            message: check.review && check.review.summary,
+            message: reviewSummary,
             evidence: check.raw_result && check.raw_result.summary,
             severity: reviewStatus === 'fail' ? 'error' : 'warning',
           },
@@ -3353,7 +3577,7 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
         var page = extractFirstPage(issue) ||
           extractFirstPage(issue.evidence) ||
           extractFirstPage(check.raw_result) ||
-          extractPageFromText(issue.message || (check.review && check.review.summary))
+          extractPageFromText(issue.message || reviewSummary)
         var sourceDocs = arrayify(check.source_context && check.source_context.source_documents)
         if (sourceDocs.length === 0) sourceDocs = documentCandidatesFromValue(bidder.documents)
         if (!sourceDocs.some(isBusinessBidDoc)) {
@@ -3521,7 +3745,7 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
         var alertTitle = checkKey === 'pricing_check' && issue.title === '报价合理性'
           ? '报价合理性（直接报价大小写一致、是否超过最高限价）'
           : checkLabel + '：' + (issue.title || (isPassedItem ? '已符合要求' : '待确定'))
-        var alertDescription = issue.message || (check.review && check.review.summary) || (isPassedItem ? '系统审查通过，关键内容已匹配' : '发现需复核项')
+        var alertDescription = issue.message || reviewSummary || (isPassedItem ? '系统审查通过，关键内容已匹配' : '发现需复核项')
 
         alertDescription = getFormatIssueMessage(checkKey, issue, alertDescription)
         if (isVerificationMissingAttachment) {
@@ -3553,7 +3777,7 @@ function collectFormatReviewAlerts(results, allAlerts, options) {
           },
           evidence: {
             issue: issue,
-            reviewSummary: check.review && check.review.summary,
+            reviewSummary: reviewSummary,
             documents: isDeviationTableMissing ? [] : sourceDocs,
             templateMissingAnchors: checkKey === 'consistency_check' ? getFormatMissingAnchors(issue) : undefined,
             tenderHighlightLocations: getFormatTenderHighlightLocations(issue, checkKey),
@@ -4353,23 +4577,53 @@ function getReviewItemIndexLabel(alert) {
 }
 
 function isPassReviewResult(alert) {
-  return isPassedReviewItem(alert) || normalizeRiskLevel(alert && alert.riskLevel) === 'none'
+  return getMachineReviewResultStatus(alert) === 'pass'
+}
+
+function getMachineReviewResultStatus(alert) {
+  var issue = alert && alert.evidence && alert.evidence.issue
+  var raw = String(
+    (alert && alert.sourceStatus) ||
+    (issue && issue.status) ||
+    (alert && alert.sourceItem && alert.sourceItem.status) || ''
+  ).trim().toLowerCase()
+  if (['pass', 'passed', 'success', 'ok'].includes(raw)) return 'pass'
+  if (['fail', 'failed', 'missing', 'error'].includes(raw)) return 'fail'
+  if (['unclear', 'pending', 'ambiguous'].includes(raw)) return 'unclear'
+  if (['not_applicable', 'skipped', 'optional'].includes(raw)) return 'not_applicable'
+  if (isPassedReviewItem(alert) || normalizeRiskLevel(alert && alert.riskLevel) === 'none') return 'pass'
+  return 'fail'
 }
 
 function getReviewResultLabel(alert) {
-  return isPassReviewResult(alert) ? '通过' : '不通过'
+  var status = getMachineReviewResultStatus(alert)
+  var consistency = alert && alert.subType === 'consistency_check'
+  if (status === 'pass') return consistency ? '一致' : '通过'
+  return consistency ? '不一致' : '不通过'
 }
 
 function getReviewResultClass(alert) {
   return isPassReviewResult(alert) ? 'result-pass' : 'result-fail'
 }
 
+function getReviewResultAnalysisNote(alert) {
+  var status = getMachineReviewResultStatus(alert)
+  if (status === 'unclear') return '需人工复核：当前证据不足或存在歧义。'
+  var issue = alert && alert.evidence && alert.evidence.issue
+  var raw = String(
+    (alert && alert.sourceStatus) ||
+    (issue && issue.status) ||
+    (alert && alert.sourceItem && alert.sourceItem.status) || ''
+  ).trim().toLowerCase()
+  if (['not_applicable', 'skipped', 'optional'].includes(raw)) return '该项不适用：本次检查不适用于当前材料。'
+  return ''
+}
+
 function getReviewResultFilterCounts(alerts) {
   var counts = { all: 0, pass: 0, fail: 0 }
   arrayify(alerts).forEach(function (alert) {
     counts.all += 1
-    if (isPassReviewResult(alert)) counts.pass += 1
-    else counts.fail += 1
+    counts[isPassReviewResult(alert) ? 'pass' : 'fail'] += 1
   })
   return counts
 }
@@ -4379,7 +4633,7 @@ function filterReviewAlertsByResult(alerts, filterValue) {
   if (mode === 'pass') {
     return arrayify(alerts).filter(function (alert) { return isPassReviewResult(alert) })
   }
-  if (mode === 'fail') {
+  if (mode === 'fail' || mode === 'unclear' || mode === 'not_applicable') {
     return arrayify(alerts).filter(function (alert) { return !isPassReviewResult(alert) })
   }
   return arrayify(alerts)
@@ -4626,7 +4880,17 @@ export default function ReviewPage() {
   var [loadedProjectId, setLoadedProjectId] = useState('')
   var [loadError, setLoadError] = useState(false)
   var [resultsStale, setResultsStale] = useState(false)
+  var [reviewSummary, setReviewSummary] = useState(null)
+  var [resultVersion, setResultVersion] = useState('')
+  var [compatibilityMode, setCompatibilityMode] = useState(false)
+  var [categoryLoading, setCategoryLoading] = useState({})
+  var [categoryErrors, setCategoryErrors] = useState({})
+  var [categoryPages, setCategoryPages] = useState({})
+  var [loadedCategoryKeys, setLoadedCategoryKeys] = useState(new Set())
   var reviewSessionRef = useRef({ projectId: '', sequence: 0, loaded: false })
+  var categoryRequestRef = useRef(null)
+  var detailRequestRef = useRef(null)
+  var loadedIssueDetailsRef = useRef(new Set())
   var resultsRef = useRef(results)
   var projectDetailRef = useRef(projectDetail)
   var personnelEntryListRef = useRef(null)
@@ -4675,6 +4939,11 @@ export default function ReviewPage() {
   }, [])
 
   var resetReviewState = useCallback(function () {
+    categoryRequestRef.current?.abort()
+    detailRequestRef.current?.abort()
+    categoryRequestRef.current = null
+    detailRequestRef.current = null
+    loadedIssueDetailsRef.current = new Set()
     setOverviewMode('all')
     setOverviewReturn(null)
     restoreOverviewScroll.current = null
@@ -4725,6 +4994,13 @@ export default function ReviewPage() {
     resetReviewState()
     setLoadError(false)
     setResultsStale(false)
+    setReviewSummary(null)
+    setResultVersion('')
+    setCompatibilityMode(false)
+    setCategoryLoading({})
+    setCategoryErrors({})
+    setCategoryPages({})
+    setLoadedCategoryKeys(new Set())
     // 加载是否仍然“当前有效”（避免陈旧/重复加载在用户已操作后回写、把选择重置回去）
     var active = function () { return reviewSessionRef.current === session && (!isActive || isActive()) }
     if (!projectId) {
@@ -4741,60 +5017,43 @@ export default function ReviewPage() {
     }
 
     setIsLoading(true)
-    setFormatManualLoading(true)
-    Promise.all([
-      getProjectResults(projectId),
-      getProjectDetail(projectId).catch(function () { return null }),
-      getBusinessBidFormatReviewEditable(projectId).catch(function () { return null }),
-    ]).then(function (responses) {
+    var summaryController = new AbortController()
+    session.summaryController = summaryController
+    getProjectDetail(projectId).then(function (loadedProjectDetail) {
+      if (!active()) return
+      projectDetailRef.current = loadedProjectDetail
+      setProjectDetail(loadedProjectDetail)
+    }).catch(function () {
+      // 项目基础信息独立失败，不阻塞摘要；页面仍可单独重试结果。
+    })
+    getProjectReviewSummary(projectId, { signal: summaryController.signal }).then(function (data) {
       if (!active()) return // 已切走/重复加载：丢弃陈旧结果，不回写、不重置选择
-      var data = responses[0]
-      var loadedProjectDetail = responses[1]
-      var editablePayload = responses[2]
-      var projectResults = normalizeProjectResultsPayload(data)
-      var stale = Boolean(data && (data.results_stale || data.result_record_meta && data.result_record_meta.results_stale))
+      var stale = Boolean(data && data.results_stale)
       setResultsStale(stale)
       session.loaded = !stale
       setLoadedProjectId(projectId)
-      resultsRef.current = projectResults
-      projectDetailRef.current = loadedProjectDetail
-      setResults(projectResults)
-      setProjectDetail(loadedProjectDetail)
-      var alerts = enrichAlertsWithProjectFiles(collectAllAlerts(projectResults), loadedProjectDetail)
-      var draftDocs = getPersonnelDraftDocuments(projectResults.personnel_reuse_check, loadedProjectDetail)
-      var draftCompanyGroups = getPersonnelDraftCompanyGroups(draftDocs)
-      var firstDraftCompany = draftCompanyGroups[0] || null
-      var firstDraftDoc = getDefaultPersonnelCompanyDocument(firstDraftCompany) || draftDocs[0] || null
-      var editableItems = arrayify(editablePayload && editablePayload.items)
-      var manualDrafts = {}
-      editableItems.forEach(function (item) {
-        if (item.has_manual_value) {
-          manualDrafts[item.editable_id] = stringifyManualReviewValue(item.manual_value)
-        }
-      })
-      setAllAlerts(alerts)
-      setFormatEditableItems(editableItems)
-      setFormatManualDrafts(manualDrafts)
-      setPersonnelDraftDocuments(draftDocs)
-      setPersonnelActiveBidderKey(firstDraftCompany && firstDraftCompany.key || '')
-      setPersonnelActiveDocKey(getPersonnelDraftDocKey(firstDraftDoc))
-      setPersonnelActivePage(1)
-      setPersonnelDraftDirty(false)
+      setReviewSummary(data)
+      setResultVersion(String(data && data.result_version || ''))
+      setCompatibilityMode(Boolean(data && data.compatibility_mode))
+      resultsRef.current = {}
+      setResults({})
+      setAllAlerts([])
       setSelectedAlerts(new Set())
       setCurrentServiceType(null)
       setCurrentAlertIndex(0)
-    }).catch(function () {
+    }).catch(function (error) {
       if (!active()) return
-      setProjectDetail(null)
+      if (error && error.status === 499) return
       setFormatEditableItems([])
       setFormatManualDrafts({})
       setFormatManualEditing({})
       setPersonnelDraftDocuments([])
       setPersonnelActiveBidderKey('')
       setPersonnelActiveDocKey('')
-      resetReviewState()
+      setResults(null)
+      setAllAlerts([])
       setLoadError(true)
-      setNotice({ type: 'error', message: '加载项目结果失败' })
+      setNotice({ type: 'error', message: '加载项目摘要失败' })
     }).finally(function () {
       if (!active()) return
       setIsLoading(false)
@@ -4810,7 +5069,11 @@ export default function ReviewPage() {
     var active = true
     loadData(selectedProjectId, function () { return active })
     // 卸载/切项目/StrictMode 重跑时标记失效：陈旧加载完成后不再回写、不重置已选审查项
-    return function () { active = false; reviewSessionRef.current.loaded = false }
+    return function () {
+      active = false
+      reviewSessionRef.current.summaryController?.abort()
+      reviewSessionRef.current.loaded = false
+    }
   }, [selectedProjectId, loadData])
 
   useEffect(function () {
@@ -4860,13 +5123,73 @@ export default function ReviewPage() {
   var checkFilteredAlerts = isFormatDetailService
     ? filterReviewAlertsByCheck(fileFilteredAlerts, detailCheckFilter)
     : fileFilteredAlerts
-  // 结果筛选（全部/通过/不通过）
+  // 结果筛选（全部/通过/不通过；待复核和不适用归入不通过）
   var detailResultCounts = getReviewResultFilterCounts(checkFilteredAlerts)
   var serviceAlerts = filterReviewAlertsByResult(checkFilteredAlerts, detailResultFilter)
   var hasActiveDetailFilter = detailResultFilter !== 'all' || detailFileFilter !== 'all' ||
     detailCheckFilter !== 'all'
+  var activeCategoryPage = categoryPages[currentServiceType] || null
+  var activeCategoryPageNumber = activeCategoryPage
+    ? Math.floor(activeCategoryPage.offset / Math.max(1, activeCategoryPage.limit)) + 1
+    : 1
+  var activeCategoryPageCount = activeCategoryPage
+    ? Math.max(1, Math.ceil(activeCategoryPage.total / Math.max(1, activeCategoryPage.limit)))
+    : 1
 
   var currentAlert = serviceAlerts[currentAlertIndex] || null
+  useEffect(function () {
+    var issueId = currentAlert && currentAlert.reviewIssueId
+    if (!issueId || compatibilityMode || !resultVersion || !selectedProjectId) return undefined
+    if (!/_duplicate_check$/.test(String(currentAlert.sourceResultKey || ''))) return undefined
+    var detailKey = selectedProjectId + ':' + resultVersion + ':' + issueId
+    if (loadedIssueDetailsRef.current.has(detailKey)) return undefined
+
+    detailRequestRef.current?.abort()
+    var controller = new AbortController()
+    detailRequestRef.current = controller
+    var operation = reviewSessionRef.current
+    Promise.all([
+      getProjectReviewIssue(selectedProjectId, issueId, resultVersion, { signal: controller.signal }),
+      getProjectReviewIssueEvidence(selectedProjectId, issueId, resultVersion, {
+        limit: 100,
+        offset: 0,
+        signal: controller.signal,
+      }),
+    ]).then(function (payloads) {
+      if (controller.signal.aborted || reviewSessionRef.current !== operation) return
+      var detail = payloads[0] && payloads[0].data || {}
+      var evidence = payloads[1] && payloads[1].data || {}
+      var fullIssue = Object.assign({}, currentAlert.sourceItem || {}, detail, {
+        occurrences: arrayify(evidence.occurrences),
+        _review_issue_id: issueId,
+      })
+      var sourceKey = currentAlert.sourceResultKey
+      var oneResult = Object.assign({}, resultsRef.current && resultsRef.current[sourceKey] || {}, {
+        issues: [fullIssue],
+      })
+      var rebuilt = collectAllAlerts({ [sourceKey]: oneResult }).find(function (alert) {
+        return String(alert.reviewIssueId || '') === String(issueId)
+      })
+      if (!rebuilt) return
+      setAllAlerts(function (current) {
+        return current.map(function (alert) {
+          return String(alert.reviewIssueId || '') === String(issueId)
+            ? enrichAlertsWithProjectFiles([rebuilt], projectDetailRef.current)[0]
+            : alert
+        })
+      })
+      loadedIssueDetailsRef.current.add(detailKey)
+    }).catch(function (error) {
+      if (controller.signal.aborted || error && error.status === 499) return
+      if (error && error.status === 409) {
+        setNotice({ type: 'error', message: '审查结果已更新，正在重新加载摘要。' })
+        loadData(selectedProjectId)
+      } else {
+        setNotice({ type: 'error', message: '证据加载失败: ' + (error.message || '未知错误') })
+      }
+    })
+    return function () { controller.abort() }
+  }, [currentAlert, compatibilityMode, resultVersion, selectedProjectId, loadData])
   var personnelCompanyGroups = getPersonnelDraftCompanyGroups(personnelDraftDocuments)
   var personnelActiveCompany = personnelCompanyGroups.find(function (group) {
     return String(group.key || '') === String(personnelActiveBidderKey || '')
@@ -5033,10 +5356,135 @@ export default function ReviewPage() {
     }
   }, [personnelDraftDirty, personnelDraftDocuments, selectedProjectId])
 
+  function applyEditablePayload(editablePayload) {
+    var editableItems = arrayify(editablePayload && editablePayload.items)
+    var manualDrafts = {}
+    editableItems.forEach(function (item) {
+      if (item.has_manual_value) manualDrafts[item.editable_id] = stringifyManualReviewValue(item.manual_value)
+    })
+    setFormatEditableItems(editableItems)
+    setFormatManualDrafts(manualDrafts)
+  }
+
+  function applyLoadedCategory(key, component, pagePayload) {
+    var categoryResult = component || {}
+    if (pagePayload) {
+      categoryResult = Object.assign({}, categoryResult, {
+        issues: arrayify(pagePayload.items).map(function (row) {
+          return Object.assign({}, row.list_payload || {}, {
+            _review_issue_id: row.issue_id,
+            issue_id: (row.list_payload && row.list_payload.issue_id) || row.issue_id,
+            status: (row.list_payload && row.list_payload.status) || row.status,
+          })
+        }),
+      })
+      setCategoryPages(function (current) {
+        return Object.assign({}, current, {
+          [key]: {
+            total: Number(pagePayload.total || 0),
+            limit: Number(pagePayload.limit || 20),
+            offset: Number(pagePayload.offset || 0),
+          },
+        })
+      })
+    }
+    var nextResults = Object.assign({}, resultsRef.current || {}, { [key]: categoryResult })
+    resultsRef.current = nextResults
+    setResults(nextResults)
+    setAllAlerts(enrichAlertsWithProjectFiles(collectAllAlerts(nextResults), projectDetailRef.current))
+    setLoadedCategoryKeys(function (current) {
+      var next = new Set(current)
+      next.add(key)
+      return next
+    })
+
+    if (key === 'personnel_reuse_check') {
+      var draftDocs = getPersonnelDraftDocuments(categoryResult, projectDetailRef.current)
+      var draftCompanyGroups = getPersonnelDraftCompanyGroups(draftDocs)
+      var firstDraftCompany = draftCompanyGroups[0] || null
+      var firstDraftDoc = getDefaultPersonnelCompanyDocument(firstDraftCompany) || draftDocs[0] || null
+      setPersonnelDraftDocuments(draftDocs)
+      setPersonnelActiveBidderKey(firstDraftCompany && firstDraftCompany.key || '')
+      setPersonnelActiveDocKey(getPersonnelDraftDocKey(firstDraftDoc))
+      setPersonnelActivePage(1)
+      setPersonnelDraftDirty(false)
+    }
+  }
+
+  async function loadReviewCategory(key, offset) {
+    if (!key || !selectedProjectId || !reviewSessionRef.current.loaded) return
+    var storageKey = key === FORMAT_REVIEW_PASSED_RESULT_KEY ? FORMAT_REVIEW_RESULT_KEY : key
+    var normalizedOffset = Math.max(0, Number(offset || 0))
+    var currentPage = categoryPages[storageKey]
+    if (loadedCategoryKeys.has(storageKey) && (!currentPage || currentPage.offset === normalizedOffset)) return
+
+    categoryRequestRef.current?.abort()
+    var controller = new AbortController()
+    categoryRequestRef.current = controller
+    var operation = reviewSessionRef.current
+    setCategoryLoading(function (current) { return Object.assign({}, current, { [storageKey]: true }) })
+    setCategoryErrors(function (current) { return Object.assign({}, current, { [storageKey]: '' }) })
+    try {
+      if (compatibilityMode) {
+        var legacyData = await getProjectResults(selectedProjectId)
+        if (controller.signal.aborted || reviewSessionRef.current !== operation) return
+        var legacyResults = normalizeProjectResultsPayload(legacyData)
+        resultsRef.current = legacyResults
+        setResults(legacyResults)
+        setAllAlerts(enrichAlertsWithProjectFiles(collectAllAlerts(legacyResults), projectDetailRef.current))
+        var legacyLoadedKeys = new Set(getOverviewResultKeys(legacyResults, []))
+        legacyLoadedKeys.add(storageKey)
+        setLoadedCategoryKeys(legacyLoadedKeys)
+      } else {
+        var componentRequest = getProjectReviewComponent(selectedProjectId, storageKey, resultVersion, {
+          signal: controller.signal,
+        })
+        var pageRequest = /_duplicate_check$/.test(storageKey)
+          ? listProjectReviewIssues(selectedProjectId, {
+              resultVersion: resultVersion,
+              resultKey: storageKey,
+              limit: 20,
+              offset: normalizedOffset,
+              signal: controller.signal,
+            })
+          : Promise.resolve(null)
+        var loaded = await Promise.all([componentRequest, pageRequest])
+        if (controller.signal.aborted || reviewSessionRef.current !== operation) return
+        applyLoadedCategory(storageKey, loaded[0] && loaded[0].result, loaded[1])
+      }
+      if (storageKey === FORMAT_REVIEW_RESULT_KEY) {
+        setFormatManualLoading(true)
+        getBusinessBidFormatReviewEditable(selectedProjectId).then(function (payload) {
+          if (!controller.signal.aborted && reviewSessionRef.current === operation) applyEditablePayload(payload)
+        }).catch(function () {
+          if (!controller.signal.aborted) setNotice({ type: 'error', message: '人工编辑数据加载失败，可稍后重试。' })
+        }).finally(function () {
+          if (!controller.signal.aborted) setFormatManualLoading(false)
+        })
+      }
+    } catch (error) {
+      if (controller.signal.aborted || error && error.status === 499) return
+      if (error && error.status === 409) {
+        setNotice({ type: 'error', message: '审查结果已更新，正在重新加载摘要。' })
+        loadData(selectedProjectId)
+        return
+      }
+      setCategoryErrors(function (current) {
+        return Object.assign({}, current, { [storageKey]: error.message || '加载失败' })
+      })
+      setNotice({ type: 'error', message: '加载该分类失败: ' + (error.message || '未知错误') })
+    } finally {
+      if (!controller.signal.aborted && reviewSessionRef.current === operation) {
+        setCategoryLoading(function (current) { return Object.assign({}, current, { [storageKey]: false }) })
+      }
+    }
+  }
+
   function selectServiceType(key) {
     setOverviewReturn(null)
     setOverviewMode('all')
     setCurrentServiceType(key)
+    if (key) loadReviewCategory(key, 0)
     setCurrentAlertIndex(0)
     setDetailResultFilter('all')
     setDetailFileFilter('all')
@@ -5366,19 +5814,44 @@ export default function ReviewPage() {
     })
   }
 
-  // Select/deselect all alerts in current service type
-  function toggleSelectAllCurrent() {
+  async function getCurrentFilteredIssueIds() {
+    if (compatibilityMode || !resultVersion) return selectAllTargetAlerts.map(function (alert) { return alert.id })
+    var storageKey = currentServiceType === FORMAT_REVIEW_PASSED_RESULT_KEY
+      ? FORMAT_REVIEW_RESULT_KEY
+      : currentServiceType
+    var activeFileGroup = detailFileGroups.find(function (group) { return group.key === detailFileFilter })
+    var canonicalStatus = detailResultFilter === 'pass' ? 'pass'
+      : ['fail', 'unclear', 'not_applicable'].includes(detailResultFilter) ? 'not_pass'
+        : undefined
+    if (!isFormatReviewResultType(storageKey) && canonicalStatus === 'pass') canonicalStatus = 'passed'
+    var payload = await getProjectReviewIssueIds(selectedProjectId, {
+      resultVersion: resultVersion,
+      resultKey: storageKey,
+      status: currentServiceType === FORMAT_REVIEW_PASSED_RESULT_KEY
+        ? 'pass'
+        : canonicalStatus,
+      checkCode: detailCheckFilter === 'all' ? undefined : detailCheckFilter,
+      fileName: detailFileFilter === 'all' ? undefined : activeFileGroup && activeFileGroup.label,
+    })
+    return arrayify(payload && payload.items).map(function (item) { return item.issue_id }).filter(Boolean)
+  }
+
+  // Select/deselect every issue matching the current server-side filter, including unvisited pages.
+  async function toggleSelectAllCurrent() {
     if (!currentServiceType) return
     var targetAlerts = selectAllTargetAlerts
-    var allSelected = targetAlerts.length > 0 && targetAlerts.every(function (a) { return selectedAlerts.has(a.id) })
+    var issueIds
+    try {
+      issueIds = await getCurrentFilteredIssueIds()
+    } catch (error) {
+      setNotice({ type: 'error', message: '获取批量范围失败: ' + (error.message || '未知错误') })
+      return
+    }
+    var allSelected = issueIds.length > 0 && issueIds.every(function (id) { return selectedAlerts.has(id) })
     setSelectedAlerts(function (prev) {
-      if (allSelected) {
-        var deselected = new Set(prev)
-        targetAlerts.forEach(function (a) { deselected.delete(a.id) })
-        return deselected
-      }
       var selected = new Set(prev)
-      targetAlerts.forEach(function (a) { selected.add(a.id) })
+      issueIds.forEach(function (id) { if (allSelected) selected.delete(id); else selected.add(id) })
+      targetAlerts.forEach(function (alert) { if (allSelected) selected.delete(alert.id); else selected.add(alert.id) })
       return selected
     })
     setReviewStatus(function (current) {
@@ -5390,20 +5863,34 @@ export default function ReviewPage() {
           reviewedAt: new Date().toISOString(),
         }
       })
+      issueIds.forEach(function (issueId) {
+        statusMap[issueId] = { status: allSelected ? 'passed' : 'flagged', reviewedAt: new Date().toISOString() }
+      })
       return statusMap
     })
   }
 
-  function batchPassAll() {
+  async function batchPassAll() {
+    var issueIds
+    try {
+      issueIds = await getCurrentFilteredIssueIds()
+    } catch (error) {
+      setNotice({ type: 'error', message: '获取批量范围失败: ' + (error.message || '未知错误') })
+      return
+    }
     var newStatus = {}
     for (var key in reviewStatus) { newStatus[key] = reviewStatus[key] }
     serviceAlerts.forEach(function (alert) {
       newStatus[alert.id] = { status: 'passed', reviewedAt: new Date().toISOString() }
     })
+    issueIds.forEach(function (issueId) {
+      newStatus[issueId] = { status: 'passed', reviewedAt: new Date().toISOString() }
+    })
     setReviewStatus(newStatus)
     setSelectedAlerts(function (prev) {
       var next = new Set(prev)
       serviceAlerts.forEach(function (alert) { next.delete(alert.id) })
+      issueIds.forEach(function (issueId) { next.delete(issueId) })
       return next
     })
   }
@@ -5502,6 +5989,7 @@ export default function ReviewPage() {
       refreshPersonnelResult(result)
       setPersonnelDraftDirty(false)
       setNotice({ type: 'success', message: '人员名单已确认，重名检查已完成。' })
+      loadData(selectedProjectId)
     } catch (error) {
       if (reviewSessionRef.current !== operation) return
       setNotice({ type: 'error', message: '人员确认失败: ' + (error.message || '未知错误') })
@@ -5700,12 +6188,7 @@ export default function ReviewPage() {
       applyFormatEditablePayload(payload)
       setFormatManualEditing({})
       if (options && options.rerun && payload && payload.review) {
-        var nextResults = Object.assign({}, results, {
-          business_bid_format_review: payload.review,
-        })
-        setResults(nextResults)
-        setAllAlerts(enrichAlertsWithProjectFiles(collectAllAlerts(nextResults), projectDetail))
-        setCurrentAlertIndex(0)
+        loadData(selectedProjectId)
       }
       setNotice({
         type: 'success',
@@ -5758,13 +6241,9 @@ export default function ReviewPage() {
         ],
       })
       if (reviewSessionRef.current !== operation) return
-      var data = await getProjectResults(selectedProjectId, { forceRefresh: true })
-      if (reviewSessionRef.current !== operation) return
-      var nextResults = normalizeProjectResultsPayload(data)
-      setResults(nextResults)
-      setAllAlerts(enrichAlertsWithProjectFiles(collectAllAlerts(nextResults), projectDetail))
+      loadData(selectedProjectId)
       setNotice({ type: 'success', message: '星标响应修正已保存。' })
-      return nextResults
+      return true
     } catch (error) {
       if (reviewSessionRef.current !== operation) return
       setNotice({ type: 'error', message: '星标响应修正保存失败: ' + (error.message || '未知错误') })
@@ -5882,10 +6361,21 @@ export default function ReviewPage() {
 
     setExportLoading(true)
     try {
-      var payload = buildFilteredResultJson(allAlerts, selectedAlerts, overviewResultKeys, reviewStatus)
+      var payload
+      if (!compatibilityMode && resultVersion) {
+        var indexedStatuses = {}
+        Object.keys(reviewStatus).forEach(function (key) { indexedStatuses[key] = reviewStatus[key] })
+        allAlerts.forEach(function (alert) {
+          if (alert.reviewIssueId && reviewStatus[alert.id]) indexedStatuses[alert.reviewIssueId] = reviewStatus[alert.id]
+        })
+        payload = await exportProjectReview(selectedProjectId, resultVersion, 'json', indexedStatuses)
+      } else {
+        payload = buildFilteredResultJson(allAlerts, selectedAlerts, overviewResultKeys, reviewStatus)
+      }
+      if (reviewSessionRef.current !== operation) return
       downloadJsonFile('review-result-' + selectedProjectId + '.json', payload)
 
-      setNotice({ type: 'success', message: '过滤后的结果已导出' })
+      setNotice({ type: 'success', message: '完整结果已导出' })
       setShowExport(false)
     } catch (e) {
       if (reviewSessionRef.current !== operation) return
@@ -5906,8 +6396,18 @@ export default function ReviewPage() {
 
     setExportLoading(true)
     try {
-      var payload = buildFilteredResultJson(allAlerts, selectedAlerts, overviewResultKeys, reviewStatus)
-      var response = await exportWordReport(payload)
+      var response
+      if (!compatibilityMode && resultVersion) {
+        var indexedStatuses = {}
+        Object.keys(reviewStatus).forEach(function (key) { indexedStatuses[key] = reviewStatus[key] })
+        allAlerts.forEach(function (alert) {
+          if (alert.reviewIssueId && reviewStatus[alert.id]) indexedStatuses[alert.reviewIssueId] = reviewStatus[alert.id]
+        })
+        response = await exportProjectReview(selectedProjectId, resultVersion, 'word', indexedStatuses)
+      } else {
+        var payload = buildFilteredResultJson(allAlerts, selectedAlerts, overviewResultKeys, reviewStatus)
+        response = await exportWordReport(payload)
+      }
       if (reviewSessionRef.current !== operation) return
       var reportUrl = await getReportDownloadUrl(response, selectedProjectId)
       if (reviewSessionRef.current !== operation) return
@@ -5931,7 +6431,8 @@ export default function ReviewPage() {
 }
   }
 
-  var canUseResults = loadedProjectId === selectedProjectId && !isLoading && !loadError && !resultsStale
+  var canUseResults = loadedProjectId === selectedProjectId && !isLoading && !loadError && !resultsStale &&
+    (!compatibilityMode || loadedCategoryKeys.size > 0)
   var resultTypeKeys = []
   allAlerts.forEach(function (alert) {
     if (resultTypeKeys.indexOf(alert.resultType) < 0) {
@@ -5939,15 +6440,26 @@ export default function ReviewPage() {
     }
   })
   var resultTypeCounts = {}
-  getOverviewResultKeys(results, resultTypeKeys).forEach(function (key) {
+  var summaryCategories = arrayify(reviewSummary && reviewSummary.categories)
+  var summaryCategoryByKey = {}
+  summaryCategories.forEach(function (category) {
+    if (category && category.result_key) summaryCategoryByKey[category.result_key] = category
+  })
+  var summaryResultKeys = summaryCategories.map(function (category) { return category.result_key }).filter(Boolean)
+  var combinedResultKeys = summaryResultKeys.concat(resultTypeKeys).filter(function (key, index, list) {
+    return list.indexOf(key) === index
+  })
+  getOverviewResultKeys(results, combinedResultKeys).forEach(function (key) {
     resultTypeCounts[key] = getAlertsForResultType(key, allAlerts).length
+    if (summaryCategoryByKey[key]) resultTypeCounts[key] = Number(summaryCategoryByKey[key].issue_count || 0)
   })
 
   var reviewedCount = allAlerts.filter(function (alert) { return reviewStatus[alert.id] }).length
-  var totalCount = allAlerts.length
+  var totalCount = Number(reviewSummary && reviewSummary.issue_count)
+  if (!Number.isFinite(totalCount)) totalCount = allAlerts.length
   var progressPercent = totalCount > 0 ? Math.round((reviewedCount / totalCount) * 100) : 0
 
-  var overviewResultKeys = getOverviewResultKeys(results, resultTypeKeys)
+  var overviewResultKeys = getOverviewResultKeys(results, combinedResultKeys)
   var sidebarKeys = overviewResultKeys
 
   var selectedByType = {}
@@ -5966,15 +6478,27 @@ export default function ReviewPage() {
   var projectFiles = getProjectOverviewFiles(projectDetail)
   var overviewSections = overviewResultKeys.map(function (key) {
     var sectionAlerts = getAlertsForResultType(key, allAlerts)
-    if (overviewMode === 'fail') sectionAlerts = filterReviewAlertsByResult(sectionAlerts, 'fail')
+    if (overviewMode !== 'all') sectionAlerts = filterReviewAlertsByResult(sectionAlerts, overviewMode)
     return {
       key: key,
       label: RESULT_TYPE_LABELS[key] || key,
       color: RESULT_TYPE_COLORS[key] || '#64748b',
       alerts: sortAlertsForResultType(key, sectionAlerts),
+      loaded: loadedCategoryKeys.has(key) || (key === FORMAT_REVIEW_PASSED_RESULT_KEY && loadedCategoryKeys.has(FORMAT_REVIEW_RESULT_KEY)),
+      count: resultTypeCounts[key] === undefined ? sectionAlerts.length : resultTypeCounts[key],
     }
   })
   var overviewReviewCounts = getReviewResultFilterCounts(allAlerts)
+  var summaryStatusCounts = reviewSummary && reviewSummary.status_counts || {}
+  var summaryRiskCounts = reviewSummary && reviewSummary.risk_counts || {}
+  var hasSummaryStatusCounts = ['fail', 'unclear', 'not_applicable', 'skipped', 'optional'].some(function (key) {
+    return Object.prototype.hasOwnProperty.call(summaryStatusCounts, key)
+  })
+  var summaryFailCount = hasSummaryStatusCounts
+    ? Number(summaryStatusCounts.fail || 0) + Number(summaryStatusCounts.unclear || 0) +
+      Number(summaryStatusCounts.not_applicable || 0) + Number(summaryStatusCounts.skipped || 0) +
+      Number(summaryStatusCounts.optional || 0)
+    : Number(summaryRiskCounts.high || 0) + Number(summaryRiskCounts.medium || 0) + Number(summaryRiskCounts.low || 0)
   var overviewCards = [{
     key: 'total',
     label: '全部审核项',
@@ -5983,13 +6507,13 @@ export default function ReviewPage() {
   }, {
     key: 'fail-total',
     label: '不通过项',
-    value: overviewReviewCounts.fail,
+    value: reviewSummary ? summaryFailCount : overviewReviewCounts.fail,
     color: '#dc2626',
   }].concat(overviewSections.map(function (section) {
     return {
       key: section.key,
       label: section.label,
-      value: section.alerts.length,
+      value: section.count,
       color: section.color,
     }
   }))
@@ -6140,7 +6664,7 @@ export default function ReviewPage() {
     var group = fileGroups[activeFileIndex]
     var filterKey = section.key + ':' + group.key
     var showCheckFilter = section.key === FORMAT_REVIEW_RESULT_KEY || section.key === FORMAT_REVIEW_PASSED_RESULT_KEY
-    var activeResultFilter = overviewMode === 'fail' ? 'fail' : (overviewFileResultFilters[filterKey] || 'all')
+    var activeResultFilter = overviewMode !== 'all' ? overviewMode : (overviewFileResultFilters[filterKey] || 'all')
     var activeCheckFilter = showCheckFilter ? (overviewFileCheckFilters[filterKey] || 'all') : 'all'
     var checkCounts = getReviewCheckFilterCounts(group.alerts)
     var checkFilteredAlerts = filterReviewAlertsByCheck(group.alerts, activeCheckFilter)
@@ -6780,6 +7304,10 @@ export default function ReviewPage() {
               <div className="panel"><p>加载项目结果失败</p><button type="button" onClick={function () { loadData(selectedProjectId) }}>重试加载结果</button></div>
             ) : resultsStale ? (
               <div className="panel"><p>材料已变更，旧结果已过期，请到分析中心重新检查。</p></div>
+            ) : reviewSummary && reviewSummary.status === 'unavailable' ? (
+              <div className="panel"><p>当前项目尚未生成分析结果，请先到分析中心执行检查。</p></div>
+            ) : reviewSummary && reviewSummary.status === 'failed' ? (
+              <div className="panel"><p>项目分析失败，当前没有可供审核的有效结果。</p></div>
             ) : !currentServiceType ? (
               results ? (
                 <div className="overview-container">
@@ -6840,10 +7368,14 @@ export default function ReviewPage() {
                         <section className="panel overview-issue-section" key={section.key}>
                           <div className="overview-section-head">
                             <h3>{section.label}</h3>
-                            <span>{section.alerts.length} 项</span>
+                            <span>{section.count} 项</span>
                           </div>
 
-                          {isFormatReviewResultType(section.key) ? (
+                          {!section.loaded ? (
+                            <div className="overview-table-wrap">
+                              <EmptyBlock title="点击该分类后加载问题列表" />
+                            </div>
+                          ) : isFormatReviewResultType(section.key) ? (
                             <div className="overview-format-groups">
                               {renderFormatOverviewFileGroups(section)}
                             </div>
@@ -6927,6 +7459,13 @@ export default function ReviewPage() {
               ) : (
                 <EmptyBlock title="暂无分析结果" />
               )
+            ) : categoryLoading[currentServiceType === FORMAT_REVIEW_PASSED_RESULT_KEY ? FORMAT_REVIEW_RESULT_KEY : currentServiceType] ? (
+              <EmptyBlock title="正在加载该分类..." />
+            ) : categoryErrors[currentServiceType === FORMAT_REVIEW_PASSED_RESULT_KEY ? FORMAT_REVIEW_RESULT_KEY : currentServiceType] ? (
+              <div className="panel">
+                <p>该分类加载失败：{categoryErrors[currentServiceType === FORMAT_REVIEW_PASSED_RESULT_KEY ? FORMAT_REVIEW_RESULT_KEY : currentServiceType]}</p>
+                <button type="button" onClick={function () { loadReviewCategory(currentServiceType, 0) }}>重试</button>
+              </div>
             ) : currentServiceType === 'personnel_reuse_check' && !overviewReturn ? (
               renderPersonnelDraftWorkspace()
             ) : serviceAlerts.length === 0 ? (
@@ -6936,6 +7475,27 @@ export default function ReviewPage() {
               } />
             ) : currentAlert ? (
               <div className="detail-container">
+                {activeCategoryPage && activeCategoryPageCount > 1 ? (
+                  <div className="detail-nav">
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      disabled={activeCategoryPageNumber <= 1}
+                      onClick={function () { loadReviewCategory(currentServiceType, activeCategoryPage.offset - activeCategoryPage.limit) }}
+                    >
+                      ◀ 上一页
+                    </button>
+                    <span>问题列表第 {activeCategoryPageNumber} / {activeCategoryPageCount} 页 · 共 {activeCategoryPage.total} 项</span>
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      disabled={activeCategoryPageNumber >= activeCategoryPageCount}
+                      onClick={function () { loadReviewCategory(currentServiceType, activeCategoryPage.offset + activeCategoryPage.limit) }}
+                    >
+                      下一页 ▶
+                    </button>
+                  </div>
+                ) : null}
                 {/* ── Navigation bar ── */}
                 <div className="detail-nav">
                   <button
@@ -6994,6 +7554,12 @@ export default function ReviewPage() {
                     defaultExpanded: true,
                   })}
                   <IssueSnippet as="p" text={currentAlert.description} />
+
+                  {getReviewResultAnalysisNote(currentAlert) ? (
+                    <p className="review-result-analysis-note">
+                      {getReviewResultAnalysisNote(currentAlert)}
+                    </p>
+                  ) : null}
 
                   {currentAlert.metrics ? (
                     <div className="alert-metrics">
@@ -7289,6 +7855,36 @@ export default function ReviewPage() {
                           as="p"
                           text={getFormatIssueSnippet(currentAlert.evidence.issue, currentAlert.evidence.reviewSummary)}
                         />
+                        {getConsistencyUnclearReasons(currentAlert.evidence.issue).map(function (reason, index) {
+                          return (
+                            <div className="consistency-unclear-reason" key={'consistency-reason-' + index}>
+                              <strong>待核验范围</strong>
+                              <div>{reason.message || '现有文字或位置依据不足'}</div>
+                              {reason.basis ? <small>依据：{reason.basis}</small> : null}
+                              {reason.search_scope && arrayify(reason.search_scope.matched_pages).length ? (
+                                <small>
+                                  已有文字命中页：{arrayify(reason.search_scope.matched_pages).join('、')}；
+                                  当前附件页：{arrayify(reason.search_scope.attachment_pages).join('、') || '未确定'}
+                                </small>
+                              ) : null}
+                              {reason.affected_item_count ? (
+                                <small>影响固定内容项：{reason.affected_item_count}</small>
+                              ) : null}
+                            </div>
+                          )
+                        })}
+                        {getConsistencyDifferenceItems(currentAlert.evidence.issue).slice(0, 20).map(function (item, index) {
+                          return (
+                            <div className="consistency-character-diff" key={'consistency-diff-' + index}>
+                              <strong>{getConsistencyDifferenceLabel(item)}</strong>
+                              <div>模板：{item.template_text || '∅'}</div>
+                              <div>投标：{item.bid_text || '∅'}</div>
+                              <small>
+                                定位精度：模板 {item.template_location_precision || '区块'}；投标 {item.bid_location_precision || '区块'}
+                              </small>
+                            </div>
+                          )
+                        })}
                       </div>
                     ) : null}
 
@@ -7468,7 +8064,7 @@ export default function ReviewPage() {
 
               <div className="export-section">
                 <strong>导出说明</strong>
-                <p>导出全部审查结果；忽略项标为通过（绿色），保留项标为不通过（红色），其余保持原状态。</p>
+                <p>导出全部审查结果；待复核和不适用归入不通过，并在具体分析中注明原始状态。</p>
               </div>
             </div>
 

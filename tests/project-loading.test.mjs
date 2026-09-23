@@ -37,6 +37,24 @@ const detail = (project) => ({ project, relations: [{
   business_bid_identifier_id: 'business', business_bid_file_name: `${project.project_name}-商务.pdf`,
   technical_bid_identifier_id: 'technical', technical_bid_file_name: '技术.pdf',
 }] })
+const reviewSummary = (project, changes = {}) => ({
+  project: {
+    identifier_id: project.identifier_id,
+    project_name: project.project_name,
+    parsing_status: project.parsing_status,
+    input_revision: changes.input_revision ?? 1,
+  },
+  result_version: changes.result_version ?? null,
+  status: changes.status ?? 'legacy',
+  results_stale: changes.results_stale ?? false,
+  compatibility_mode: changes.compatibility_mode ?? true,
+  issue_count: changes.issue_count ?? 2,
+  risk_counts: changes.risk_counts ?? { high: 1, medium: 0, low: 0, none: 1 },
+  categories: changes.categories ?? [
+    { result_key: 'business_bid_format_review', status: 'legacy', issue_count: 2, risk_counts: { high: 1, none: 1 } },
+    { result_key: 'deviation_check', status: 'legacy', issue_count: 0, risk_counts: {} },
+  ],
+})
 const fulfill = (route, data, status = 200) => route.fulfill({ status, json: { code: status, message: status === 200 ? 'success' : '测试加载失败', data } })
 
 for (const succeeds of [true, false]) {
@@ -141,6 +159,7 @@ async function pageWithApi(t, intercept = async () => false, items = projects, s
       const key = 'xtjs-api-cache:' + window.location.origin + '/api/postgresql/projects?page=1&page_size=24'
       sessionStorage.setItem(key, JSON.stringify({ expiresAt: Date.now() + 30000,
         payload: { items: [{ identifier_id: 'old', project_name: '旧版缓存项目', parsing_status: 3 }] } }))
+      sessionStorage.setItem('xtjs-api-cache:legacy-full-result', 'x'.repeat(300 * 1024))
     })
   }
   await page.route('**/health', (route) => fulfill(route, { status: 'healthy' }))
@@ -152,6 +171,9 @@ async function pageWithApi(t, intercept = async () => false, items = projects, s
     if (path === '/api/postgresql/projects') return fulfill(route, { items })
     if (path.endsWith('/ocr-status')) return fulfill(route, {})
     if (path.endsWith('/workflow-state')) return fulfill(route, { excluded_bidders: [] })
+    if (path.endsWith('/business-review/tasks/latest')) return fulfill(route, null)
+    const summaryProject = items.find((item) => path === `/api/postgresql/projects/${item.identifier_id}/review/summary`)
+    if (summaryProject) return fulfill(route, reviewSummary(summaryProject))
     const project = items.find((item) => path === `/api/postgresql/projects/${item.identifier_id}`)
     if (project) return fulfill(route, detail(project))
     return fulfill(route, {}, 404)
@@ -209,6 +231,57 @@ test('详情失败保留列表，重试后恢复文档与操作', async (t) => {
   await page.getByRole('button', { name: '重试加载' }).click()
   await page.locator('.relation-card').waitFor()
   await page.getByRole('button', { name: '重新生成商务审查' }).waitFor()
+})
+
+test('商务审查首次点击后持续锁定，刷新后恢复，仅在终态解锁', async (t) => {
+  let submitCount = 0
+  let taskStatus = 'queued'
+  const task = () => ({
+    task_id: 'business-task-lock-test',
+    project_identifier_id: 'project-1',
+    request_id: 'business-request-lock-test',
+    input_revision: 1,
+    status: taskStatus,
+    stage: taskStatus === 'running' ? 'reviewing' : taskStatus,
+    progress: { completed: taskStatus === 'failed' ? 1 : 0, total: 1, message: '锁定测试' },
+    error: taskStatus === 'failed' ? '测试任务已失败' : null,
+  })
+  const { page } = await pageWithApi(t, async (route, path) => {
+    if (path.endsWith('/business-review/tasks/latest')) {
+      await fulfill(route, submitCount ? task() : null)
+      return true
+    }
+    if (path.endsWith('/business-review/tasks') && route.request().method() === 'POST') {
+      submitCount += 1
+      await fulfill(route, task(), 202)
+      return true
+    }
+    if (path.endsWith('/business-review/tasks/business-task-lock-test')) {
+      await fulfill(route, task())
+      return true
+    }
+    return false
+  }, projects.slice(0, 1))
+
+  const readyButton = page.getByRole('button', { name: '重新生成商务审查' })
+  await readyButton.waitFor()
+  await readyButton.click()
+  const queuedButton = page.getByRole('button', { name: '排队中' })
+  await queuedButton.waitFor()
+  assert.equal(await queuedButton.isDisabled(), true)
+  await queuedButton.click({ force: true })
+  assert.equal(submitCount, 1)
+
+  await page.reload()
+  const restoredButton = page.getByRole('button', { name: '排队中' })
+  await restoredButton.waitFor()
+  assert.equal(await restoredButton.isDisabled(), true)
+  assert.equal(submitCount, 1)
+
+  taskStatus = 'failed'
+  await readyButton.waitFor({ timeout: 6000 })
+  assert.equal(await readyButton.isEnabled(), true)
+  assert.equal(submitCount, 1)
 })
 
 test('已保存的技术标剔除范围返回前禁止操作，返回后保留剔除项', async (t) => {
@@ -278,6 +351,7 @@ test('升级后不复用缺少状态摘要的旧版列表缓存', async (t) => {
   assert.equal(await page.getByText('旧版缓存项目', { exact: true }).count(), 0)
   assert.equal(requests.filter((path) => path === '/api/postgresql/projects').length, 1)
   assert.match(await page.locator('.project-card').first().innerText(), /已完成/)
+  assert.equal(await page.evaluate(() => sessionStorage.getItem('xtjs-api-cache:legacy-full-result')), null)
 })
 
 const reviewFixture = { business_bid_format_review: { bidders: [{ bidder_key: 'a-company', bidder_name: '项目A公司', checks: { verification_check: { issues: { failed: [{ title: '项目A专属签章问题', status: 'fail', message: '项目A内容', severity: 'error' }] } } } }] } }
@@ -286,7 +360,8 @@ test('结果审核切项目失败时清空旧结果并禁止导出，重试后�
   let fail = true
   const { page } = await pageWithApi(t, async (route, path) => {
     if (path.endsWith('/project-1/results')) { await fulfill(route, { results: reviewFixture, input_revision: 1 }); return true }
-    if (path.endsWith('/project-2/results')) { await fulfill(route, { results: {}, input_revision: 2 }, fail ? 503 : 200); return true }
+    if (path.endsWith('/project-2/review/summary')) { await fulfill(route, reviewSummary(projects[1], { input_revision: 2 }), fail ? 503 : 200); return true }
+    if (path.endsWith('/project-2/results')) { await fulfill(route, { results: {}, input_revision: 2 }); return true }
     if (path.includes('/format-review/editable')) { await fulfill(route, { items: [] }); return true }
     return false
   }, projects.slice(0,2))
@@ -300,14 +375,18 @@ test('结果审核切项目失败时清空旧结果并禁止导出，重试后�
   fail = false
   await page.getByRole('button', { name: '重试加载结果' }).click()
   await page.getByRole('heading', { name: '项目级审查总览' }).waitFor()
+  await page.locator('.filter-card').filter({ hasText: '商务标形式审查' }).click()
+  await page.waitForFunction(() => {
+    const button = [...document.querySelectorAll('button')].find((item) => /^导出报告/.test(item.textContent || ''))
+    return button && !button.disabled
+  })
   assert.equal(await page.getByRole('button', { name: /^导出报告/ }).isEnabled(),true)
 })
 
 test('结果审核迟到的旧项目响应不会覆盖当前项目', async (t) => {
   let oldRequest
   const { page } = await pageWithApi(t, async (route,path) => {
-    if (path.endsWith('/project-1/results')) { oldRequest=route; return true }
-    if (path.endsWith('/project-2/results')) { await fulfill(route,{results:{},input_revision:2}); return true }
+    if (path.endsWith('/project-1/review/summary')) { oldRequest=route; return true }
     return false
   },projects.slice(0,2))
   await page.goto(`${origin}/#/review?projectId=project-1`)
@@ -315,7 +394,7 @@ test('结果审核迟到的旧项目响应不会覆盖当前项目', async (t) =
   await page.locator('.dropdown-item').filter({hasText:'测试项目 2'}).click()
   await page.getByRole('heading',{name:'项目级审查总览'}).waitFor()
   assert.ok(oldRequest)
-  await fulfill(oldRequest,{results:reviewFixture,input_revision:1})
+  await fulfill(oldRequest,reviewSummary(projects[0]))
   await page.waitForTimeout(100)
   assert.equal(await page.getByText('项目A专属签章问题').count(),0)
   assert.match(await page.locator('.review-main').innerText(),/测试项目 2/)
@@ -323,7 +402,7 @@ test('结果审核迟到的旧项目响应不会覆盖当前项目', async (t) =
 
 test('材料变更后旧结果标记过期并禁止导出', async (t) => {
   const { page } = await pageWithApi(t,async(route,path)=>{
-    if(path.endsWith('/results')){await fulfill(route,{results:{},results_stale:true,input_revision:3});return true}
+    if(path.endsWith('/review/summary')){await fulfill(route,reviewSummary(projects[0],{results_stale:true,status:'stale',input_revision:3}));return true}
     return false
   },projects.slice(0,1))
   await page.goto(`${origin}/#/review?projectId=project-1`)
@@ -401,6 +480,10 @@ for (const onlyFailed of [false,true]) {
   },projects.slice(0,1))
   await page.goto(`${origin}/#/review?projectId=project-1`)
   await page.getByRole('heading',{name:'项目级审查总览'}).waitFor()
+  await page.locator('.filter-card').filter({hasText:'商务标形式审查'}).click()
+  await page.locator('.detail-container').waitFor()
+  await page.locator('.filter-card').filter({hasText:'总览'}).click()
+  await page.locator('.overview-table tbody tr').filter({hasText:'待核条目 32'}).first().waitFor()
   if(onlyFailed){await page.locator('.overview-stat-card').filter({hasText:'不通过项'}).click();await page.getByRole('heading',{name:'全部不通过项'}).waitFor();assert.equal(await page.locator('.overview-section-list').getByText('正常条目',{exact:true}).count(),0)}
   const row=page.locator('.overview-table tbody tr').filter({hasText:'待核条目 32'}).first()
   await row.scrollIntoViewIfNeeded()

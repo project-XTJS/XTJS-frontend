@@ -5,9 +5,36 @@ const API_CACHE_TTL = {
   projectDetail: 2 * 60 * 1000,
   projectResults: 2 * 60 * 1000,
 }
+const API_MEMORY_CACHE_BUDGET_BYTES = 16 * 1024 * 1024
+const API_SESSION_CACHE_MAX_BYTES = 256 * 1024
 const apiMemoryCache = new Map()
 const apiInflightCache = new Map()
 let apiCacheEpoch = 0
+let apiMemoryCacheBytes = 0
+
+function jsonByteLength(value) {
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength
+  } catch {
+    return Number.MAX_SAFE_INTEGER
+  }
+}
+
+function deleteMemoryCacheItem(cacheKey) {
+  const item = apiMemoryCache.get(cacheKey)
+  if (item) apiMemoryCacheBytes = Math.max(0, apiMemoryCacheBytes - Number(item.sizeBytes || 0))
+  apiMemoryCache.delete(cacheKey)
+}
+
+function writeMemoryCacheItem(cacheKey, item) {
+  deleteMemoryCacheItem(cacheKey)
+  if (item.sizeBytes > API_MEMORY_CACHE_BUDGET_BYTES) return
+  apiMemoryCache.set(cacheKey, item)
+  apiMemoryCacheBytes += item.sizeBytes
+  while (apiMemoryCacheBytes > API_MEMORY_CACHE_BUDGET_BYTES && apiMemoryCache.size > 0) {
+    deleteMemoryCacheItem(apiMemoryCache.keys().next().value)
+  }
+}
 
 function resolveApiBaseUrl() {
   const rawValue = (import.meta.env.VITE_API_BASE_URL ?? DEFAULT_API_BASE_URL).trim()
@@ -142,9 +169,10 @@ function unwrapUnifiedPayload(payload, response) {
 }
 
 const projectInputVersions = new Map()
+const projectResultVersions = new Map()
 const uploadAttempts = new Map()
 
-export async function request(path, { method = 'GET', query, body, headers, timeoutMs = 0 } = {}) {
+export async function request(path, { method = 'GET', query, body, headers, timeoutMs = 0, signal } = {}) {
   // 自动携带 Bearer 令牌（已登录时）。
   const token = getToken()
   const finalHeaders = token
@@ -156,14 +184,20 @@ export async function request(path, { method = 'GET', query, body, headers, time
   if (projectId && method !== 'GET' && /\/(manual-review|business-bid-format-review|personnel|export-report)/.test(path) && projectInputVersions.has(projectId)) {
     finalHeaders['X-XTJS-Input-Revision'] = String(projectInputVersions.get(projectId))
   }
+  if (projectId && method !== 'GET' && /\/(manual-review|business-bid-format-review|personnel|review\/exports)/.test(path) && projectResultVersions.has(projectId)) {
+    finalHeaders['X-XTJS-Result-Version'] = String(projectResultVersions.get(projectId))
+  }
   const controller = timeoutMs > 0 ? new AbortController() : null
+  const abortFromCaller = function () { controller?.abort() }
+  if (signal && controller) signal.addEventListener('abort', abortFromCaller, { once: true })
+  const requestSignal = controller ? controller.signal : signal
   const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
   try {
     const response = await fetch(buildRequestUrl(path, query), {
       method,
       body,
       headers: finalHeaders,
-      ...(controller ? { signal: controller.signal } : {}),
+      ...(requestSignal ? { signal: requestSignal } : {}),
     })
 
     // 会话失效：清除令牌并通知上层跳转登录，避免无效请求继续。
@@ -174,28 +208,62 @@ export async function request(path, { method = 'GET', query, body, headers, time
 
     const payload = await parseResponseBody(response)
     const data = unwrapUnifiedPayload(payload, response)
-    if (projectId && method === 'GET' && Number.isInteger(data?.input_revision)) projectInputVersions.set(projectId, data.input_revision)
+    if (projectId) {
+      const inputRevision = Number.isInteger(data?.input_revision)
+        ? data.input_revision
+        : data?.project?.input_revision
+      if (Number.isInteger(inputRevision)) projectInputVersions.set(projectId, inputRevision)
+      const resultVersion = data?.result_version || data?.result_record?.result_version || data?.result_record_meta?.result_version || data?._result_version
+      if (resultVersion) projectResultVersions.set(projectId, resultVersion)
+    }
     return data
   } catch (error) {
+    if (signal?.aborted) throw createApiError('请求已取消', { status: 499 })
     if (controller?.signal.aborted) throw createApiError('加载超时，请稍后重试。', { status: 408 })
     throw error
   } finally {
     if (timer !== null) clearTimeout(timer)
+    if (signal && controller) signal.removeEventListener('abort', abortFromCaller)
   }
 }
 
 function canUseSessionStorage() {
-  return typeof window !== 'undefined' && window.sessionStorage
+  if (typeof window === 'undefined') return false
+  try {
+    return Boolean(window.sessionStorage)
+  } catch {
+    return false
+  }
 }
+
+function purgeLegacyOversizedSessionCache() {
+  if (!canUseSessionStorage()) return
+  try {
+    for (let index = window.sessionStorage.length - 1; index >= 0; index -= 1) {
+      const storageKey = window.sessionStorage.key(index)
+      if (!storageKey || !storageKey.startsWith(API_CACHE_PREFIX)) continue
+      const rawItem = window.sessionStorage.getItem(storageKey)
+      if (rawItem && new TextEncoder().encode(rawItem).byteLength > API_SESSION_CACHE_MAX_BYTES) {
+        window.sessionStorage.removeItem(storageKey)
+      }
+    }
+  } catch {
+    // Storage may be unavailable in privacy mode; in-memory limits still apply.
+  }
+}
+
+purgeLegacyOversizedSessionCache()
 
 function readCachedPayload(cacheKey) {
   const now = Date.now()
   const memoryItem = apiMemoryCache.get(cacheKey)
   if (memoryItem && memoryItem.expiresAt > now) {
+    apiMemoryCache.delete(cacheKey)
+    apiMemoryCache.set(cacheKey, memoryItem)
     return memoryItem.payload
   }
   if (memoryItem) {
-    apiMemoryCache.delete(cacheKey)
+    deleteMemoryCacheItem(cacheKey)
   }
 
   if (!canUseSessionStorage()) return undefined
@@ -203,27 +271,38 @@ function readCachedPayload(cacheKey) {
   try {
     const rawItem = window.sessionStorage.getItem(API_CACHE_PREFIX + cacheKey)
     if (!rawItem) return undefined
+    if (new TextEncoder().encode(rawItem).byteLength > API_SESSION_CACHE_MAX_BYTES) {
+      window.sessionStorage.removeItem(API_CACHE_PREFIX + cacheKey)
+      return undefined
+    }
     const item = JSON.parse(rawItem)
     if (!item || item.expiresAt <= now) {
       window.sessionStorage.removeItem(API_CACHE_PREFIX + cacheKey)
       return undefined
     }
-    apiMemoryCache.set(cacheKey, item)
+    item.sizeBytes = Number(item.sizeBytes || jsonByteLength(item.payload))
+    if (item.sizeBytes > API_SESSION_CACHE_MAX_BYTES) {
+      window.sessionStorage.removeItem(API_CACHE_PREFIX + cacheKey)
+      return undefined
+    }
+    writeMemoryCacheItem(cacheKey, item)
     return item.payload
   } catch {
     return undefined
   }
 }
 
-function writeCachedPayload(cacheKey, payload, ttl) {
+function writeCachedPayload(cacheKey, payload, ttl, persistSession) {
   if (!ttl || ttl <= 0) return
+  const sizeBytes = jsonByteLength(payload)
   const item = {
     expiresAt: Date.now() + ttl,
     payload,
+    sizeBytes,
   }
-  apiMemoryCache.set(cacheKey, item)
+  writeMemoryCacheItem(cacheKey, item)
 
-  if (!canUseSessionStorage()) return
+  if (!persistSession || sizeBytes > API_SESSION_CACHE_MAX_BYTES || !canUseSessionStorage()) return
   try {
     window.sessionStorage.setItem(API_CACHE_PREFIX + cacheKey, JSON.stringify(item))
   } catch {
@@ -238,7 +317,7 @@ function invalidateApiCache(match) {
     : (key) => String(key).includes(String(match || ''))
 
   Array.from(apiMemoryCache.keys()).forEach((key) => {
-    if (matcher(key)) apiMemoryCache.delete(key)
+    if (matcher(key)) deleteMemoryCacheItem(key)
   })
   Array.from(apiInflightCache.keys()).forEach((key) => {
     if (matcher(key)) apiInflightCache.delete(key)
@@ -273,7 +352,15 @@ function invalidateProjectResultsCache(identifierId) {
 
 let cachedSessionToken = null
 
-function cachedRequest(path, { query, ttl, forceRefresh = false, timeoutMs, cacheVersion = '' } = {}) {
+function cachedRequest(path, {
+  query,
+  ttl,
+  forceRefresh = false,
+  timeoutMs,
+  cacheVersion = '',
+  persistSession = false,
+  signal,
+} = {}) {
   // localStorage can change in another tab without calling setToken here.
   const requestToken = getToken()
   if (requestToken !== cachedSessionToken) {
@@ -285,24 +372,24 @@ function cachedRequest(path, { query, ttl, forceRefresh = false, timeoutMs, cach
   if (!forceRefresh) {
     const cached = readCachedPayload(cacheKey)
     if (cached !== undefined) return Promise.resolve(cached)
-    const inflight = apiInflightCache.get(cacheKey)
+    const inflight = signal ? null : apiInflightCache.get(cacheKey)
     if (inflight) return inflight
   }
 
   const requestEpoch = apiCacheEpoch
-  const requestPromise = request(path, { query, timeoutMs })
+  const requestPromise = request(path, { query, timeoutMs, signal })
     .then((payload) => {
       if (requestToken !== getToken()) throw new Error('登录账号已变更，请重新加载')
       if (requestEpoch === apiCacheEpoch) {
-        writeCachedPayload(cacheKey, payload, ttl)
+        writeCachedPayload(cacheKey, payload, ttl, persistSession)
       }
       return payload
     })
     .finally(() => {
-      apiInflightCache.delete(cacheKey)
+      if (!signal) apiInflightCache.delete(cacheKey)
     })
 
-  apiInflightCache.set(cacheKey, requestPromise)
+  if (!signal) apiInflightCache.set(cacheKey, requestPromise)
   return requestPromise
 }
 
@@ -429,6 +516,104 @@ export async function getProjectResults(projectName, { forceRefresh = false } = 
   })
 }
 
+export async function getProjectReviewSummary(projectIdentifier, { forceRefresh = false, signal } = {}) {
+  return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/review/summary`, {
+    ttl: API_CACHE_TTL.projectResults,
+    timeoutMs: 20000,
+    forceRefresh,
+    cacheVersion: 'review-summary-v1',
+    persistSession: true,
+    signal,
+  })
+}
+
+export async function getProjectReviewComponent(projectIdentifier, resultKey, resultVersion, { signal } = {}) {
+  return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/review/results/${encodeURIComponent(resultKey)}`, {
+    query: { result_version: resultVersion },
+    ttl: API_CACHE_TTL.projectResults,
+    timeoutMs: 60000,
+    cacheVersion: resultVersion,
+    signal,
+  })
+}
+
+export async function listProjectReviewIssues(projectIdentifier, {
+  resultVersion,
+  resultKey,
+  riskLevel,
+  status,
+  checkCode,
+  fileName,
+  limit = 20,
+  offset = 0,
+  signal,
+} = {}) {
+  return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/review/issues`, {
+    query: {
+      result_version: resultVersion,
+      result_key: resultKey,
+      risk_level: riskLevel,
+      status,
+      check_code: checkCode,
+      file_name: fileName,
+      limit,
+      offset,
+    },
+    ttl: API_CACHE_TTL.projectResults,
+    timeoutMs: 30000,
+    cacheVersion: resultVersion,
+    signal,
+  })
+}
+
+export async function getProjectReviewIssue(projectIdentifier, issueId, resultVersion, { signal } = {}) {
+  return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/review/issues/${encodeURIComponent(issueId)}`, {
+    query: { result_version: resultVersion },
+    ttl: API_CACHE_TTL.projectResults,
+    timeoutMs: 30000,
+    cacheVersion: resultVersion,
+    signal,
+  })
+}
+
+export async function getProjectReviewIssueEvidence(projectIdentifier, issueId, resultVersion, {
+  limit = 20,
+  offset = 0,
+  signal,
+} = {}) {
+  return cachedRequest(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/review/issues/${encodeURIComponent(issueId)}/evidence`, {
+    query: { result_version: resultVersion, limit, offset },
+    ttl: API_CACHE_TTL.projectResults,
+    timeoutMs: 60000,
+    cacheVersion: resultVersion,
+    signal,
+  })
+}
+
+export async function getProjectReviewIssueIds(projectIdentifier, filters = {}) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/review/issue-ids`, {
+    query: {
+      result_version: filters.resultVersion,
+      result_key: filters.resultKey,
+      risk_level: filters.riskLevel,
+      status: filters.status,
+      check_code: filters.checkCode,
+      file_name: filters.fileName,
+    },
+    timeoutMs: 30000,
+    signal: filters.signal,
+  })
+}
+
+export async function exportProjectReview(projectIdentifier, resultVersion, format, reviewStatuses = {}) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/review/exports`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ result_version: resultVersion, format, review_statuses: reviewStatuses }),
+    timeoutMs: 120000,
+  })
+}
+
 
 
 export async function getProjectWorkflowState(projectIdentifier, { forceRefresh = false } = {}) {
@@ -527,6 +712,27 @@ export async function runAnalysis({
   })
   invalidateProjectCache(projectIdentifier)
   return payload
+}
+
+export async function submitBusinessReviewTask(projectIdentifier, { requestId, inputRevision }) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/business-review/tasks`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ request_id: requestId, input_revision: inputRevision }),
+    timeoutMs: 15000,
+  })
+}
+
+export async function getLatestBusinessReviewTask(projectIdentifier) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/business-review/tasks/latest`, {
+    timeoutMs: 10000,
+  })
+}
+
+export async function getBusinessReviewTask(projectIdentifier, taskId) {
+  return request(`/api/postgresql/projects/${encodeURIComponent(projectIdentifier)}/business-review/tasks/${encodeURIComponent(taskId)}`, {
+    timeoutMs: 10000,
+  })
 }
 
 // ─── 独立招标文件审查 ────────────────────────────────

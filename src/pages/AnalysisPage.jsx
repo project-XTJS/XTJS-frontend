@@ -2,12 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   getProjectDetail,
-  getProjectResults,
+  getProjectReviewSummary,
   listProjects,
   runAnalysis,
 } from '../lib/xtjsApi'
 import { formatDateTime } from '../utils/formatters'
-import { normalizeProjectResultsPayload } from '../utils/results'
 import EmptyBlock from '../components/EmptyBlock'
 import ProjectDropdown from '../components/ProjectDropdown'
 
@@ -252,7 +251,11 @@ function getFormatCheckStatus(check) {
     return { state: 'warning', label: issueCount > 0 ? `${issueCount} 项待复核` : '待复核', count: issueCount }
   }
 
-  if (['not_applicable', 'not_required', 'skipped'].includes(status)) {
+  if (['not_applicable', 'skipped', 'optional'].includes(status)) {
+    return { state: 'pending', label: '不适用', count: 0 }
+  }
+
+  if (status === 'not_required') {
     return { state: 'pass', label: '无需检查', count: 0 }
   }
 
@@ -814,19 +817,29 @@ function getDisabledHint(analysisType, parsingStatus) {
     : '商务标解析完成后可用'
 }
 
-function buildAnalysisViewState(allResults, projectMeta) {
+function buildAnalysisViewStateFromSummary(summary, projectMeta) {
   const cardResults = {}
   const statusMap = {}
-
+  const categories = Object.fromEntries(arrayify(summary?.categories).map((category) => [category.result_key, category]))
   ANALYSIS_TYPES.forEach((analysisType) => {
-    const hasServiceResult = analysisType.services.some((serviceKey) => allResults[serviceKey])
-
-    if (!hasServiceResult) return
-
-    cardResults[analysisType.key] = normalizeAnalysisResult(analysisType, { results: allResults }, projectMeta)
-    statusMap[analysisType.key] = 'success'
+    const category = analysisType.services.map((serviceKey) => categories[serviceKey]).find(Boolean)
+    if (!category) return
+    const risks = category.risk_counts || {}
+    const suspicious = Number(risks.high || 0) + Number(risks.medium || 0) + Number(risks.low || 0)
+    cardResults[analysisType.key] = {
+      __summaryOnly: true,
+      summary: {
+        ...(category.summary || {}),
+        document_count: firstAvailableCount(
+          category.summary?.document_count,
+          getProjectDocumentCountForAnalysis(analysisType, projectMeta),
+        ),
+        suspicious,
+      },
+    }
+    statusMap[analysisType.key] = category.status === 'ready' ? 'success'
+      : category.status === 'failed' ? 'error' : 'pending'
   })
-
   return { cardResults, statusMap }
 }
 
@@ -872,9 +885,9 @@ export default function AnalysisPage() {
     const projectId = selectedProjectId
     if (!projectId) return
 
-    const [detailResult, resultsResult] = await Promise.allSettled([
+    const [detailResult, summaryResult] = await Promise.allSettled([
       getProjectDetail(projectId, { forceRefresh: true }),
-      getProjectResults(projectId, { forceRefresh: true }),
+      getProjectReviewSummary(projectId, { forceRefresh: true }),
     ])
 
     if (String(selectedProjectIdRef.current || '') !== String(projectId || '')) return
@@ -891,9 +904,8 @@ export default function AnalysisPage() {
       setSelectedProjectParsingStatus(projectMeta?.parsing_status ?? 0)
     }
 
-    if (resultsResult.status === 'fulfilled') {
-      const allResults = normalizeProjectResultsPayload(resultsResult.value)
-      const viewState = buildAnalysisViewState(allResults, projectMeta)
+    if (summaryResult.status === 'fulfilled') {
+      const viewState = buildAnalysisViewStateFromSummary(summaryResult.value, projectMeta)
       setResults((prev) => ({ ...prev, ...viewState.cardResults }))
       setAnalysisStatus((prev) => ({ ...prev, ...viewState.statusMap }))
     }
@@ -923,8 +935,8 @@ export default function AnalysisPage() {
 
     Promise.allSettled([
       getProjectDetail(selectedProjectId),
-      getProjectResults(selectedProjectId),
-    ]).then(([detailResult, resultsResult]) => {
+      getProjectReviewSummary(selectedProjectId),
+    ]).then(([detailResult, summaryResult]) => {
       if (cancelled) return
 
       const detailValue = detailResult.status === 'fulfilled' ? detailResult.value : null
@@ -937,9 +949,8 @@ export default function AnalysisPage() {
       setSelectedProjectMeta(projectMeta)
       setSelectedProjectParsingStatus(projectMeta?.parsing_status ?? 0)
 
-      if (resultsResult.status === 'fulfilled') {
-        const allResults = normalizeProjectResultsPayload(resultsResult.value)
-        const viewState = buildAnalysisViewState(allResults, projectMeta)
+      if (summaryResult.status === 'fulfilled') {
+        const viewState = buildAnalysisViewStateFromSummary(summaryResult.value, projectMeta)
         setResults(viewState.cardResults)
         setAnalysisStatus(viewState.statusMap)
       }

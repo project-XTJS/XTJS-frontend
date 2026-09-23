@@ -406,6 +406,39 @@
   margin-top: 18px;
 }
 
+.business-task-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  margin: 14px 0 8px;
+  padding: 10px 14px;
+  border: 1px solid #bfd2f7;
+  border-radius: 12px;
+  background: #f4f8ff;
+  color: #31558f;
+  line-height: 1.5;
+}
+
+.business-task-status small {
+  flex-basis: 100%;
+  color: #8a4a2a;
+}
+
+.business-task-failed,
+.business-task-interrupted,
+.business-task-stale {
+  border-color: #e9b7aa;
+  background: #fff5f2;
+  color: #8c3024;
+}
+
+.business-task-succeeded {
+  border-color: #a9d8bc;
+  background: #f1fbf5;
+  color: #25633d;
+}
+
 .scope-field {
   min-width: 220px;
 }
@@ -2016,6 +2049,7 @@
   align-self: start;
   position: sticky;
   top: 24px;
+  min-width: 0;
   padding: 20px !important;
 }
 
@@ -2489,6 +2523,42 @@
   background: #fee2e2;
 }
 
+.result-unclear {
+  color: #a16207;
+  background: #fef3c7;
+}
+
+.result-not-applicable {
+  color: #475569;
+  background: #f1f5f9;
+}
+
+.consistency-character-diff {
+  margin-top: 0.65rem;
+  padding: 0.65rem 0.75rem;
+  border-left: 3px solid #f59e0b;
+  background: #fffbeb;
+  overflow-wrap: anywhere;
+}
+
+.consistency-character-diff small {
+  color: #64748b;
+}
+
+.consistency-unclear-reason {
+  margin-top: 0.65rem;
+  padding: 0.65rem 0.75rem;
+  border-left: 3px solid #3b82f6;
+  background: #eff6ff;
+  overflow-wrap: anywhere;
+}
+
+.consistency-unclear-reason small {
+  display: block;
+  margin-top: 0.25rem;
+  color: #64748b;
+}
+
 /* ─── Review Alert Card ─────────────────────────── */
 
 .review-alert-card {
@@ -2710,6 +2780,16 @@
   font-weight: 900;
   line-height: 1;
   letter-spacing: 0.08em;
+}
+
+.review-result-analysis-note {
+  margin: 10px 0 0;
+  padding: 9px 12px;
+  border-left: 3px solid #b91c1c;
+  border-radius: 4px;
+  color: #991b1b;
+  background: #fef2f2;
+  font-weight: 600;
 }
 
 .manual-inline-actions {
@@ -3414,6 +3494,11 @@
   font-weight: 700;
 }
 
+.typo-highlight-review {
+  color: #a16207;
+  background: #fef3c7;
+}
+
 .duplicate-typo-summary {
   display: flex;
   flex-wrap: wrap;
@@ -3437,6 +3522,32 @@
   background: #fff;
   border: 1px solid #fecaca;
   color: #7f1d1d;
+}
+
+.duplicate-typo-summary-review {
+  display: block;
+  border-color: #fde68a;
+  background: #fffbeb;
+}
+
+.duplicate-typo-summary-review summary {
+  cursor: pointer;
+}
+
+.duplicate-typo-summary-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.duplicate-typo-summary-review strong {
+  color: #92400e;
+}
+
+.duplicate-typo-chip-review {
+  border-color: #fde68a;
+  color: #78350f;
 }
 
 /* ─── Filter Card Sidebar ───────────────────────── */
@@ -3508,18 +3619,23 @@
 }
 
 .detail-result-filter {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(84px, 1fr));
   align-items: center;
   gap: 4px;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   padding: 3px;
   margin-bottom: 14px;
   border: 1px solid var(--line);
-  border-radius: 999px;
+  border-radius: 14px;
   background: #fff;
 }
 
 .detail-result-filter-btn {
-  flex: 1;
+  width: 100%;
+  min-width: 0;
   min-height: 28px;
   border: 0;
   border-radius: 999px;

@@ -252,18 +252,24 @@ export function formatManualReviewFieldDisplayValue(value, field, sourceValue) {
 export function buildManualReviewValueWithField(item, field, fieldValue, manualDrafts) {
   var currentValue = getManualReviewCurrentValue(item, manualDrafts)
   var nextValue = setManualReviewPathValue(currentValue, field.path, fieldValue)
+  if (['opening_amount', 'price_constraint'].includes(item.field_group) && isObject(nextValue)) {
+    delete nextValue.basis
+    delete nextValue.package
+  }
   if (item.field_group === 'attachment_result') {
     if (field.path && ['date_text', 'deadline_date'].includes(field.path[0])) {
       if (field.path[0] === 'deadline_date') nextValue = setManualReviewPathValue(nextValue, ['deadline_manually_confirmed'], !isManualValueBlank(fieldValue))
       nextValue = setManualReviewPathValue(nextValue, ['date_status'], isManualValueBlank(fieldValue) ? (field.path[0] === 'deadline_date' ? 'missing_deadline' : 'missing_date') : 'pending')
     }
     if (field.path && ['signature_text', 'signature_texts', 'signature_evidence'].includes(field.path[0])) {
-      nextValue = setManualReviewPathValue(nextValue, ['signature_status'], 'pending')
-      nextValue = setManualReviewPathValue(nextValue, ['signature_manually_confirmed'], false)
+      nextValue = setManualReviewPathValue(nextValue, ['signature_status'], isManualValueBlank(fieldValue) ? 'fail' : 'pass')
     }
     if (field.path && ['seal_text', 'seal_texts', 'seal_evidence'].includes(field.path[0])) {
       nextValue = setManualReviewPathValue(nextValue, ['seal_status'], 'pending')
-      nextValue = setManualReviewPathValue(nextValue, ['seal_manually_confirmed'], false)
+    }
+    if (isObject(nextValue)) {
+      delete nextValue.signature_manually_confirmed
+      delete nextValue.seal_manually_confirmed
     }
   }
   return nextValue

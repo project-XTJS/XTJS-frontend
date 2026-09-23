@@ -3,16 +3,17 @@ import {
   continueTechnicalOcr,
   deleteProject,
   getProjectAuthorCheck,
+  getBusinessReviewTask,
+  getLatestBusinessReviewTask,
   getProjectDetail,
   getProjectOcrStatus,
-  getProjectResults,
   getProjectWorkflowState,
   ingestProjectDocuments,
   listProjects,
-  runAnalysis,
   runBusinessOcr,
   runTenderOcr,
   saveProjectWorkflowScope,
+  submitBusinessReviewTask,
   uploadProjectFolder,
   uploadMissingProjectFile,
   replaceProjectDocument,
@@ -27,7 +28,6 @@ import {
   getProjectSummary,
   stripExtension,
 } from '../utils/formatters'
-import { normalizeProjectResultsPayload } from '../utils/results'
 import StatusPill from '../components/StatusPill'
 import StatItem from '../components/StatItem'
 import EmptyBlock from '../components/EmptyBlock'
@@ -55,6 +55,22 @@ const PROJECT_STAGE_POLL_INTERVAL_MS = 5000
 const PROJECT_STAGE_POLL_ATTEMPTS = 360
 // OCR 进行中时拉取细粒度进度（按文件 + 当前文件页数）的轮询间隔
 const OCR_STATUS_POLL_INTERVAL_MS = 2500
+const BUSINESS_TASK_POLL_INTERVAL_MS = 2000
+const BUSINESS_TASK_ACTIVE_STATUSES = new Set(['restoring', 'submitting', 'connection_lost', 'queued', 'running'])
+const BUSINESS_TASK_TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'interrupted', 'stale'])
+
+const BUSINESS_TASK_STAGE_LABELS = {
+  restoring: '正在确认任务状态',
+  queued: '排队中',
+  preparing: '准备材料',
+  evidence: '核验附件证据',
+  reviewing: '审查投标方',
+  saving: '保存结果',
+  succeeded: '生成成功',
+  failed: '生成失败',
+  interrupted: '任务中断',
+  stale: '材料已变化',
+}
 
 // OCR 阶段标签（与后端 ocr-status 的 stage 对齐）
 const OCR_STAGE_LABELS = {
@@ -85,6 +101,29 @@ function delay(ms) {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms)
   })
+}
+
+function createRequestId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID()
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (token) => {
+    const value = Math.floor(Math.random() * 16)
+    return (token === 'x' ? value : (value & 0x3) | 0x8).toString(16)
+  })
+}
+
+function businessTaskText(task) {
+  if (!task) return ''
+  if (task.status === 'submitting') return '提交中'
+  if (task.status === 'connection_lost') return '连接暂时中断，正在查询原任务'
+  const stage = BUSINESS_TASK_STAGE_LABELS[task.stage] || BUSINESS_TASK_STAGE_LABELS[task.status] || task.stage || task.status
+  const progress = task.progress || {}
+  const count = Number(progress.total || 0) > 0
+    ? `（${Number(progress.completed || 0)}/${Number(progress.total)}）`
+    : ''
+  const elapsed = task.started_at
+    ? `，已用时 ${Math.max(0, Math.floor((Date.now() - new Date(task.started_at).getTime()) / 1000))} 秒`
+    : ''
+  return `${stage}${count}${progress.message ? `：${progress.message}` : ''}${elapsed}`
 }
 
 function hasBusinessAnalysisResults(project) {
@@ -145,11 +184,6 @@ function buildWorkflowExcludedBidders(candidates, excludedIds) {
     }))
 }
 
-function getAnalysisRunError(apiResult) {
-  const failedItem = (apiResult?.items ?? []).find((item) => item?.status && item.status !== 'success')
-  return failedItem?.error || failedItem?.message || ''
-}
-
 function normalizeRelation(rawRelation, index) {
   return {
     id: rawRelation.relation_id ?? index + 1,
@@ -199,6 +233,7 @@ function normalizeProject(detail) {
     createdAt: detail.project.create_time,
     updatedAt: detail.project.update_time,
     parsingStatus: detail.project.parsing_status ?? 0,
+    inputRevision: Number(detail.project.input_revision ?? 0),
     uploadComplete: detail.project.upload_complete !== false,
     uploadIssues: detail.project.upload_issues ?? [],
     relations,
@@ -221,6 +256,7 @@ function normalizeProjectFromListItem(item) {
     createdAt: item.create_time,
     updatedAt: item.update_time,
     parsingStatus: item.parsing_status ?? 0,
+    inputRevision: Number(item.input_revision ?? 0),
     uploadComplete: item.upload_complete !== false,
     resultsStale: Boolean(item.results_stale),
     uploadIssues: item.upload_issues ?? [],
@@ -250,6 +286,9 @@ export default function ProjectsPage() {
   const [technicalOcrExcludedIdsByProject, setTechnicalOcrExcludedIdsByProject] = useState({})
   const [ocrStatus, setOcrStatus] = useState(null)
   const [ocrStatusError, setOcrStatusError] = useState(null)
+  const [businessTasksByProject, setBusinessTasksByProject] = useState({})
+  const businessSubmissionLocksRef = useRef(new Set())
+  const handledBusinessTasksRef = useRef(new Set())
   // 作者查重预警弹窗：{ report, onProceed?, proceedLabel }；onProceed 存在时显示“仍然继续”。
   const [authorModal, setAuthorModal] = useState(null)
 
@@ -306,6 +345,16 @@ export default function ProjectsPage() {
     null
 
   const activeProjectId = activeProject?.identifierId
+  const hasResolvedActiveBusinessTask = Boolean(activeProjectId) && Object.prototype.hasOwnProperty.call(
+    businessTasksByProject,
+    activeProjectId,
+  )
+  const activeBusinessTask = activeProjectId ? businessTasksByProject[activeProjectId] : null
+  const isActiveBusinessTaskRunning = Boolean(activeProjectId) && (
+    !hasResolvedActiveBusinessTask ||
+    businessSubmissionLocksRef.current.has(activeProjectId) ||
+    BUSINESS_TASK_ACTIVE_STATUSES.has(activeBusinessTask?.status)
+  )
   const activeProjectIdRef = useRef(activeProjectId)
   activeProjectIdRef.current = activeProjectId
   useEffect(() => {
@@ -325,6 +374,133 @@ export default function ProjectsPage() {
       })
     return () => { cancelled = true }
   }, [activeProjectId, loadAttempt])
+
+  // Restore the latest persistent task when the user switches projects or reloads.
+  useEffect(() => {
+    const projectId = activeProjectId
+    if (!projectId) return undefined
+    let cancelled = false
+    setBusinessTasksByProject((current) => {
+      if (Object.prototype.hasOwnProperty.call(current, projectId)) return current
+      return {
+        ...current,
+        [projectId]: {
+          status: 'restoring',
+          stage: 'restoring',
+          progress: { completed: 0, total: 0, message: '正在查询最近任务' },
+        },
+      }
+    })
+    getLatestBusinessReviewTask(projectId)
+      .then((task) => {
+        if (cancelled) return
+        if (task && BUSINESS_TASK_ACTIVE_STATUSES.has(task.status)) {
+          businessSubmissionLocksRef.current.add(projectId)
+        } else {
+          businessSubmissionLocksRef.current.delete(projectId)
+        }
+        setBusinessTasksByProject((current) => ({ ...current, [projectId]: task || null }))
+      })
+      .catch(() => {
+        if (cancelled) return
+        businessSubmissionLocksRef.current.add(projectId)
+        setBusinessTasksByProject((current) => ({
+          ...current,
+          [projectId]: {
+            ...(current[projectId] || {}),
+            status: 'connection_lost',
+            stage: current[projectId]?.stage || 'queued',
+            progress: current[projectId]?.progress || { completed: 0, total: 0, message: '正在重新连接任务服务' },
+          },
+        }))
+      })
+    return () => { cancelled = true }
+  }, [activeProjectId, loadAttempt])
+
+  // Poll all locally known active tasks, so switching projects cannot overwrite
+  // another project's progress and returning to it is instantaneous.
+  useEffect(() => {
+    const activeEntries = Object.entries(businessTasksByProject)
+      .filter(([, task]) => BUSINESS_TASK_ACTIVE_STATUSES.has(task?.status))
+    if (!activeEntries.length) return undefined
+    let cancelled = false
+    let timer = null
+
+    const poll = async () => {
+      await Promise.all(activeEntries.map(async ([projectId, previous]) => {
+        try {
+          const task = previous.task_id
+            ? await getBusinessReviewTask(projectId, previous.task_id)
+            : await getLatestBusinessReviewTask(projectId)
+          if (cancelled) return
+          if (!task) {
+            businessSubmissionLocksRef.current.delete(projectId)
+            setBusinessTasksByProject((current) => ({
+              ...current,
+              [projectId]: previous.request_id
+                ? {
+                    ...previous,
+                    status: 'failed',
+                    stage: 'failed',
+                    error: '服务端未找到已提交的商务审查任务',
+                    progress: { completed: 0, total: 0, message: '任务未成功提交' },
+                  }
+                : null,
+            }))
+            return
+          }
+          if (!previous.task_id && previous.request_id && task.request_id !== previous.request_id && !BUSINESS_TASK_ACTIVE_STATUSES.has(task.status)) {
+            businessSubmissionLocksRef.current.delete(projectId)
+            setBusinessTasksByProject((current) => ({
+              ...current,
+              [projectId]: {
+                ...previous,
+                status: 'failed',
+                stage: 'failed',
+                error: '服务端未找到本次提交的商务审查任务',
+                progress: { completed: 0, total: 0, message: '任务未成功提交' },
+              },
+            }))
+            return
+          }
+          setBusinessTasksByProject((current) => ({ ...current, [projectId]: task }))
+          if (BUSINESS_TASK_TERMINAL_STATUSES.has(task.status)) {
+            businessSubmissionLocksRef.current.delete(projectId)
+          } else {
+            businessSubmissionLocksRef.current.add(projectId)
+          }
+          if (task.status === 'succeeded' && !handledBusinessTasksRef.current.has(task.task_id)) {
+            handledBusinessTasksRef.current.add(task.task_id)
+            try {
+              const detail = normalizeProject(await getProjectDetail(projectId, { forceRefresh: true }))
+              if (!cancelled) upsertProject(detail)
+            } catch {
+              // A later project refresh will pick up the committed result.
+            }
+            if (!cancelled && activeProjectIdRef.current === projectId) {
+              setLoadAttempt((value) => value + 1)
+              setNotice({ type: 'success', message: `项目 ${projectId} 商务标审查结果已生成。` })
+            }
+          } else if (['failed', 'interrupted', 'stale'].includes(task.status) && activeProjectIdRef.current === projectId) {
+            setNotice({ type: 'warning', message: task.error || '商务审查未完成，可点击重试。' })
+          }
+        } catch {
+          if (!cancelled) {
+            setBusinessTasksByProject((current) => ({
+              ...current,
+              [projectId]: { ...current[projectId], status: 'connection_lost' },
+            }))
+          }
+        }
+      }))
+      if (!cancelled) timer = window.setTimeout(poll, BUSINESS_TASK_POLL_INTERVAL_MS)
+    }
+    timer = window.setTimeout(poll, BUSINESS_TASK_POLL_INTERVAL_MS)
+    return () => {
+      cancelled = true
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [businessTasksByProject])
 
   const needsWorkflowState = Boolean(activeProject?.detailLoaded) &&
     activeProject.uploadComplete !== false &&
@@ -551,20 +727,7 @@ export default function ProjectsPage() {
   }
 
   async function refreshProjectSnapshot(projectId) {
-    const [detailResult, resultsResult] = await Promise.allSettled([
-      getProjectDetail(projectId, { forceRefresh: true }),
-      getProjectResults(projectId, { forceRefresh: true }),
-    ])
-
-    if (detailResult.status === 'rejected') {
-      throw detailResult.reason
-    }
-
-    const project = normalizeProject(detailResult.value)
-    if (resultsResult.status === 'fulfilled') {
-      project.results = normalizeProjectResultsPayload(resultsResult.value)
-      project.resultsLoaded = true
-    }
+    const project = normalizeProject(await getProjectDetail(projectId, { forceRefresh: true }))
     upsertProject(project)
     return project
   }
@@ -596,17 +759,96 @@ export default function ProjectsPage() {
     throw new Error(`${targetLabel}等待超时，请稍后刷新项目状态。`)
   }
 
-  async function runBusinessAnalysisForProject(projectId) {
-    const apiResult = await runAnalysis({
-      projectIdentifier: projectId,
-      services: BUSINESS_ANALYSIS_SERVICES,
-    })
-    const runError = getAnalysisRunError(apiResult)
-    if (runError) {
-      throw new Error(runError)
+  async function submitBusinessAnalysisForProject(project, { waitForCompletion = false } = {}) {
+    const projectId = project?.identifierId || project?.id
+    if (!projectId) throw new Error('缺少项目标识')
+    if (businessSubmissionLocksRef.current.has(projectId)) {
+      return businessTasksByProject[projectId]
     }
-    await refreshProjectSnapshot(projectId)
-    return apiResult
+    businessSubmissionLocksRef.current.add(projectId)
+    const requestId = createRequestId()
+    const pending = {
+      request_id: requestId,
+      input_revision: Number(project.inputRevision || 0),
+      status: 'submitting',
+      stage: 'queued',
+      progress: { completed: 0, total: 0, message: '正在提交任务' },
+    }
+    setBusinessTasksByProject((current) => ({ ...current, [projectId]: pending }))
+
+    let task = pending
+    try {
+      task = await submitBusinessReviewTask(projectId, {
+        requestId,
+        inputRevision: pending.input_revision,
+      })
+      setBusinessTasksByProject((current) => ({ ...current, [projectId]: task }))
+      if (BUSINESS_TASK_TERMINAL_STATUSES.has(task?.status)) {
+        businessSubmissionLocksRef.current.delete(projectId)
+      }
+    } catch (submitError) {
+      // The POST may have committed even if the response was lost. Recover the
+      // original task instead of creating a second request id.
+      let recovered
+      try {
+        recovered = await getLatestBusinessReviewTask(projectId)
+      } catch {
+        task = { ...pending, status: 'connection_lost', error: submitError.message }
+        setBusinessTasksByProject((current) => ({ ...current, [projectId]: task }))
+        recovered = undefined
+      }
+      if (recovered && (recovered.request_id === requestId || BUSINESS_TASK_ACTIVE_STATUSES.has(recovered.status))) {
+        task = recovered
+        setBusinessTasksByProject((current) => ({ ...current, [projectId]: recovered }))
+      } else if (recovered !== undefined) {
+        task = {
+          ...pending,
+          status: 'failed',
+          stage: 'failed',
+          error: submitError.message || '任务提交失败',
+          progress: { completed: 0, total: 0, message: '服务端未接收任务' },
+        }
+        businessSubmissionLocksRef.current.delete(projectId)
+        setBusinessTasksByProject((current) => ({ ...current, [projectId]: task }))
+        throw submitError
+      }
+    }
+    if (BUSINESS_TASK_TERMINAL_STATUSES.has(task?.status)) {
+      businessSubmissionLocksRef.current.delete(projectId)
+      if (task.status !== 'succeeded') {
+        throw new Error(task.error || '商务审查任务未完成')
+      }
+    }
+
+    if (!waitForCompletion) return task
+    for (let attempt = 0; attempt < 480; attempt += 1) {
+      try {
+        const latest = task.task_id
+          ? await getBusinessReviewTask(projectId, task.task_id)
+          : await getLatestBusinessReviewTask(projectId)
+        if (latest && (task.task_id || latest.request_id === requestId || BUSINESS_TASK_ACTIVE_STATUSES.has(latest.status))) {
+          task = latest
+          setBusinessTasksByProject((current) => ({ ...current, [projectId]: latest }))
+          if (latest.status === 'succeeded') {
+            businessSubmissionLocksRef.current.delete(projectId)
+            await refreshProjectSnapshot(projectId)
+            return latest
+          }
+          if (['failed', 'interrupted', 'stale'].includes(latest.status)) {
+            businessSubmissionLocksRef.current.delete(projectId)
+            throw new Error(latest.error || '商务审查任务未完成')
+          }
+        }
+      } catch (error) {
+        if (['failed', 'interrupted', 'stale'].includes(task?.status)) throw error
+        setBusinessTasksByProject((current) => ({
+          ...current,
+          [projectId]: { ...current[projectId], status: 'connection_lost' },
+        }))
+      }
+      await delay(BUSINESS_TASK_POLL_INTERVAL_MS)
+    }
+    throw new Error('商务审查任务等待超时，请刷新页面继续查看进度。')
   }
 
   async function runPostCreateWorkflow(projectId, parallelism) {
@@ -615,13 +857,13 @@ export default function ProjectsPage() {
       message: `项目 ${projectId} 创建成功，招标文件与商务标 OCR 已加入队列，正在等待完成...`,
     })
     await runBusinessOcr(projectId, { parallelism })
-    await waitForProjectParsingStatus(projectId, PARSING_STATUS_BUSINESS_READY, '招标文件与商务标 OCR')
+    const readyProject = await waitForProjectParsingStatus(projectId, PARSING_STATUS_BUSINESS_READY, '招标文件与商务标 OCR')
 
     setNotice({
       type: 'info',
       message: `项目 ${projectId} 招标文件与商务标 OCR 已完成，正在生成商务标审查结果...`,
     })
-    await runBusinessAnalysisForProject(projectId)
+    await submitBusinessAnalysisForProject(readyProject, { waitForCompletion: true })
 
     setNotice({
       type: 'success',
@@ -829,19 +1071,21 @@ export default function ProjectsPage() {
   }
 
   async function handleRunBusinessAnalysis() {
-    if (!activeProject || !canRunBusinessAnalysis) return
+    if (!activeProject || !canRunBusinessAnalysis || isActiveBusinessTaskRunning) return
 
     setBusyToken('business-analysis')
     setNotice({
       type: 'info',
-      message: `正在生成项目 ${activeProject.identifierId} 的商务标审查结果...`,
+      message: `正在提交项目 ${activeProject.identifierId} 的商务标审查任务...`,
     })
 
     try {
-      await runBusinessAnalysisForProject(activeProject.identifierId)
+      const task = await submitBusinessAnalysisForProject(activeProject)
       setNotice({
-        type: 'success',
-        message: `项目 ${activeProject.identifierId} 商务标审查结果已生成。`,
+        type: task?.status === 'connection_lost' ? 'warning' : 'info',
+        message: task?.status === 'connection_lost'
+          ? '连接暂时中断，正在继续查询原任务，不会重复提交。'
+          : `商务审查任务已提交（${task.task_id || task.request_id}）。`,
       })
     } catch (error) {
       setNotice({
@@ -1500,6 +1744,14 @@ export default function ProjectsPage() {
                   </div>
                 ) : null}
 
+                {activeBusinessTask ? (
+                  <div className={`business-task-status business-task-${activeBusinessTask.status}`}>
+                    <strong>商务审查：</strong>
+                    <span>{businessTaskText(activeBusinessTask)}</span>
+                    {activeBusinessTask.error ? <small>{activeBusinessTask.error}</small> : null}
+                  </div>
+                ) : null}
+
                 <div className="action-row">
                   {deleteConfirm === activeProject.identifierId ? (
                     <>
@@ -1535,10 +1787,12 @@ export default function ProjectsPage() {
                           type="button"
                           className="ghost-button"
                           onClick={handleRunBusinessAnalysis}
-                          disabled={Boolean(busyToken)}
+                          disabled={Boolean(busyToken) || isActiveBusinessTaskRunning}
                         >
-                          {busyToken === 'business-analysis'
-                            ? '生成中...'
+                          {isActiveBusinessTaskRunning
+                            ? BUSINESS_TASK_STAGE_LABELS[activeBusinessTask?.stage] || '处理中...'
+                            : busyToken === 'business-analysis'
+                              ? '提交中...'
                             : activeProjectHasBusinessResults
                               ? '重新生成商务审查'
                               : '生成商务审查'}
