@@ -3922,7 +3922,8 @@
 
 .personnel-entry-table-scroll {
   /* 高度由 JS 按左侧页面高度动态设置 */
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .personnel-pagination {

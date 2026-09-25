@@ -43,12 +43,12 @@ before(async () => {
   helpers = await import(`data:text/javascript;base64,${source}`)
 })
 
-test('v2 confirmed issues and review candidates stay separate while legacy issues become review-only', () => {
+test('only confirmed full-word issues display; historical character candidates stay hidden', () => {
   const alert = {
     evidence: {
       cluster: {
         short_duplicate_typo_issues: [
-          { shared_id: 'confirmed', verification_status: 'confirmed', matched_text: '培圳', suggestion: '培训', occurrences: [{ source_evidence_id: 'e1', side: 'left', start: 1, end: 2 }] },
+          { shared_id: 'confirmed', verification_status: 'confirmed', original_word: '培圳', replacement_word: '培训', matched_text: '培圳', suggestion: '培训', occurrences: [{ source_evidence_id: 'e1', side: 'left', start: 1, end: 2 }] },
           { matched_text: '性', suggestion: '新', page: 1 },
         ],
         typo_review_candidates: [
@@ -58,7 +58,7 @@ test('v2 confirmed issues and review candidates stay separate while legacy issue
     },
   }
   assert.deepEqual(helpers.auditTypoIssues(alert).map((item) => item.shared_id), ['confirmed'])
-  assert.deepEqual(helpers.auditTypoReview(alert).map((item) => item.shared_id || item.matched_text).sort(), ['review', '性'])
+  assert.deepEqual(helpers.auditTypoReview(alert), [])
 })
 
 test('highlight spans require the exact evidence and side and preserve code-point offsets', () => {

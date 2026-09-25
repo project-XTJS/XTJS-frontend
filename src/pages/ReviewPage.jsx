@@ -191,12 +191,16 @@ function bboxToRect(value, format) {
 
 function collectHighlightRects(value, format) {
   var rects = []
+  var seen = new Set()
 
   function collect(valueToCollect) {
     if (!valueToCollect) return
     if (hasRectShape(valueToCollect)) {
       var rect = bboxToRect(valueToCollect, format)
-      if (rect) rects.push(rect)
+      if (rect) {
+        var key = rect.map(function (number) { return Number(number).toFixed(2) }).join(',')
+        if (!seen.has(key)) { seen.add(key); rects.push(rect) }
+      }
       return
     }
     if (Array.isArray(valueToCollect)) {
@@ -220,13 +224,17 @@ function makeHighlightPageRects(page, rects) {
 function collectHighlightPageRects(value, targetPage) {
   var target = getFirstNumber(targetPage)
   var rects = []
+  var seen = new Set()
 
   function collect(valueToCollect, inheritedPage) {
     if (!valueToCollect) return
     if (hasRectShape(valueToCollect)) {
       if (!target || !inheritedPage || Number(inheritedPage) === Number(target)) {
         var rect = bboxToRect(valueToCollect)
-        if (rect) rects.push(rect)
+        if (rect) {
+          var key = String(inheritedPage || target || '') + ':' + rect.map(function (number) { return Number(number).toFixed(2) }).join(',')
+          if (!seen.has(key)) { seen.add(key); rects.push(rect) }
+        }
       }
       return
     }
@@ -253,7 +261,15 @@ function collectHighlightPageRects(value, targetPage) {
 }
 
 function mergeHighlightPageRects(left, right) {
-  return arrayify(left).concat(arrayify(right)).slice(0, 120)
+  var seen = new Set()
+  return arrayify(left).concat(arrayify(right)).filter(function (item) {
+    var rect = item && (item.rect || item.bbox)
+    if (!hasRectShape(rect)) return true
+    var key = String(getFirstNumber(item.page) || '') + ':' + rect.slice(0, 4).map(function (number) { return Number(number).toFixed(2) }).join(',')
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  }).slice(0, 120)
 }
 
 function cloneForExport(value) {
@@ -570,6 +586,25 @@ function enrichAlertsWithProjectFiles(alerts, projectDetail) {
 
 function buildExportPayload(alert, item) {
   var source = isObject(item) ? cloneForExport(item) : { value: item }
+  if (String(alert.sourceResultKey || alert.resultType || '').includes('duplicate')) {
+    function hideUnverified(value) {
+      if (Array.isArray(value)) return value.map(hideUnverified)
+      if (!isObject(value)) return value
+      return Object.fromEntries(Object.entries(value).flatMap(function ([key, nested]) {
+        if (key === 'typo_review_candidates') return []
+        if (key === 'short_duplicate_typo_issues') {
+          return [[key, arrayify(nested).filter(function (issue) {
+            return issue && issue.verification_status === 'confirmed' &&
+              Array.from(String(issue.original_word || '')).length >= 2 &&
+              arrayify(issue.occurrences).length > 0
+          }).map(hideUnverified)]]
+        }
+        if (key === 'review_candidate_count') return [[key, 0]]
+        return [[key, hideUnverified(nested)]]
+      }))
+    }
+    source = hideUnverified(source)
+  }
   return compactObject(Object.assign({
     result_key: alert.sourceResultKey || alert.resultType,
     review_item: alert.subType,
@@ -578,8 +613,9 @@ function buildExportPayload(alert, item) {
 }
 
 function isDuplicateIssueVisible(item) {
+  if (!item) return false
   var riskLevel = String(item.risk_level || '').toLowerCase()
-  return Boolean(item) && (Boolean(item.review_only) || (riskLevel !== '' && riskLevel !== 'none'))
+  return Boolean(item) && riskLevel !== '' && riskLevel !== 'none'
 }
 
 function getDuplicateAlertResultType(resultKey) {
@@ -807,41 +843,39 @@ function getDuplicateClusterPageLocations(cluster, group, page) {
 function getDuplicateClusterFileGroups(cluster) {
   var groups = {}
 
-  function ensureGroup(fileName) {
+  function ensureGroup(fileName, documentId) {
     if (!fileName) return null
-    var rangeStart = getDuplicateClusterRangeStarts(cluster, fileName)[0] || null
-    if (!groups[fileName]) {
-      groups[fileName] = {
+    var key = documentId ? 'id:' + documentId : 'name:' + fileName
+    var rangeStart = documentId ? null : (getDuplicateClusterRangeStarts(cluster, fileName)[0] || null)
+    if (!groups[key]) {
+      groups[key] = {
         fileName: fileName,
+        documentId: documentId || '',
         firstPage: rangeStart,
         hasRangePage: Boolean(rangeStart),
         locations: [],
       }
-    } else if (!groups[fileName].hasRangePage && rangeStart) {
-      groups[fileName].firstPage = rangeStart
-      groups[fileName].hasRangePage = true
+    } else if (!groups[key].hasRangePage && rangeStart) {
+      groups[key].firstPage = rangeStart
+      groups[key].hasRangePage = true
     }
-    return groups[fileName]
+    return groups[key]
   }
-
-  arrayify(cluster.files).forEach(function (fileName) {
-    ensureGroup(fileName)
-  })
-
-  Object.keys(cluster.doc_ranges_by_file || {}).forEach(function (fileName) {
-    ensureGroup(fileName)
-  })
 
   arrayify(cluster.locations).forEach(function (location) {
     var fileName = location && location.file_name
     var page = extractFirstPage(location)
     if (!fileName || !page) return
 
-    var group = ensureGroup(fileName)
+    var group = ensureGroup(fileName, location.document_identifier_id || location.identifier_id)
     group.locations.push(location)
     if (!group.hasRangePage && (!group.firstPage || Number(page) < Number(group.firstPage))) {
-      groups[fileName].firstPage = page
+      group.firstPage = page
     }
+  })
+
+  arrayify(cluster.files).concat(Object.keys(cluster.doc_ranges_by_file || {})).forEach(function (fileName) {
+    if (!Object.values(groups).some(function (group) { return group.fileName === fileName })) ensureGroup(fileName)
   })
 
   return Object.values(groups).filter(function (group) {
@@ -849,7 +883,10 @@ function getDuplicateClusterFileGroups(cluster) {
   }).sort(function (a, b) {
     var aFileOrder = arrayify(cluster.files).indexOf(a.fileName)
     var bFileOrder = arrayify(cluster.files).indexOf(b.fileName)
-    if (aFileOrder >= 0 && bFileOrder >= 0 && aFileOrder !== bFileOrder) return aFileOrder - bFileOrder
+    if (aFileOrder >= 0 && bFileOrder >= 0) {
+      if (aFileOrder !== bFileOrder) return aFileOrder - bFileOrder
+      return Number(a.firstPage || 1) - Number(b.firstPage || 1)
+    }
     if (aFileOrder >= 0) return -1
     if (bFileOrder >= 0) return 1
     return Number(a.firstPage || 1) - Number(b.firstPage || 1)
@@ -857,25 +894,38 @@ function getDuplicateClusterFileGroups(cluster) {
 }
 
 function buildDuplicateClusterDocs(cluster) {
-  return getDuplicateClusterFileGroups(cluster).map(function (group, index) {
+  var groups = getDuplicateClusterFileGroups(cluster)
+  return groups.map(function (group, index) {
     var fileName = group.fileName
     var page = chooseDuplicateClusterPage(cluster, group) || group.firstPage || 1
     var locations = getDuplicateClusterPageLocations(cluster, group, page)
-    var rects = locations.map(locationBboxToRect).filter(Boolean)
+    var rects = collectHighlightRects(locations.map(locationBboxToRect).filter(Boolean))
+    var seenPageRects = new Set()
+    var pageRects = group.locations.map(function (location) {
+      var locationPage = getFirstNumber(extractFirstPage(location))
+      var rect = locationBboxToRect(location)
+      if (!locationPage || !rect) return null
+      var key = String(locationPage) + ':' + rect.map(function (number) { return Number(number).toFixed(2) }).join(',')
+      if (seenPageRects.has(key)) return null
+      seenPageRects.add(key)
+      return { page: locationPage, rect: rect }
+    }).filter(Boolean)
     var locationWithId = locations.find(function (location) {
       return location.document_identifier_id || location.identifier_id
     }) || group.locations.find(function (location) {
       return location.document_identifier_id || location.identifier_id
     })
-    var docId = locationWithId && (locationWithId.document_identifier_id || locationWithId.identifier_id)
+    var docId = group.documentId || (locationWithId && (locationWithId.document_identifier_id || locationWithId.identifier_id))
     var previews = cluster.doc_previews_by_file && cluster.doc_previews_by_file[fileName]
 
     // 定位覆盖整段：range 全部页码 ∪ 各 location 页码 ∪ 首屏起始页
     var locationPages = group.locations.map(function (location) {
       return getFirstNumber(extractFirstPage(location))
     }).filter(Boolean)
+    var sameNameGroups = groups.filter(function (entry) { return entry.fileName === fileName })
+    var rangePages = sameNameGroups.length > 1 ? [] : getDuplicateClusterRangePages(cluster, fileName)
     var targetPages = [Number(page)]
-      .concat(getDuplicateClusterRangePages(cluster, fileName), locationPages)
+      .concat(rangePages, locationPages)
       .filter(Boolean)
       .filter(function (value, valueIndex, list) { return list.indexOf(value) === valueIndex })
       .sort(function (a, b) { return Number(a) - Number(b) })
@@ -890,13 +940,29 @@ function buildDuplicateClusterDocs(cluster) {
       highlight: collectHighlightPhrases(cluster.tokens, cluster.title, previews, locations),
       highlightBbox: rects[0],
       highlightRects: rects,
-      highlightPageRects: makeHighlightPageRects(page, rects),
+      highlightPageRects: pageRects,
     }, { label: fileName, page: page })
   }).filter(Boolean)
 }
 
 function getDuplicateOccurrenceDocEntries(cluster, occurrence) {
   var docs = isObject(occurrence && occurrence.docs) ? occurrence.docs : {}
+  if (occurrence && occurrence.left_file_name && occurrence.left_file_name === occurrence.right_file_name &&
+      occurrence.left_document_identifier_id && occurrence.right_document_identifier_id &&
+      occurrence.left_document_identifier_id !== occurrence.right_document_identifier_id) {
+    var sharedName = occurrence.left_file_name
+    var sharedDoc = docs[sharedName] || {}
+    var sharedEvidence = occurrence.evidence || {}
+    return ['left', 'right'].map(function (side) {
+      return {
+        fileName: sharedName,
+        doc: Object.assign({}, sharedDoc, {
+          pages: sharedEvidence[side + '_pages'] || sharedEvidence[side + '_page'] || sharedDoc.pages,
+          document_identifier_id: occurrence[side + '_document_identifier_id'],
+        }),
+      }
+    })
+  }
   var fileOrder = arrayify(cluster && cluster.files).filter(function (fileName) {
     return docs[fileName]
   })
@@ -1000,6 +1066,16 @@ function buildDuplicateEvidenceRows(cluster) {
       right_text: rightText,
       similarity: occurrence.similarity || (cluster && cluster.similarity),
       source_evidence_id: occurrence.evidence && occurrence.evidence.typo_evidence_id,
+      source_evidence_count: arrayify(occurrence.source_evidence).length || 1,
+      source_kinds: Array.from(new Set(arrayify(occurrence.source_evidence).map(function (source) { return source.kind }).filter(Boolean))),
+      source_evidence: arrayify(occurrence.source_evidence).map(function (source) {
+        return {
+          kind: source.kind,
+          source_item_id: source.source_item_id,
+          left_text: getDuplicateEvidenceSideText(source.evidence, 'left'),
+          right_text: getDuplicateEvidenceSideText(source.evidence, 'right'),
+        }
+      }),
       source_index: index,
     })
   })
@@ -1058,26 +1134,14 @@ function getDuplicateTypoIssues(alert) {
   var cluster = evidence.cluster
   var values = fromAlert.length > 0 ? fromAlert : arrayify(cluster && cluster.short_duplicate_typo_issues)
   return values.filter(function (issue) {
-    return issue && issue.verification_status === 'confirmed' && arrayify(issue.occurrences).length > 0
+    return issue && issue.verification_status === 'confirmed' &&
+      Array.from(String(issue.original_word || '')).length >= 2 &&
+      arrayify(issue.occurrences).length > 0
   })
 }
 
 function getDuplicateTypoReviewCandidates(alert) {
-  var evidence = (alert && alert.evidence) || {}
-  var cluster = evidence.cluster
-  var explicit = arrayify(evidence.typoReviewCandidates)
-  if (explicit.length === 0) explicit = arrayify(cluster && cluster.typo_review_candidates)
-  var legacy = arrayify(evidence.shortDuplicateTypoIssues).concat(arrayify(cluster && cluster.short_duplicate_typo_issues)).filter(function (issue) {
-    return issue && !(issue.verification_status === 'confirmed' && arrayify(issue.occurrences).length > 0)
-  })
-  var seen = new Set()
-  return explicit.concat(legacy).filter(function (issue) {
-    if (!issue) return false
-    var key = issue.shared_id || [issue.matched_text, issue.suggestion, issue.page].join('|')
-    if (seen.has(key)) return false
-    seen.add(key)
-    return true
-  })
+  return []
 }
 
 function getTypoSpansForSource(issues, sourceEvidenceId, side) {
@@ -1191,6 +1255,26 @@ function renderDuplicateTypoSummary(issues, options) {
   )
 }
 
+function renderDuplicateSourceEvidence(row) {
+  var sources = arrayify(row && row.source_evidence)
+  if (sources.length < 2) return null
+  return (
+    <details className="duplicate-typo-summary duplicate-typo-summary-review">
+      <summary>原始证据（{sources.length} 条）</summary>
+      {sources.map(function (source, index) {
+        return (
+          <div key={'duplicate-source-' + index} className="duplicate-segment">
+            <span className="duplicate-segment-label">
+              {source.kind || '来源'}{source.source_item_id ? ' / ' + String(source.source_item_id).slice(0, 12) : ''}
+            </span>
+            <p className="duplicate-preview-text">{String(source.left_text || source.right_text || '').slice(0, 300)}</p>
+          </div>
+        )
+      })}
+    </details>
+  )
+}
+
 function renderDuplicateEvidenceRows(alert) {
   var typoIssues = getDuplicateTypoIssues(alert)
   var typoReviewCandidates = getDuplicateTypoReviewCandidates(alert)
@@ -1201,7 +1285,7 @@ function renderDuplicateEvidenceRows(alert) {
     })
   })
   var cluster = alert && alert.evidence && alert.evidence.cluster
-  if (isObject(cluster) && isObject(cluster.doc_previews_by_file) && !hasPreciseTypoLocations) {
+  if (isObject(cluster) && isObject(cluster.doc_previews_by_file) && !hasPreciseTypoLocations && !cluster.review_projection_version) {
     var files = arrayify(cluster.files)
     Object.keys(cluster.doc_previews_by_file).forEach(function (fileName) {
       if (files.indexOf(fileName) < 0) files.push(fileName)
@@ -1280,6 +1364,7 @@ function renderDuplicateEvidenceRows(alert) {
                   </div>
                 )
               })}
+              {renderDuplicateSourceEvidence(row)}
             </div>
           )
         }
@@ -1296,6 +1381,7 @@ function renderDuplicateEvidenceRows(alert) {
             ) : (
               <p className="duplicate-preview-text">{renderTypoText(row.text || row.left_text || row.right_text, allTypoResults, row.source_evidence_id, 'left', 'row-' + index)}</p>
             )}
+            {renderDuplicateSourceEvidence(row)}
           </div>
         )
       })}
@@ -1335,7 +1421,7 @@ function collectDuplicateAlerts(results, allAlerts) {
       })
 
       var alert = {
-        id: makeAlertId('duplicate', resultKey, groupKey, item.cluster_id, index),
+        id: item._review_issue_id || item.issue_id || item.cluster_id || makeAlertId('duplicate', resultKey, groupKey, index),
         reviewIssueId: item._review_issue_id || item.issue_id || item.cluster_id,
         resultType: alertResultType,
         parentResultType: alertResultType !== resultKey ? resultKey : '',
@@ -1348,6 +1434,8 @@ function collectDuplicateAlerts(results, allAlerts) {
         title: item.title || [item.left_file_name, item.right_file_name].filter(Boolean).join(' / ') || '疑似重复内容',
         description: '共 ' + (item.occurrence_count ?? duplicateEvidenceRows.length) + ' 条重复证据，匹配得分 ' + (score === undefined || score === null ? '--' : score) + (item.short_summary ? '；' + item.short_summary : ''),
         metrics: {
+          '有效证据数': item.occurrence_count,
+          '原始证据数': item.source_evidence_count,
           '完全重复块': item.metrics && item.metrics.exact_block_count,
           '相似块': item.metrics && item.metrics.similar_block_count,
           '重复表格': item.metrics && item.metrics.exact_table_count,
@@ -1355,7 +1443,6 @@ function collectDuplicateAlerts(results, allAlerts) {
           '重复字数': item.duplicate_text_length || item.metrics && item.metrics.duplicate_text_length,
           '上报规则': formatDuplicateReportReason(item.duplicate_report_reason),
           '确认错别字': item.typo_check?.status === 'incomplete' ? '检查未完成，请重试' : (item.typo_check?.confirmed_count ?? (arrayify(item.short_duplicate_typo_issues).length || '')),
-          '待复核候选': item.typo_check?.review_candidate_count ?? (arrayify(item.typo_review_candidates).length || ''),
         },
         evidence: {
           cluster: item,
@@ -1363,7 +1450,6 @@ function collectDuplicateAlerts(results, allAlerts) {
           duplicateBlocks: duplicateBlocks,
           similarBlocks: similarBlocks,
           shortDuplicateTypoIssues: item.short_duplicate_typo_issues,
-          typoReviewCandidates: item.typo_review_candidates,
         },
         documents: docs,
         page: docs[0] && docs[0].startPage,
@@ -5155,12 +5241,23 @@ export default function ReviewPage() {
         offset: 0,
         signal: controller.signal,
       }),
-    ]).then(function (payloads) {
+    ]).then(async function (payloads) {
       if (controller.signal.aborted || reviewSessionRef.current !== operation) return
       var detail = payloads[0] && payloads[0].data || {}
       var evidence = payloads[1] && payloads[1].data || {}
+      var allOccurrences = arrayify(evidence.occurrences).slice()
+      var totalOccurrences = Number(evidence.total || allOccurrences.length)
+      while (allOccurrences.length < totalOccurrences) {
+        var nextPage = await getProjectReviewIssueEvidence(selectedProjectId, issueId, resultVersion, {
+          limit: 100, offset: allOccurrences.length, signal: controller.signal,
+        })
+        if (controller.signal.aborted || reviewSessionRef.current !== operation) return
+        var nextOccurrences = arrayify(nextPage && nextPage.data && nextPage.data.occurrences)
+        if (nextOccurrences.length === 0) break
+        allOccurrences = allOccurrences.concat(nextOccurrences)
+      }
       var fullIssue = Object.assign({}, currentAlert.sourceItem || {}, detail, {
-        occurrences: arrayify(evidence.occurrences),
+        occurrences: allOccurrences,
         _review_issue_id: issueId,
       })
       var sourceKey = currentAlert.sourceResultKey
